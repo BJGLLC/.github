@@ -256,18 +256,19 @@ def is_nudged(comments, head_pushed_at):
     return any(c["body"].strip().startswith(REVIEW_REQUEST) and ts(c["created_at"]) > pushed for c in comments)
 
 
-def derive_asked_at(head_pushed_at, ready_times):
-    """R23b/R23d: when Codex was asked about this head, from PR state alone so every mode
-    (poll, one-shot, dispatch) computes the same clock: the later of head_pushed_at and the
-    latest ready_for_review event (Codex reviews on draft -> ready). Returns the winning
-    ISO timestamp string.
+def derive_asked_at(head_pushed_at, event_times):
+    """R23b/d/e: when Codex was asked about this head, from PR state alone so every mode
+    (poll, one-shot, dispatch) computes the same clock: the latest of head_pushed_at and
+    `event_times` -- the PR's createdAt and its READY_FOR_REVIEW / REOPENED timeline events
+    (a branch can sit long before its PR opens; Codex reviews on open and on draft -> ready).
+    Returns the winning ISO timestamp string.
     `@codex review` comments (any author: the gate's nudge / re-review request or a human or
     agent retry) never move it -- they only count for is_nudged(). Each clock start is an
-    event that starts its own poller (push -> synchronize, draft -> ready ->
-    ready_for_review), so clock_start + 31 min always falls inside that poller's 35-min job
-    timeout; a comment-moved clock (R23b/c) could push the deadline past it, and Actions
-    killed the poller while compute still said pending."""
-    return max([head_pushed_at, *ready_times], key=ts)
+    event that starts its own poller (push -> synchronize, PR created -> opened, draft ->
+    ready -> ready_for_review, reopen -> reopened), so clock_start + 31 min always falls
+    inside that poller's 35-min job timeout; a comment-moved clock (R23b/c) could push the
+    deadline past it, and Actions killed the poller while compute still said pending."""
+    return max([head_pushed_at, *event_times], key=ts)
 
 
 def reactions_from_rest(items):
@@ -284,8 +285,8 @@ def reactions_from_rest(items):
 
 GQL = """
 query($owner:String!,$name:String!,$n:Int!){ repository(owner:$owner,name:$name){ pullRequest(number:$n){
-  headRefOid isDraft state labels(first:20){nodes{name}}
-  timelineItems(last:5, itemTypes:[READY_FOR_REVIEW_EVENT]){nodes{... on ReadyForReviewEvent{createdAt}}}
+  headRefOid isDraft state createdAt labels(first:20){nodes{name}}
+  timelineItems(last:5, itemTypes:[READY_FOR_REVIEW_EVENT, REOPENED_EVENT]){nodes{... on ReadyForReviewEvent{createdAt} ... on ReopenedEvent{createdAt}}}
   commits(last:1){nodes{commit{committedDate checkSuites(first:20){nodes{createdAt app{slug}}}}}}
   reviews(first:100){nodes{author{login} submittedAt commit{oid}}}
   comments(last:100){nodes{author{login} body createdAt}}
@@ -324,7 +325,7 @@ def fetch(repo, number):
         "threads": [{"id": t["id"], "is_resolved": t["isResolved"], "comments": [
             {"author": login(c["author"]), "body": c["body"], "created_at": c["createdAt"], "commit_sha": (c["commit"] or {}).get("oid", "")} for c in t["comments"]["nodes"]]} for t in p["reviewThreads"]["nodes"]],
         "nudged": is_nudged(comments, head_pushed_at),
-        "asked_at": derive_asked_at(head_pushed_at, [e["createdAt"] for e in p["timelineItems"]["nodes"] if e.get("createdAt")]),
+        "asked_at": derive_asked_at(head_pushed_at, [p["createdAt"], *(e["createdAt"] for e in p["timelineItems"]["nodes"] if e.get("createdAt"))]),
         "summary": _newest_summary(comments),
     }
 

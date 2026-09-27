@@ -315,6 +315,7 @@ class NudgedHelper(unittest.TestCase):
 # New names are reached through the module (rv.*) so the older tests above keep
 # running while these are RED.
 import json
+import re
 import subprocess
 import review_verdict as rv
 
@@ -518,9 +519,12 @@ class PollLoop(unittest.TestCase):
 
 
 class FetchWiring(unittest.TestCase):
-    def fetch_with(self, ready=(), comments=()):
+    def fetch_with(self, ready=(), comments=(), created=None):
+        """ready = createdAt of READY_FOR_REVIEW / REOPENED timeline events; created = PR createdAt
+        (default: an hour before the push, i.e. the PR predates its head)."""
         gql = {"data": {"repository": {"pullRequest": {
             "headRefOid": "abc", "isDraft": True, "state": "OPEN", "labels": {"nodes": [{"name": "x"}]},
+            "createdAt": created or iso(T0 - timedelta(hours=1)),
             "commits": {"nodes": [{"commit": {"committedDate": iso(T0), "checkSuites": {"nodes": []}}}]},
             "timelineItems": {"nodes": [{"createdAt": r} for r in ready]},
             "reviews": {"nodes": []}, "reviewThreads": {"nodes": []},
@@ -546,6 +550,20 @@ class FetchWiring(unittest.TestCase):
                                   comments=[(login, "@codex review", iso(T0 + timedelta(minutes=75)))])
             self.assertEqual(got["asked_at"], iso(T0 + timedelta(minutes=40)), login)
             self.assertTrue(got["nudged"], login)
+        got = self.fetch_with(created=iso(T0 + timedelta(minutes=45)),
+                              comments=[("blakejgruber", "@codex review", iso(T0 + timedelta(minutes=60)))])
+        self.assertEqual(got["asked_at"], iso(T0 + timedelta(minutes=45)))  # R23e: still only events
+
+    def test_pr_opened_after_the_push_starts_the_clock(self):  # R23e
+        self.assertEqual(self.fetch_with(created=iso(T0 + timedelta(minutes=45)))["asked_at"], iso(T0 + timedelta(minutes=45)))
+
+    def test_reopen_event_starts_the_clock(self):  # R23e: timeline nodes carry READY_FOR_REVIEW and REOPENED alike
+        self.assertEqual(self.fetch_with(ready=[iso(T0 + timedelta(hours=2))])["asked_at"], iso(T0 + timedelta(hours=2)))
+
+    def test_query_asks_for_pr_created_at_and_both_event_types(self):  # R23e wiring
+        self.assertRegex(rv.GQL, r"pullRequest\(number:\$n\)\{\s*headRefOid[^\n]*\bcreatedAt\b")
+        self.assertIn("itemTypes:[READY_FOR_REVIEW_EVENT, REOPENED_EVENT]", rv.GQL)
+        self.assertIn("... on ReopenedEvent{createdAt}", rv.GQL)
 
 
 class CliDispatch(unittest.TestCase):
@@ -721,6 +739,55 @@ class SilentCodexReplay(unittest.TestCase):  # R23c/R23d: every silent-Codex pat
         self.assertEqual(v["state"], "failure"); self.assertIn("codex-unavailable", v["description"])
         _, v, _ = self.state_at(45, retry, summary={"status": "completed", "commit": "new"})
         self.assertEqual(v["state"], "success")
+
+    # ---- R23e: PR creation and reopen are clock starts too -----------------------------
+    def assert_relative_timings(self, start_min):
+        """From a clock start at T0+start_min (its own poller starts there): pending at +5,
+        nudge at +10, codex-unavailable at +30 -- all inside that poller's 35-min timeout."""
+        starts = [iso(T0 + timedelta(minutes=start_min))]
+        _, v, _ = self.state_at(start_min + 5, [], starts)
+        self.assertEqual(v["state"], "pending"); self.assertFalse(v["nudge"])
+        _, v, _ = self.state_at(start_min + 10, [], starts)
+        self.assertEqual(v["state"], "pending"); self.assertTrue(v["nudge"])
+        nudged = [self.gate_nudge(start_min + 10)]
+        _, v, _ = self.state_at(start_min + 29, nudged, starts)
+        self.assertEqual(v["state"], "pending")
+        p, v, now = self.state_at(start_min + 30, nudged, starts)
+        self.assertEqual(v["state"], "failure"); self.assertIn("codex-unavailable", v["description"])
+        self.assertTrue(rv.poll_done(p, v, now))
+        self.assertLess(now - rv.ts(starts[0]), self.POLL_JOB_TIMEOUT)
+
+    def test_pr_opened_45_min_after_the_push(self):
+        self.assert_relative_timings(45)   # the P1: previously codex-unavailable on the first poll
+
+    def test_pr_reopened_2_hours_after_the_push(self):
+        self.assert_relative_timings(120)
+
+    def test_every_clock_start_ends_inside_the_poll_timeout(self):
+        # push (synchronize) = 0; open / ready / reopen at arbitrary later times
+        for start in (0, 7, 45, 120, 600):
+            with self.subTest(start=start):
+                self.assert_relative_timings(start)
+
+
+class ClockStartsHaveAPoller(unittest.TestCase):  # R23e invariant
+    """Every event that can set asked_at must also start a poller, or the deadline could fall
+    outside any running poller: push -> synchronize, PR creation -> opened, READY_FOR_REVIEW_EVENT
+    -> ready_for_review, REOPENED_EVENT -> reopened."""
+    CLOCK_START_ACTIONS = {"synchronize", "opened", "ready_for_review", "reopened"}
+
+    def test_poll_job_triggers_cover_every_clock_start(self):
+        try:
+            import yaml
+        except ImportError:
+            self.skipTest("PyYAML not installed")
+        wf = os.path.join(os.path.dirname(__file__), "..", ".github", "workflows", "review-verdict.yml")
+        with open(wf) as f:
+            cond = yaml.safe_load(f)["jobs"]["poll"]["if"]
+        m = re.search(r"fromJSON\('(\[.*?\])'\)", cond)
+        self.assertIsNotNone(m, cond)
+        self.assertEqual(set(json.loads(m.group(1))), self.CLOCK_START_ACTIONS)
+        self.assertIn("github.event_name == 'pull_request'", cond)
 
 
 class DrillFixtures(unittest.TestCase):
