@@ -671,6 +671,54 @@ class DeriveAskedAt(unittest.TestCase):  # R23b: pure max-selection
         got = rv.derive_asked_at(iso(T0), [], [self.c("looks good", 50), self.c("please @codex review", 55)])
         self.assertEqual(got, iso(T0))
 
+    def test_the_gates_own_review_requests_do_not_count(self):  # R23c
+        for login in ("github-actions", "github-actions[bot]"):
+            got = rv.derive_asked_at(iso(T0), [], [self.c("@codex review", 10, author=login)])
+            self.assertEqual(got, iso(T0), login)
+
+
+class SilentCodexReplay(unittest.TestCase):  # R23c: the path that broke under R23b as first ruled
+    POLL_JOB_TIMEOUT = timedelta(minutes=35)  # reusable workflow, poll job timeout-minutes
+
+    def state_at(self, minutes, comments, ready=()):
+        """Rebuild the PR exactly as fetch() would (nudged + asked_at from the same comments)."""
+        p = pr(comments=comments, nudged=rv.is_nudged(comments, iso(T0)),
+               asked_at=rv.derive_asked_at(iso(T0), list(ready), comments))
+        now = T0 + timedelta(minutes=minutes)
+        v = compute(p, now)
+        return p, v, now
+
+    def gate_nudge(self, minutes):
+        return {"author": "github-actions", "body": "@codex review", "created_at": iso(T0 + timedelta(minutes=minutes))}
+
+    def test_opened_nudge_at_10_no_codex_is_unavailable_at_30_inside_the_poll_timeout(self):
+        _, v, _ = self.state_at(10, [])
+        self.assertTrue(v["nudge"])  # the gate posts its nudge here
+        nudged = [self.gate_nudge(10)]
+        _, v, _ = self.state_at(29, nudged)
+        self.assertEqual(v["state"], "pending"); self.assertFalse(v["nudge"])
+        p, v, now = self.state_at(30, nudged)
+        self.assertEqual(v["state"], "failure"); self.assertIn("codex-unavailable", v["description"])
+        self.assertTrue(rv.poll_done(p, v, now))
+        self.assertLess(now - T0, self.POLL_JOB_TIMEOUT)
+
+    def test_ready_for_review_nudge_no_codex_is_unavailable_30_min_after_ready(self):
+        ready = [iso(T0 + timedelta(minutes=40))]  # poller starts at +40
+        nudged = [self.gate_nudge(50)]
+        _, v, _ = self.state_at(69, nudged, ready)
+        self.assertEqual(v["state"], "pending")
+        p, v, now = self.state_at(70, nudged, ready)
+        self.assertEqual(v["state"], "failure"); self.assertTrue(rv.poll_done(p, v, now))
+        self.assertLess(now - (T0 + timedelta(minutes=40)), self.POLL_JOB_TIMEOUT)
+
+    def test_a_human_or_agent_retry_still_restarts_the_window(self):
+        retry = [self.gate_nudge(10), {"author": "blakejgruber", "body": "@codex review", "created_at": iso(T0 + timedelta(minutes=35))}]
+        _, v, _ = self.state_at(40, retry)
+        self.assertEqual(v["state"], "pending")  # 5 min into the retry's window, not codex-unavailable
+        self.assertFalse(v["nudge"])             # already nudged for this SHA
+        _, v, _ = self.state_at(65, retry)
+        self.assertEqual(v["state"], "failure"); self.assertIn("codex-unavailable", v["description"])
+
 
 class DrillFixtures(unittest.TestCase):
     def load(self, name):

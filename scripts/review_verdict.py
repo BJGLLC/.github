@@ -18,9 +18,10 @@ import time
 from datetime import datetime, timedelta, timezone
 
 CODEX = "chatgpt-codex-connector"
+GATE = "github-actions"  # the identity this gate's own comments (nudge, re-review request) carry
 NUDGE_AFTER = timedelta(minutes=10)
 UNAVAILABLE_AFTER = timedelta(minutes=30)
-POLL_DEADLINE = timedelta(minutes=31)  # a poller never waits past head_pushed_at + 31 min
+POLL_DEADLINE = timedelta(minutes=31)  # a poller never waits past clock_start + 31 min
 POLL_INTERVAL = 60                     # seconds between poll iterations
 POLL_MAX_ERRORS = 3                    # consecutive failed iterations before the poller gives up
 DRAFT_DESC = "draft: Codex reviews when marked ready"
@@ -264,8 +265,13 @@ def derive_asked_at(head_pushed_at, ready_times, comments):
     """R23b: when Codex was last asked about this head, from PR state alone, so every mode
     (poll, one-shot, dispatch) computes the same clock: the latest of head_pushed_at, any
     ready_for_review event (Codex reviews on draft -> ready) and any `@codex review`
-    comment after the push. Returns the winning ISO timestamp string."""
-    requests = [c["created_at"] for c in _review_requests_after(comments, head_pushed_at)]
+    comment after the push. Returns the winning ISO timestamp string.
+    R23c: the gate's own requests (GATE: the 10-min nudge, the R6 re-review request) do
+    not count -- the nudge is part of the first 30-min window, not a retry; counting it
+    pushed codex-unavailable to +40, past the poll job's 35-min timeout. They still count
+    for is_nudged(), so the gate never nudges a SHA twice."""
+    requests = [c["created_at"] for c in _review_requests_after(comments, head_pushed_at)
+                if _normalize_login(c["author"]) != GATE]
     return max([head_pushed_at, *ready_times, *requests], key=ts)
 
 
