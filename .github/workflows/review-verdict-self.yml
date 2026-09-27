@@ -1,0 +1,28 @@
+# .github/workflows/review-verdict-self.yml — this repo's own caller (SSSF-23, R12): the gate's
+# repo is gated too, so its PRs get a `review-verdict` status. Same as the thin caller in every
+# gated repo except `uses:` points at the local reusable workflow. Note: the reusable workflow
+# always runs scripts/ from main, so a PR here is judged by main's verdict logic, not its own.
+# Recompute by hand: gh workflow run review-verdict-self.yml -f pr=<n>
+name: review-verdict-self
+on:
+  pull_request: { types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled, closed] }
+  pull_request_review: { types: [submitted] }
+  issue_comment: { types: [created, edited] }   # Codex edits its sticky summary comment per round
+  workflow_dispatch:
+    inputs:
+      pr:    { description: "PR number", required: true, type: number }
+      drill: { description: "p1-open | clean | (empty = real)", required: false, type: string, default: "" }
+permissions:
+  contents: read
+  checks: read
+  pull-requests: write
+  statuses: write
+  issues: write
+jobs:
+  verdict:
+    # issue_comment: only Codex's own comments on a PR; any other comment would bill a minute for nothing.
+    if: github.event_name != 'issue_comment' || (github.event.issue.pull_request && startsWith(github.event.comment.user.login, 'chatgpt-codex-connector'))
+    uses: ./.github/workflows/review-verdict.yml
+    with:
+      pr: ${{ inputs.pr || 0 }}
+      drill: ${{ inputs.drill || '' }}
