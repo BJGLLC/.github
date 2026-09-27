@@ -536,12 +536,16 @@ class FetchWiring(unittest.TestCase):
         self.assertIs(got["draft"], True); self.assertEqual(got["state"], "OPEN")
         self.assertEqual(got["head_sha"], "abc"); self.assertEqual(got["labels"], ["x"])
 
-    def test_fetch_derives_asked_at_from_pr_state(self):  # R23b
+    def test_fetch_derives_asked_at_from_pr_state(self):  # R23b / R23d
         self.assertEqual(self.fetch_with()["asked_at"], iso(T0))
         self.assertEqual(self.fetch_with(ready=[iso(T0 + timedelta(minutes=40))])["asked_at"], iso(T0 + timedelta(minutes=40)))
-        got = self.fetch_with(ready=[iso(T0 + timedelta(minutes=40))],
-                              comments=[("blakejgruber", "@codex review", iso(T0 + timedelta(minutes=75)))])
-        self.assertEqual(got["asked_at"], iso(T0 + timedelta(minutes=75)))
+
+    def test_review_requests_never_move_the_clock_but_still_count_as_nudged(self):  # R23d
+        for login in ("blakejgruber", "github-actions", "github-actions[bot]"):
+            got = self.fetch_with(ready=[iso(T0 + timedelta(minutes=40))],
+                                  comments=[(login, "@codex review", iso(T0 + timedelta(minutes=75)))])
+            self.assertEqual(got["asked_at"], iso(T0 + timedelta(minutes=40)), login)
+            self.assertTrue(got["nudged"], login)
 
 
 class CliDispatch(unittest.TestCase):
@@ -647,43 +651,25 @@ class PollSinceRemoved(unittest.TestCase):  # R23b: the clock is fetched, not pa
         self.assertEqual(rv.main(["rv", "poll", "o/r", "5", "--rereview", "--rereview"]), 2)
 
 
-class DeriveAskedAt(unittest.TestCase):  # R23b: pure max-selection
-    def c(self, body, minutes, author="blakejgruber"):
-        return {"author": author, "body": body, "created_at": iso(T0 + timedelta(minutes=minutes))}
-
+class DeriveAskedAt(unittest.TestCase):  # R23d: max(push, latest draft -> ready); comments never count
     def test_none_present_is_head_pushed_at(self):
-        self.assertEqual(rv.derive_asked_at(iso(T0), [], []), iso(T0))
+        self.assertEqual(rv.derive_asked_at(iso(T0), []), iso(T0))
 
-    def test_push_wins_over_older_sources(self):
-        got = rv.derive_asked_at(iso(T0), [iso(T0 - timedelta(minutes=5))], [self.c("@codex review", -3)])
-        self.assertEqual(got, iso(T0))
+    def test_push_wins_over_an_older_ready_event(self):
+        self.assertEqual(rv.derive_asked_at(iso(T0), [iso(T0 - timedelta(minutes=5))]), iso(T0))
 
     def test_latest_ready_for_review_wins(self):
-        got = rv.derive_asked_at(iso(T0), [iso(T0 + timedelta(minutes=20)), iso(T0 + timedelta(minutes=40))], [])
+        got = rv.derive_asked_at(iso(T0), [iso(T0 + timedelta(minutes=20)), iso(T0 + timedelta(minutes=40))])
         self.assertEqual(got, iso(T0 + timedelta(minutes=40)))
 
-    def test_latest_codex_review_request_after_push_wins(self):
-        got = rv.derive_asked_at(iso(T0), [iso(T0 + timedelta(minutes=40))],
-                                 [self.c("@codex review", 50), self.c("  @codex review please", 60)])
-        self.assertEqual(got, iso(T0 + timedelta(minutes=60)))
 
-    def test_other_comments_do_not_count(self):
-        got = rv.derive_asked_at(iso(T0), [], [self.c("looks good", 50), self.c("please @codex review", 55)])
-        self.assertEqual(got, iso(T0))
-
-    def test_the_gates_own_review_requests_do_not_count(self):  # R23c
-        for login in ("github-actions", "github-actions[bot]"):
-            got = rv.derive_asked_at(iso(T0), [], [self.c("@codex review", 10, author=login)])
-            self.assertEqual(got, iso(T0), login)
-
-
-class SilentCodexReplay(unittest.TestCase):  # R23c: the path that broke under R23b as first ruled
+class SilentCodexReplay(unittest.TestCase):  # R23c/R23d: every silent-Codex path ends inside the poll timeout
     POLL_JOB_TIMEOUT = timedelta(minutes=35)  # reusable workflow, poll job timeout-minutes
 
-    def state_at(self, minutes, comments, ready=()):
-        """Rebuild the PR exactly as fetch() would (nudged + asked_at from the same comments)."""
-        p = pr(comments=comments, nudged=rv.is_nudged(comments, iso(T0)),
-               asked_at=rv.derive_asked_at(iso(T0), list(ready), comments))
+    def state_at(self, minutes, comments, ready=(), summary=None):
+        """Rebuild the PR exactly as fetch() would (nudged from the comments, asked_at from push/ready)."""
+        p = pr(comments=comments, nudged=rv.is_nudged(comments, iso(T0)), summary=summary,
+               asked_at=rv.derive_asked_at(iso(T0), list(ready)))
         now = T0 + timedelta(minutes=minutes)
         v = compute(p, now)
         return p, v, now
@@ -711,13 +697,30 @@ class SilentCodexReplay(unittest.TestCase):  # R23c: the path that broke under R
         self.assertEqual(v["state"], "failure"); self.assertTrue(rv.poll_done(p, v, now))
         self.assertLess(now - (T0 + timedelta(minutes=40)), self.POLL_JOB_TIMEOUT)
 
-    def test_a_human_or_agent_retry_still_restarts_the_window(self):
-        retry = [self.gate_nudge(10), {"author": "blakejgruber", "body": "@codex review", "created_at": iso(T0 + timedelta(minutes=35))}]
-        _, v, _ = self.state_at(40, retry)
-        self.assertEqual(v["state"], "pending")  # 5 min into the retry's window, not codex-unavailable
-        self.assertFalse(v["nudge"])             # already nudged for this SHA
-        _, v, _ = self.state_at(65, retry)
+    def human_retry(self, minutes):
+        return {"author": "blakejgruber", "body": "@codex review", "created_at": iso(T0 + timedelta(minutes=minutes))}
+
+    def test_human_retry_at_20_does_not_restart_the_window(self):
+        # Reviewer's scenario (R23d): push t=0, human retry t=+20, Codex silent. Under R23c the
+        # retry moved the deadline to +51, past the 35-min job timeout (killed while pending).
+        retry = [self.human_retry(20)]
+        _, v, _ = self.state_at(29, retry)
+        self.assertEqual(v["state"], "pending"); self.assertFalse(v["nudge"])  # the retry counts as the nudge
+        p, v, now = self.state_at(30, retry)
         self.assertEqual(v["state"], "failure"); self.assertIn("codex-unavailable", v["description"])
+        self.assertTrue(rv.poll_done(p, v, now))
+        p31, v31, now31 = self.state_at(31, retry)
+        self.assertTrue(rv.poll_done(p31, v31, now31))
+        self.assertLess(now31 - T0, self.POLL_JOB_TIMEOUT)
+
+    def test_retry_after_codex_unavailable_is_recomputed_by_codexs_summary_edit(self):
+        # spec §6: the status stays codex-unavailable after a retry; Codex's summary edit
+        # (an issue_comment event -> one-shot run) recomputes it once the review lands.
+        retry = [self.gate_nudge(10), self.human_retry(35)]
+        _, v, _ = self.state_at(40, retry)
+        self.assertEqual(v["state"], "failure"); self.assertIn("codex-unavailable", v["description"])
+        _, v, _ = self.state_at(45, retry, summary={"status": "completed", "commit": "new"})
+        self.assertEqual(v["state"], "success")
 
 
 class DrillFixtures(unittest.TestCase):

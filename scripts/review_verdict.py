@@ -18,7 +18,6 @@ import time
 from datetime import datetime, timedelta, timezone
 
 CODEX = "chatgpt-codex-connector"
-GATE = "github-actions"  # the identity this gate's own comments (nudge, re-review request) carry
 NUDGE_AFTER = timedelta(minutes=10)
 UNAVAILABLE_AFTER = timedelta(minutes=30)
 POLL_DEADLINE = timedelta(minutes=31)  # a poller never waits past clock_start + 31 min
@@ -112,9 +111,10 @@ def clock_start(pr):
 def compute(pr, now):
     """The verdict for the PR's head. Pure: every mode (poll, one-shot, dispatch) feeds it
     the same fetch() output, so two runs on the same SHA post the same status.
-    The nudge (10 min) and codex-unavailable (30 min) ages run from clock_start(pr). A
-    retry `@codex review` comment moves asked_at, so it restarts the 30-min window by
-    design: the codex-unavailable description tells people to do exactly that."""
+    The nudge (10 min) and codex-unavailable (30 min) ages run from clock_start(pr) (push or
+    draft -> ready). A retry `@codex review` does NOT restart the window: the status stays
+    codex-unavailable until Codex's summary edit (an issue_comment event -> one-shot run)
+    recomputes it once the review lands (spec §6)."""
     if "hotfix" in pr.get("labels", []):
         return {"state": "success", "description": "hotfix: review skipped, post-hoc queued", "queue": [], "nudge": False}
 
@@ -248,31 +248,26 @@ def pushed_at(commit_node):
     return commit["committedDate"]
 
 
-def _review_requests_after(comments, head_pushed_at):
-    """`@codex review` comments (any author, stripped body starts with it) after the push."""
-    pushed = ts(head_pushed_at)
-    return [c for c in comments if c["body"].strip().startswith(REVIEW_REQUEST) and ts(c["created_at"]) > pushed]
-
-
 def is_nudged(comments, head_pushed_at):
     """True if any comment (any author) whose stripped body starts with
     '@codex review' was created after head_pushed_at -- i.e. this SHA has already
     been nudged, so main() should not nudge it again."""
-    return bool(_review_requests_after(comments, head_pushed_at))
+    pushed = ts(head_pushed_at)
+    return any(c["body"].strip().startswith(REVIEW_REQUEST) and ts(c["created_at"]) > pushed for c in comments)
 
 
-def derive_asked_at(head_pushed_at, ready_times, comments):
-    """R23b: when Codex was last asked about this head, from PR state alone, so every mode
-    (poll, one-shot, dispatch) computes the same clock: the latest of head_pushed_at, any
-    ready_for_review event (Codex reviews on draft -> ready) and any `@codex review`
-    comment after the push. Returns the winning ISO timestamp string.
-    R23c: the gate's own requests (GATE: the 10-min nudge, the R6 re-review request) do
-    not count -- the nudge is part of the first 30-min window, not a retry; counting it
-    pushed codex-unavailable to +40, past the poll job's 35-min timeout. They still count
-    for is_nudged(), so the gate never nudges a SHA twice."""
-    requests = [c["created_at"] for c in _review_requests_after(comments, head_pushed_at)
-                if _normalize_login(c["author"]) != GATE]
-    return max([head_pushed_at, *ready_times, *requests], key=ts)
+def derive_asked_at(head_pushed_at, ready_times):
+    """R23b/R23d: when Codex was asked about this head, from PR state alone so every mode
+    (poll, one-shot, dispatch) computes the same clock: the later of head_pushed_at and the
+    latest ready_for_review event (Codex reviews on draft -> ready). Returns the winning
+    ISO timestamp string.
+    `@codex review` comments (any author: the gate's nudge / re-review request or a human or
+    agent retry) never move it -- they only count for is_nudged(). Each clock start is an
+    event that starts its own poller (push -> synchronize, draft -> ready ->
+    ready_for_review), so clock_start + 31 min always falls inside that poller's 35-min job
+    timeout; a comment-moved clock (R23b/c) could push the deadline past it, and Actions
+    killed the poller while compute still said pending."""
+    return max([head_pushed_at, *ready_times], key=ts)
 
 
 def reactions_from_rest(items):
@@ -329,7 +324,7 @@ def fetch(repo, number):
         "threads": [{"id": t["id"], "is_resolved": t["isResolved"], "comments": [
             {"author": login(c["author"]), "body": c["body"], "created_at": c["createdAt"], "commit_sha": (c["commit"] or {}).get("oid", "")} for c in t["comments"]["nodes"]]} for t in p["reviewThreads"]["nodes"]],
         "nudged": is_nudged(comments, head_pushed_at),
-        "asked_at": derive_asked_at(head_pushed_at, [e["createdAt"] for e in p["timelineItems"]["nodes"] if e.get("createdAt")], comments),
+        "asked_at": derive_asked_at(head_pushed_at, [e["createdAt"] for e in p["timelineItems"]["nodes"] if e.get("createdAt")]),
         "summary": _newest_summary(comments),
     }
 

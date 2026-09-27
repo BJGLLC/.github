@@ -6,9 +6,10 @@
 # The `github` context here is the CALLER's (event, payload, repository, token), so the jobs pick
 # their mode from the caller's event:
 #   poll   — pull_request opened/synchronize/reopened/ready_for_review: wait for Codex, <=31 min
-#            after it was last asked (asked_at, which the script derives from PR state: the later
-#            of the push, the last draft->ready and the last `@codex review`). No cron: the
-#            $25/mo hard Actions budget cannot carry one.
+#            after it was asked (asked_at, which the script derives from PR state: the later of
+#            the push and the last draft->ready; `@codex review` comments never move it, so the
+#            deadline always falls inside this poller's 35-min timeout). No cron: the $25/mo
+#            hard Actions budget cannot carry one.
 #   once   — every other event: one fetch -> compute -> post, or a drill (workflow_dispatch).
 #   hotfix — a merged `hotfix` PR: ask Codex for the post-hoc review (§8).
 # pull_request `closed` without a merged hotfix runs nothing (a running poller sees the close
