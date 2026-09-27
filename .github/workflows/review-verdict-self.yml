@@ -1,12 +1,12 @@
 # .github/workflows/review-verdict-self.yml — this repo's own caller (SSSF-23, R12): the gate's
 # repo is gated too, so its PRs get a `review-verdict` status. Same as the thin caller in every
-# gated repo except `uses:` points at the local reusable workflow. Note: the reusable workflow
-# always runs scripts/ from main, so a PR here is judged by main's verdict logic, not its own.
+# gated repo, including `uses: …@main` (R24): both the reusable workflow YAML and scripts/ come
+# from main, so a PR here is judged by main's gate, never by the version it changes.
 # Recompute by hand: gh workflow run review-verdict-self.yml -f pr=<n>
 name: review-verdict-self
 on:
   pull_request: { types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled, closed] }
-  pull_request_review: { types: [submitted] }
+  pull_request_review: { types: [submitted] }   # also fires on thread replies (a reply is a COMMENTED review)
   issue_comment: { types: [created, edited] }   # Codex edits its sticky summary comment per round
   workflow_dispatch:
     inputs:
@@ -20,9 +20,14 @@ permissions:
   issues: write
 jobs:
   verdict:
-    # issue_comment: only Codex's own comments on a PR; any other comment would bill a minute for nothing.
-    if: github.event_name != 'issue_comment' || (github.event.issue.pull_request && startsWith(github.event.comment.user.login, 'chatgpt-codex-connector'))
-    uses: ./.github/workflows/review-verdict.yml
+    # Skipped jobs bill nothing. issue_comment: only Codex's own comments on a PR. pull_request:
+    # label churn only for `hotfix`; nothing for a draft (ready_for_review arrives with draft=false
+    # and starts the poller) except `closed`, which carries the hotfix post-hoc step.
+    if: >-
+      (github.event_name != 'issue_comment' || (github.event.issue.pull_request && startsWith(github.event.comment.user.login, 'chatgpt-codex-connector')))
+      && (github.event_name != 'pull_request' || ((!contains(fromJSON('["labeled","unlabeled"]'), github.event.action) || github.event.label.name == 'hotfix')
+      && (!github.event.pull_request.draft || github.event.action == 'closed')))
+    uses: BJGLLC/.github/.github/workflows/review-verdict.yml@main
     with:
       pr: ${{ inputs.pr || 0 }}
       drill: ${{ inputs.drill || '' }}

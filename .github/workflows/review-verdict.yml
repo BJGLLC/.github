@@ -6,13 +6,16 @@
 # The `github` context here is the CALLER's (event, payload, repository, token), so the jobs pick
 # their mode from the caller's event:
 #   poll   — pull_request opened/synchronize/reopened/ready_for_review: wait for Codex, <=31 min
-#            after the push (no cron: the $25/mo hard Actions budget cannot carry one).
+#            after the later of the push and the event (--since; no cron: the $25/mo hard
+#            Actions budget cannot carry one).
 #   once   — every other event: one fetch -> compute -> post, or a drill (workflow_dispatch).
 #   hotfix — a merged `hotfix` PR: ask Codex for the post-hoc review (§8).
 # pull_request `closed` without a merged hotfix runs nothing (a running poller sees the close
 # and stops by itself). Event data and dispatch inputs reach shell only via env: (never ${{ }}
-# inside run:). pull_request_review_thread is not an Actions trigger, so resolving a thread
-# does not recompute on its own: resolve before the fix push, or dispatch the caller with -f pr=<n>.
+# inside run:). Thread replies arrive as pull_request_review events (a GraphQL thread reply
+# creates a COMMENTED review by the replier): the agent replies naming the fix commit, then
+# resolves. A bare resolve with no reply triggers nothing (pull_request_review_thread is not
+# an Actions trigger); recompute by dispatching the caller with -f pr=<n>.
 name: review-verdict
 on:
   workflow_call:
@@ -39,16 +42,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: { repository: BJGLLC/.github, ref: main, persist-credentials: false }
-      - name: Poll until Codex's verdict lands (<=31 min after the push)
+      - name: Poll until Codex's verdict lands (<=31 min after the push / ask)
         env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}
           EVENT_ACTION: ${{ github.event.action }}
+          ASKED_AT: ${{ github.event.pull_request.updated_at }}   # R23: when this event asked Codex
         run: |
           [[ "$PR" =~ ^[1-9][0-9]*$ ]] || { echo "::error::no PR number in the pull_request payload"; exit 1; }
           rereview=()
           if [ "$EVENT_ACTION" = synchronize ]; then rereview=(--rereview); fi  # R6: delete this line to roll back
-          python3 scripts/review_verdict.py poll "$GITHUB_REPOSITORY" "$PR" "${rereview[@]}"
+          python3 scripts/review_verdict.py poll "$GITHUB_REPOSITORY" "$PR" --since "$ASKED_AT" "${rereview[@]}"
 
   once:
     if: github.event_name != 'pull_request' || !contains(fromJSON('["opened","synchronize","reopened","ready_for_review","closed"]'), github.event.action)
