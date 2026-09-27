@@ -1,8 +1,12 @@
 name: ci
 on: { push: { branches: [main] }, pull_request: {} }
+permissions: { contents: read }
 jobs:
   ci:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with: { persist-credentials: false }
       - run: cd scripts && python3 -m unittest -v
+      - name: actionlint
+        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -color

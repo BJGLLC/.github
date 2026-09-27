@@ -1,0 +1,15 @@
+{
+  "head_sha": "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
+  "head_pushed_at": "2026-01-01T00:00:00Z",
+  "state": "OPEN",
+  "draft": false,
+  "labels": [],
+  "summary": null,
+  "nudged": false,
+  "reviews": [
+    {"author": "chatgpt-codex-connector", "submitted_at": "2026-01-01T00:05:00Z", "commit_sha": "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1"}
+  ],
+  "comments": [],
+  "reactions": [],
+  "threads": []
+}

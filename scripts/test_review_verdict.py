@@ -89,13 +89,14 @@ class Blocking(unittest.TestCase):
         v = compute(pr(reviews=[review(3)], threads=[thread("T2", 2, 3)]), T0 + timedelta(minutes=4))
         self.assertEqual(v["state"], "success"); self.assertEqual(v["queue"], ["T2"])
 
+    # R22: a round is a distinct reviewed SHA, so round 3 = three reviews on three SHAs.
     def test_round3_p1_is_queued_not_blocking(self):
-        p = pr(reviews=[review(3), review(6), review(9)], threads=[thread("T9", 1, 9)])
+        p = pr(reviews=[review(3, sha="a"), review(6, sha="b"), review(9)], threads=[thread("T9", 1, 9)])
         v = compute(p, T0 + timedelta(minutes=10))
         self.assertEqual(v["state"], "success"); self.assertEqual(v["queue"], ["T9"])
 
     def test_round3_p0_still_blocks(self):
-        p = pr(reviews=[review(3), review(6), review(9)], threads=[thread("T9", 0, 9)])
+        p = pr(reviews=[review(3, sha="a"), review(6, sha="b"), review(9)], threads=[thread("T9", 0, 9)])
         self.assertEqual(compute(p, T0 + timedelta(minutes=10))["state"], "failure")
 
     def test_unbadged_codex_thread_counts_as_p2(self):
@@ -308,6 +309,504 @@ class NudgedHelper(unittest.TestCase):
     def test_unrelated_comment_does_not_count(self):
         comments = [{"author": "github-actions", "body": "unrelated", "created_at": iso(T0 + timedelta(minutes=1))}]
         self.assertFalse(is_nudged(comments, iso(T0)))
+
+
+# ==== Task 8 (SSSF-23): drafts, poll loop, re-review, drills ========================
+# New names are reached through the module (rv.*) so the older tests above keep
+# running while these are RED.
+import json
+import re
+import subprocess
+import review_verdict as rv
+
+DRILLS = os.path.join(os.path.dirname(__file__), "drills")
+DRAFT_DESC = "draft: Codex reviews when marked ready"
+
+
+class Draft(unittest.TestCase):
+    def test_draft_is_pending_with_draft_description_and_no_nudge(self):
+        v = compute(pr(draft=True), T0 + timedelta(minutes=11))
+        self.assertEqual(v, {"state": "pending", "description": DRAFT_DESC, "queue": [], "nudge": False})
+
+    def test_draft_is_never_codex_unavailable(self):
+        v = compute(pr(draft=True), T0 + timedelta(hours=5))
+        self.assertEqual(v["state"], "pending"); self.assertEqual(v["description"], DRAFT_DESC)
+
+    def test_draft_ignores_findings_and_does_not_queue(self):
+        v = compute(pr(draft=True, reviews=[review(3)], threads=[thread("T1", 1, 3), thread("T2", 2, 3)]),
+                    T0 + timedelta(minutes=4))
+        self.assertEqual(v["state"], "pending"); self.assertEqual(v["queue"], [])
+
+    def test_hotfix_wins_over_draft(self):
+        v = compute(pr(draft=True, labels=["hotfix"]), T0 + timedelta(minutes=1))
+        self.assertEqual(v["state"], "success")
+
+    def test_non_draft_unchanged(self):
+        self.assertEqual(compute(pr(draft=False), T0 + timedelta(minutes=5))["state"], "pending")
+        self.assertIn("waiting for Codex", compute(pr(draft=False), T0 + timedelta(minutes=5))["description"])
+
+
+class ClosedPrNeverNudged(unittest.TestCase):
+    def test_closed_or_merged_pr_is_not_nudged(self):
+        for state in ("CLOSED", "MERGED"):
+            self.assertFalse(compute(pr(state=state), T0 + timedelta(minutes=11))["nudge"], state)
+
+    def test_open_pr_still_nudged(self):
+        self.assertTrue(compute(pr(state="OPEN"), T0 + timedelta(minutes=11))["nudge"])
+
+
+def pending():
+    return {"state": "pending", "description": "waiting", "queue": [], "nudge": False}
+
+
+class PollDone(unittest.TestCase):
+    def test_keeps_polling_while_pending_before_deadline(self):
+        self.assertFalse(rv.poll_done(pr(), pending(), T0 + timedelta(minutes=5)))
+
+    def test_stops_on_any_non_pending_state(self):
+        for state in ("success", "failure"):
+            self.assertTrue(rv.poll_done(pr(), dict(pending(), state=state), T0 + timedelta(minutes=1)), state)
+
+    def test_stops_at_31_minutes_after_push(self):
+        self.assertFalse(rv.poll_done(pr(), pending(), T0 + timedelta(minutes=30, seconds=59)))
+        self.assertTrue(rv.poll_done(pr(), pending(), T0 + timedelta(minutes=31)))
+
+    def test_rerun_long_after_push_stops_immediately(self):
+        self.assertTrue(rv.poll_done(pr(), pending(), T0 + timedelta(days=2)))
+
+    def test_draft_stops_immediately_even_though_pending(self):
+        # R16: a draft push must bill ~1 minute, not 31.
+        p = pr(draft=True)
+        v = compute(p, T0 + timedelta(seconds=30))
+        self.assertEqual(v["state"], "pending")
+        self.assertTrue(rv.poll_done(p, v, T0 + timedelta(seconds=30)))
+
+    def test_closed_or_merged_mid_poll_stops(self):
+        for state in ("CLOSED", "MERGED"):
+            self.assertTrue(rv.poll_done(pr(state=state), pending(), T0 + timedelta(minutes=2)), state)
+
+
+class WantsRereview(unittest.TestCase):
+    def test_summary_for_previous_commit_wants_rereview(self):
+        self.assertTrue(rv.wants_rereview(pr(summary={"status": "completed", "commit": "old"})))
+
+    def test_error_summary_for_previous_commit_wants_rereview(self):
+        self.assertTrue(rv.wants_rereview(pr(summary={"status": "error", "commit": "old"})))
+
+    def test_no_summary_means_no_rereview(self):
+        self.assertFalse(rv.wants_rereview(pr(summary=None)))
+        self.assertFalse(rv.wants_rereview(pr()))
+
+    def test_summary_already_for_head_means_no_rereview(self):
+        for status in ("completed", "running", "error", "unknown"):
+            self.assertFalse(rv.wants_rereview(pr(head_sha="abc1234def", summary={"status": status, "commit": "abc1234"})), status)
+
+    def test_running_summary_means_no_rereview(self):
+        # Codex is mid-review; compute's 10-minute nudge is the backstop.
+        self.assertFalse(rv.wants_rereview(pr(summary={"status": "running", "commit": "old"})))
+
+    def test_already_nudged_means_no_rereview(self):
+        self.assertFalse(rv.wants_rereview(pr(nudged=True, summary={"status": "completed", "commit": "old"})))
+
+    def test_summary_without_commit_means_no_rereview(self):
+        self.assertFalse(rv.wants_rereview(pr(summary={"status": "completed", "commit": None})))
+        self.assertFalse(rv.wants_rereview(pr(summary={"status": "completed", "commit": ""})))
+
+    def test_draft_closed_or_hotfix_means_no_rereview(self):
+        s = {"status": "completed", "commit": "old"}
+        self.assertFalse(rv.wants_rereview(pr(draft=True, summary=s)))
+        self.assertFalse(rv.wants_rereview(pr(state="CLOSED", summary=s)))
+        self.assertFalse(rv.wants_rereview(pr(labels=["hotfix"], summary=s)))
+
+
+class FakeGitHub:
+    """Records the side effects run_once performs; hands back a fixed PR from fetch."""
+    def __init__(self, prdict):
+        self.prdict, self.calls = prdict, []
+
+    def install(self, test):
+        for name, fn in (("fetch", self.fetch), ("post_status", self.post_status),
+                         ("resolve_thread", self.resolve_thread), ("comment", self.comment)):
+            orig = getattr(rv, name)
+            setattr(rv, name, fn)
+            test.addCleanup(setattr, rv, name, orig)
+        return self
+
+    def fetch(self, repo, n):
+        self.calls.append(("fetch", repo, n)); return json.loads(json.dumps(self.prdict))
+
+    def post_status(self, repo, sha, v):
+        self.calls.append(("status", sha, v["state"])); return "posted"
+
+    def resolve_thread(self, tid, reply):
+        self.calls.append(("resolve", tid))
+
+    def comment(self, repo, n, body):
+        self.calls.append(("comment", body))
+
+
+class RunOnce(unittest.TestCase):
+    def test_posts_status_and_resolves_queued_threads(self):
+        g = FakeGitHub(pr(reviews=[review(3)], threads=[thread("T2", 2, 3)])).install(self)
+        _, v, _ = rv.run_once("o/r", 7, now=T0 + timedelta(minutes=4))
+        self.assertEqual(v["state"], "success")
+        self.assertEqual(g.calls, [("fetch", "o/r", 7), ("status", "new", "success"), ("resolve", "T2")])
+
+    def test_nudges_when_compute_says_so(self):
+        g = FakeGitHub(pr()).install(self)
+        rv.run_once("o/r", 7, now=T0 + timedelta(minutes=11))
+        self.assertEqual(g.calls[-1], ("comment", "@codex review"))
+
+    def test_rereview_comment_goes_out_before_the_status_and_only_once(self):
+        # 11 min after the push compute would also nudge; the rereview comment must
+        # mark the SHA nudged so the same run does not post `@codex review` twice.
+        g = FakeGitHub(pr(summary={"status": "completed", "commit": "old"})).install(self)
+        rv.run_once("o/r", 7, rereview=True, now=T0 + timedelta(minutes=11))
+        comments = [c for c in g.calls if c[0] == "comment"]
+        self.assertEqual(comments, [("comment", "@codex review")])
+        self.assertLess(g.calls.index(("comment", "@codex review")), [c[0] for c in g.calls].index("status"))
+
+    def test_no_rereview_flag_no_rereview_comment(self):
+        g = FakeGitHub(pr(summary={"status": "completed", "commit": "old"})).install(self)
+        rv.run_once("o/r", 7, now=T0 + timedelta(minutes=1))
+        self.assertNotIn("comment", [c[0] for c in g.calls])
+
+
+class PollLoop(unittest.TestCase):
+    def run_poll(self, results, **kw):
+        """results: list of (state, pr-overrides) or Exception; one per iteration."""
+        seen, sleeps = [], []
+        it = iter(results)
+
+        def step(repo, n, rereview=False):  # R23b: no mode-specific clock input any more
+            seen.append(rereview)
+            r = next(it)
+            if isinstance(r, Exception):
+                raise r
+            state, over = r
+            return pr(**over), dict(pending(), state=state), T0 + timedelta(minutes=len(seen))
+
+        v = rv.poll("o/r", 7, step=step, sleep=sleeps.append, **kw)
+        return v, seen, sleeps
+
+    def test_stops_on_first_non_pending_and_sleeps_between(self):
+        v, seen, sleeps = self.run_poll([("pending", {}), ("pending", {}), ("success", {})])
+        self.assertEqual(v["state"], "success"); self.assertEqual(len(seen), 3)
+        self.assertEqual(sleeps, [60, 60])
+
+    def test_rereview_only_on_first_iteration(self):
+        _, seen, _ = self.run_poll([("pending", {}), ("failure", {})], rereview=True)
+        self.assertEqual(seen, [True, False])
+
+    def test_draft_ends_after_one_iteration(self):
+        v, seen, sleeps = self.run_poll([("pending", {"draft": True})])
+        self.assertEqual(len(seen), 1); self.assertEqual(sleeps, [])
+
+    def test_transient_error_is_retried_and_rereview_survives_it(self):
+        err = subprocess.CalledProcessError(1, ["gh"], stderr="HTTP 502")
+        v, seen, _ = self.run_poll([err, ("success", {})], rereview=True)
+        self.assertEqual(v["state"], "success"); self.assertEqual(seen, [True, True])
+
+    def test_three_consecutive_errors_give_up(self):
+        err = subprocess.CalledProcessError(1, ["gh"], stderr="HTTP 502")
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.run_poll([("pending", {}), err, err, err, ("success", {})])
+
+    def test_error_count_resets_after_a_good_iteration(self):
+        err = subprocess.CalledProcessError(1, ["gh"], stderr="HTTP 502")
+        v, seen, _ = self.run_poll([err, err, ("pending", {}), err, err, ("success", {})])
+        self.assertEqual(v["state"], "success"); self.assertEqual(len(seen), 6)
+
+
+class FetchWiring(unittest.TestCase):
+    def fetch_with(self, ready=(), comments=(), created=None):
+        """ready = createdAt of READY_FOR_REVIEW / REOPENED timeline events; created = PR createdAt
+        (default: an hour before the push, i.e. the PR predates its head)."""
+        gql = {"data": {"repository": {"pullRequest": {
+            "headRefOid": "abc", "isDraft": True, "state": "OPEN", "labels": {"nodes": [{"name": "x"}]},
+            "createdAt": created or iso(T0 - timedelta(hours=1)),
+            "commits": {"nodes": [{"commit": {"committedDate": iso(T0), "checkSuites": {"nodes": []}}}]},
+            "timelineItems": {"nodes": [{"createdAt": r} for r in ready]},
+            "reviews": {"nodes": []}, "reviewThreads": {"nodes": []},
+            "comments": {"nodes": [{"author": {"login": a}, "body": b, "createdAt": t} for a, b, t in comments]}}}}}
+
+        def fake_gh(*args, stdin=None):
+            return json.dumps(gql) if "graphql" in args else "[]"
+        orig = rv.gh; rv.gh = fake_gh; self.addCleanup(setattr, rv, "gh", orig)
+        return rv.fetch("o/r", 7)
+
+    def test_fetch_reports_draft_and_state(self):
+        got = self.fetch_with()
+        self.assertIs(got["draft"], True); self.assertEqual(got["state"], "OPEN")
+        self.assertEqual(got["head_sha"], "abc"); self.assertEqual(got["labels"], ["x"])
+
+    def test_fetch_derives_asked_at_from_pr_state(self):  # R23b / R23d
+        self.assertEqual(self.fetch_with()["asked_at"], iso(T0))
+        self.assertEqual(self.fetch_with(ready=[iso(T0 + timedelta(minutes=40))])["asked_at"], iso(T0 + timedelta(minutes=40)))
+
+    def test_review_requests_never_move_the_clock_but_still_count_as_nudged(self):  # R23d
+        for login in ("blakejgruber", "github-actions", "github-actions[bot]"):
+            got = self.fetch_with(ready=[iso(T0 + timedelta(minutes=40))],
+                                  comments=[(login, "@codex review", iso(T0 + timedelta(minutes=75)))])
+            self.assertEqual(got["asked_at"], iso(T0 + timedelta(minutes=40)), login)
+            self.assertTrue(got["nudged"], login)
+        got = self.fetch_with(created=iso(T0 + timedelta(minutes=45)),
+                              comments=[("blakejgruber", "@codex review", iso(T0 + timedelta(minutes=60)))])
+        self.assertEqual(got["asked_at"], iso(T0 + timedelta(minutes=45)))  # R23e: still only events
+
+    def test_pr_opened_after_the_push_starts_the_clock(self):  # R23e
+        self.assertEqual(self.fetch_with(created=iso(T0 + timedelta(minutes=45)))["asked_at"], iso(T0 + timedelta(minutes=45)))
+
+    def test_reopen_event_starts_the_clock(self):  # R23e: timeline nodes carry READY_FOR_REVIEW and REOPENED alike
+        self.assertEqual(self.fetch_with(ready=[iso(T0 + timedelta(hours=2))])["asked_at"], iso(T0 + timedelta(hours=2)))
+
+    def test_query_asks_for_pr_created_at_and_both_event_types(self):  # R23e wiring
+        self.assertRegex(rv.GQL, r"pullRequest\(number:\$n\)\{\s*headRefOid[^\n]*\bcreatedAt\b")
+        self.assertIn("itemTypes:[READY_FOR_REVIEW_EVENT, REOPENED_EVENT]", rv.GQL)
+        self.assertIn("... on ReopenedEvent{createdAt}", rv.GQL)
+
+
+class CliDispatch(unittest.TestCase):
+    def patch(self, name, fn):
+        orig = getattr(rv, name); setattr(rv, name, fn); self.addCleanup(setattr, rv, name, orig)
+
+    def test_poll_subcommand(self):
+        calls = []
+        self.patch("poll", lambda repo, n, rereview=False: calls.append((repo, n, rereview)) or pending())
+        self.assertEqual(rv.main(["rv", "poll", "o/r", "5"]), 0)
+        self.assertEqual(rv.main(["rv", "poll", "o/r", "5", "--rereview"]), 0)
+        self.assertEqual(calls, [("o/r", 5, False), ("o/r", 5, True)])
+
+    def test_poll_rejects_unknown_flags(self):
+        self.patch("poll", lambda *a, **k: self.fail("poll must not run"))
+        self.assertEqual(rv.main(["rv", "poll", "o/r", "5", "--rereveiw"]), 2)
+        self.assertEqual(rv.main(["rv", "poll", "o/r"]), 2)
+
+    def test_one_shot_subcommand_uses_run_once(self):
+        calls = []
+        self.patch("run_once", lambda repo, n, rereview=False: calls.append((repo, n, rereview)) or (pr(), pending(), T0))
+        self.assertEqual(rv.main(["rv", "o/r", "9"]), 0)
+        self.assertEqual(calls, [("o/r", 9, False)])
+
+
+# ==== Fix round 1 ======================================================================
+class Rounds(unittest.TestCase):  # R22
+    def test_two_reviews_of_the_same_sha_are_one_round_and_p1_still_blocks(self):
+        p = pr(reviews=[review(3), review(5), review(7)], threads=[thread("T1", 1, 3)])
+        v = compute(p, T0 + timedelta(minutes=8))
+        self.assertEqual(v["state"], "failure"); self.assertTrue(v["description"].startswith("round 1:"))
+
+    def test_empty_commit_sha_review_is_its_own_round(self):
+        # SHAs a + new = 2 rounds, plus two empty-SHA reviews = 4: P1 no longer blocks.
+        p = pr(reviews=[review(1, sha="a"), review(2, sha=""), review(3, sha=""), review(4)],
+               threads=[thread("T1", 1, 4)])
+        v = compute(p, T0 + timedelta(minutes=5))
+        self.assertEqual(v["state"], "success"); self.assertTrue(v["description"].startswith("round 4:"))
+
+    def test_second_distinct_sha_is_round_2_and_p1_blocks(self):
+        p = pr(reviews=[review(3, sha="a"), review(9)], threads=[thread("T9", 1, 9)])
+        v = compute(p, T0 + timedelta(minutes=10))
+        self.assertEqual(v["state"], "failure"); self.assertTrue(v["description"].startswith("round 2:"))
+
+
+ASK = T0 + timedelta(minutes=40)  # e.g. draft -> ready 40 min after the push
+
+
+class AskedAtClock(unittest.TestCase):  # R23
+    def test_ready_40_min_after_push_is_pending_not_unavailable_and_not_nudged(self):
+        v = compute(pr(asked_at=iso(ASK)), ASK + timedelta(seconds=30))
+        self.assertEqual(v["state"], "pending"); self.assertFalse(v["nudge"])
+        self.assertNotIn("codex-unavailable", v["description"])
+
+    def test_nudge_10_min_after_asked_at(self):
+        self.assertFalse(compute(pr(asked_at=iso(ASK)), ASK + timedelta(minutes=9, seconds=59))["nudge"])
+        self.assertTrue(compute(pr(asked_at=iso(ASK)), ASK + timedelta(minutes=10))["nudge"])
+
+    def test_unavailable_30_min_after_asked_at(self):
+        self.assertEqual(compute(pr(asked_at=iso(ASK)), ASK + timedelta(minutes=29, seconds=59))["state"], "pending")
+        v = compute(pr(asked_at=iso(ASK)), ASK + timedelta(minutes=30))
+        self.assertEqual(v["state"], "failure"); self.assertIn("codex-unavailable", v["description"])
+
+    def test_resolved_without_push_p1_still_blocks_when_asked_at_is_later(self):
+        # `cleared` stays on head_pushed_at: the thread (T0+3) is after the push (T0), so
+        # resolving it without a push must not clear it just because asked_at is later.
+        p = pr(asked_at=iso(ASK), reviews=[review(3)], threads=[thread("T1", 1, 3, resolved=True)])
+        self.assertEqual(compute(p, ASK + timedelta(minutes=1))["state"], "failure")
+
+    def test_after_filter_stays_on_head_pushed_at(self):
+        # a 👍 between the push and asked_at is still a verdict for this head (no summary)
+        r = {"user": CODEX, "content": "+1", "created_at": iso(T0 + timedelta(minutes=5))}
+        self.assertEqual(compute(pr(asked_at=iso(ASK), reactions=[r]), ASK + timedelta(minutes=1))["state"], "success")
+
+    def test_asked_at_before_push_is_ignored(self):
+        v = compute(pr(asked_at=iso(T0 - timedelta(hours=1))), T0 + timedelta(minutes=30))
+        self.assertEqual(v["state"], "failure"); self.assertIn("codex-unavailable", v["description"])
+
+    def test_poll_deadline_uses_the_later_of_push_and_asked_at(self):
+        p = pr(asked_at=iso(ASK))
+        self.assertFalse(rv.poll_done(p, pending(), ASK + timedelta(minutes=30, seconds=59)))
+        self.assertTrue(rv.poll_done(p, pending(), ASK + timedelta(minutes=31)))
+
+    def test_once_path_uses_the_fetched_asked_at(self):
+        # Review Focus 4: the clock comes from fetch(), so a one-shot run (e.g. Codex's
+        # "running" summary edit) right after draft -> ready posts what the poller posts.
+        FakeGitHub(pr(asked_at=iso(ASK))).install(self)
+        _, v, _ = rv.run_once("o/r", 7, now=ASK + timedelta(minutes=1))
+        self.assertEqual(v["state"], "pending"); self.assertNotIn("codex-unavailable", v["description"])
+
+    def test_same_pr_same_status_whichever_mode_runs(self):
+        now = ASK + timedelta(minutes=1)
+        FakeGitHub(pr(asked_at=iso(ASK), summary={"status": "running", "commit": "new"})).install(self)
+        _, once_v, _ = rv.run_once("o/r", 7, now=now)                 # e.g. Codex's "running" summary edit
+        _, poll_v, _ = rv.run_once("o/r", 7, rereview=True, now=now)  # a synchronize poller's first pass
+        self.assertEqual(once_v, poll_v); self.assertEqual(once_v["state"], "pending")
+
+
+class PollSinceRemoved(unittest.TestCase):  # R23b: the clock is fetched, not passed in
+    def test_since_is_a_usage_error(self):
+        orig = rv.poll; rv.poll = lambda *a, **k: self.fail("poll must not run"); self.addCleanup(setattr, rv, "poll", orig)
+        self.assertEqual(rv.main(["rv", "poll", "o/r", "5", "--since", "2026-09-27T22:04:49Z"]), 2)
+        self.assertEqual(rv.main(["rv", "poll", "o/r", "5", "--rereview", "--rereview"]), 2)
+
+
+class DeriveAskedAt(unittest.TestCase):  # R23d: max(push, latest draft -> ready); comments never count
+    def test_none_present_is_head_pushed_at(self):
+        self.assertEqual(rv.derive_asked_at(iso(T0), []), iso(T0))
+
+    def test_push_wins_over_an_older_ready_event(self):
+        self.assertEqual(rv.derive_asked_at(iso(T0), [iso(T0 - timedelta(minutes=5))]), iso(T0))
+
+    def test_latest_ready_for_review_wins(self):
+        got = rv.derive_asked_at(iso(T0), [iso(T0 + timedelta(minutes=20)), iso(T0 + timedelta(minutes=40))])
+        self.assertEqual(got, iso(T0 + timedelta(minutes=40)))
+
+
+class SilentCodexReplay(unittest.TestCase):  # R23c/R23d: every silent-Codex path ends inside the poll timeout
+    POLL_JOB_TIMEOUT = timedelta(minutes=35)  # reusable workflow, poll job timeout-minutes
+
+    def state_at(self, minutes, comments, ready=(), summary=None):
+        """Rebuild the PR exactly as fetch() would (nudged from the comments, asked_at from push/ready)."""
+        p = pr(comments=comments, nudged=rv.is_nudged(comments, iso(T0)), summary=summary,
+               asked_at=rv.derive_asked_at(iso(T0), list(ready)))
+        now = T0 + timedelta(minutes=minutes)
+        v = compute(p, now)
+        return p, v, now
+
+    def gate_nudge(self, minutes):
+        return {"author": "github-actions", "body": "@codex review", "created_at": iso(T0 + timedelta(minutes=minutes))}
+
+    def test_opened_nudge_at_10_no_codex_is_unavailable_at_30_inside_the_poll_timeout(self):
+        _, v, _ = self.state_at(10, [])
+        self.assertTrue(v["nudge"])  # the gate posts its nudge here
+        nudged = [self.gate_nudge(10)]
+        _, v, _ = self.state_at(29, nudged)
+        self.assertEqual(v["state"], "pending"); self.assertFalse(v["nudge"])
+        p, v, now = self.state_at(30, nudged)
+        self.assertEqual(v["state"], "failure"); self.assertIn("codex-unavailable", v["description"])
+        self.assertTrue(rv.poll_done(p, v, now))
+        self.assertLess(now - T0, self.POLL_JOB_TIMEOUT)
+
+    def test_ready_for_review_nudge_no_codex_is_unavailable_30_min_after_ready(self):
+        ready = [iso(T0 + timedelta(minutes=40))]  # poller starts at +40
+        nudged = [self.gate_nudge(50)]
+        _, v, _ = self.state_at(69, nudged, ready)
+        self.assertEqual(v["state"], "pending")
+        p, v, now = self.state_at(70, nudged, ready)
+        self.assertEqual(v["state"], "failure"); self.assertTrue(rv.poll_done(p, v, now))
+        self.assertLess(now - (T0 + timedelta(minutes=40)), self.POLL_JOB_TIMEOUT)
+
+    def human_retry(self, minutes):
+        return {"author": "blakejgruber", "body": "@codex review", "created_at": iso(T0 + timedelta(minutes=minutes))}
+
+    def test_human_retry_at_20_does_not_restart_the_window(self):
+        # Reviewer's scenario (R23d): push t=0, human retry t=+20, Codex silent. Under R23c the
+        # retry moved the deadline to +51, past the 35-min job timeout (killed while pending).
+        retry = [self.human_retry(20)]
+        _, v, _ = self.state_at(29, retry)
+        self.assertEqual(v["state"], "pending"); self.assertFalse(v["nudge"])  # the retry counts as the nudge
+        p, v, now = self.state_at(30, retry)
+        self.assertEqual(v["state"], "failure"); self.assertIn("codex-unavailable", v["description"])
+        self.assertTrue(rv.poll_done(p, v, now))
+        p31, v31, now31 = self.state_at(31, retry)
+        self.assertTrue(rv.poll_done(p31, v31, now31))
+        self.assertLess(now31 - T0, self.POLL_JOB_TIMEOUT)
+
+    def test_retry_after_codex_unavailable_is_recomputed_by_codexs_summary_edit(self):
+        # spec §6: the status stays codex-unavailable after a retry; Codex's summary edit
+        # (an issue_comment event -> one-shot run) recomputes it once the review lands.
+        retry = [self.gate_nudge(10), self.human_retry(35)]
+        _, v, _ = self.state_at(40, retry)
+        self.assertEqual(v["state"], "failure"); self.assertIn("codex-unavailable", v["description"])
+        _, v, _ = self.state_at(45, retry, summary={"status": "completed", "commit": "new"})
+        self.assertEqual(v["state"], "success")
+
+    # ---- R23e: PR creation and reopen are clock starts too -----------------------------
+    def assert_relative_timings(self, start_min):
+        """From a clock start at T0+start_min (its own poller starts there): pending at +5,
+        nudge at +10, codex-unavailable at +30 -- all inside that poller's 35-min timeout."""
+        starts = [iso(T0 + timedelta(minutes=start_min))]
+        _, v, _ = self.state_at(start_min + 5, [], starts)
+        self.assertEqual(v["state"], "pending"); self.assertFalse(v["nudge"])
+        _, v, _ = self.state_at(start_min + 10, [], starts)
+        self.assertEqual(v["state"], "pending"); self.assertTrue(v["nudge"])
+        nudged = [self.gate_nudge(start_min + 10)]
+        _, v, _ = self.state_at(start_min + 29, nudged, starts)
+        self.assertEqual(v["state"], "pending")
+        p, v, now = self.state_at(start_min + 30, nudged, starts)
+        self.assertEqual(v["state"], "failure"); self.assertIn("codex-unavailable", v["description"])
+        self.assertTrue(rv.poll_done(p, v, now))
+        self.assertLess(now - rv.ts(starts[0]), self.POLL_JOB_TIMEOUT)
+
+    def test_pr_opened_45_min_after_the_push(self):
+        self.assert_relative_timings(45)   # the P1: previously codex-unavailable on the first poll
+
+    def test_pr_reopened_2_hours_after_the_push(self):
+        self.assert_relative_timings(120)
+
+    def test_every_clock_start_ends_inside_the_poll_timeout(self):
+        # push (synchronize) = 0; open / ready / reopen at arbitrary later times
+        for start in (0, 7, 45, 120, 600):
+            with self.subTest(start=start):
+                self.assert_relative_timings(start)
+
+
+class ClockStartsHaveAPoller(unittest.TestCase):  # R23e invariant
+    """Every event that can set asked_at must also start a poller, or the deadline could fall
+    outside any running poller: push -> synchronize, PR creation -> opened, READY_FOR_REVIEW_EVENT
+    -> ready_for_review, REOPENED_EVENT -> reopened."""
+    CLOCK_START_ACTIONS = {"synchronize", "opened", "ready_for_review", "reopened"}
+
+    def test_poll_job_triggers_cover_every_clock_start(self):
+        try:
+            import yaml
+        except ImportError:
+            self.skipTest("PyYAML not installed")
+        wf = os.path.join(os.path.dirname(__file__), "..", ".github", "workflows", "review-verdict.yml")
+        with open(wf) as f:
+            cond = yaml.safe_load(f)["jobs"]["poll"]["if"]
+        m = re.search(r"fromJSON\('(\[.*?\])'\)", cond)
+        self.assertIsNotNone(m, cond)
+        self.assertEqual(set(json.loads(m.group(1))), self.CLOCK_START_ACTIONS)
+        self.assertIn("github.event_name == 'pull_request'", cond)
+
+
+class DrillFixtures(unittest.TestCase):
+    def load(self, name):
+        with open(os.path.join(DRILLS, name)) as f:
+            return json.load(f)
+
+    def test_p1_open_is_failure(self):
+        p = self.load("p1-open.json")
+        self.assertIsNone(p["summary"]); self.assertIs(p["draft"], False)
+        self.assertEqual(p["reviews"][0]["commit_sha"], p["head_sha"])
+        v = compute(p, datetime.now(timezone.utc))
+        self.assertEqual(v["state"], "failure"); self.assertIn("unresolved P0/P1", v["description"])
+
+    def test_clean_is_success(self):
+        p = self.load("clean.json")
+        self.assertIsNone(p["summary"]); self.assertIs(p["draft"], False); self.assertEqual(p["threads"], [])
+        self.assertEqual(p["reviews"][0]["commit_sha"], p["head_sha"])
+        self.assertEqual(compute(p, datetime.now(timezone.utc))["state"], "success")
 
 
 if __name__ == "__main__":
