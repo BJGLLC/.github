@@ -1,0 +1,19 @@
+{
+  "head_sha": "d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1",
+  "head_pushed_at": "2026-01-01T00:00:00Z",
+  "state": "OPEN",
+  "draft": false,
+  "labels": [],
+  "summary": null,
+  "nudged": false,
+  "reviews": [
+    {"author": "chatgpt-codex-connector", "submitted_at": "2026-01-01T00:05:00Z", "commit_sha": "d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1"}
+  ],
+  "comments": [],
+  "reactions": [],
+  "threads": [
+    {"id": "DRILL_P1", "is_resolved": false, "comments": [
+      {"author": "chatgpt-codex-connector", "body": "<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub> Drill: synthetic P1 finding (review v4 red-proof).", "created_at": "2026-01-01T00:05:00Z", "commit_sha": "d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1"}
+    ]}
+  ]
+}

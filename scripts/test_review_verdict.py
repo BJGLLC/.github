@@ -310,5 +310,268 @@ class NudgedHelper(unittest.TestCase):
         self.assertFalse(is_nudged(comments, iso(T0)))
 
 
+# ==== Task 8 (SSSF-23): drafts, poll loop, re-review, drills ========================
+# New names are reached through the module (rv.*) so the older tests above keep
+# running while these are RED.
+import json
+import subprocess
+import review_verdict as rv
+
+DRILLS = os.path.join(os.path.dirname(__file__), "drills")
+DRAFT_DESC = "draft: Codex reviews when marked ready"
+
+
+class Draft(unittest.TestCase):
+    def test_draft_is_pending_with_draft_description_and_no_nudge(self):
+        v = compute(pr(draft=True), T0 + timedelta(minutes=11))
+        self.assertEqual(v, {"state": "pending", "description": DRAFT_DESC, "queue": [], "nudge": False})
+
+    def test_draft_is_never_codex_unavailable(self):
+        v = compute(pr(draft=True), T0 + timedelta(hours=5))
+        self.assertEqual(v["state"], "pending"); self.assertEqual(v["description"], DRAFT_DESC)
+
+    def test_draft_ignores_findings_and_does_not_queue(self):
+        v = compute(pr(draft=True, reviews=[review(3)], threads=[thread("T1", 1, 3), thread("T2", 2, 3)]),
+                    T0 + timedelta(minutes=4))
+        self.assertEqual(v["state"], "pending"); self.assertEqual(v["queue"], [])
+
+    def test_hotfix_wins_over_draft(self):
+        v = compute(pr(draft=True, labels=["hotfix"]), T0 + timedelta(minutes=1))
+        self.assertEqual(v["state"], "success")
+
+    def test_non_draft_unchanged(self):
+        self.assertEqual(compute(pr(draft=False), T0 + timedelta(minutes=5))["state"], "pending")
+        self.assertIn("waiting for Codex", compute(pr(draft=False), T0 + timedelta(minutes=5))["description"])
+
+
+class ClosedPrNeverNudged(unittest.TestCase):
+    def test_closed_or_merged_pr_is_not_nudged(self):
+        for state in ("CLOSED", "MERGED"):
+            self.assertFalse(compute(pr(state=state), T0 + timedelta(minutes=11))["nudge"], state)
+
+    def test_open_pr_still_nudged(self):
+        self.assertTrue(compute(pr(state="OPEN"), T0 + timedelta(minutes=11))["nudge"])
+
+
+def pending():
+    return {"state": "pending", "description": "waiting", "queue": [], "nudge": False}
+
+
+class PollDone(unittest.TestCase):
+    def test_keeps_polling_while_pending_before_deadline(self):
+        self.assertFalse(rv.poll_done(pr(), pending(), T0 + timedelta(minutes=5)))
+
+    def test_stops_on_any_non_pending_state(self):
+        for state in ("success", "failure"):
+            self.assertTrue(rv.poll_done(pr(), dict(pending(), state=state), T0 + timedelta(minutes=1)), state)
+
+    def test_stops_at_31_minutes_after_push(self):
+        self.assertFalse(rv.poll_done(pr(), pending(), T0 + timedelta(minutes=30, seconds=59)))
+        self.assertTrue(rv.poll_done(pr(), pending(), T0 + timedelta(minutes=31)))
+
+    def test_rerun_long_after_push_stops_immediately(self):
+        self.assertTrue(rv.poll_done(pr(), pending(), T0 + timedelta(days=2)))
+
+    def test_draft_stops_immediately_even_though_pending(self):
+        # R16: a draft push must bill ~1 minute, not 31.
+        p = pr(draft=True)
+        v = compute(p, T0 + timedelta(seconds=30))
+        self.assertEqual(v["state"], "pending")
+        self.assertTrue(rv.poll_done(p, v, T0 + timedelta(seconds=30)))
+
+    def test_closed_or_merged_mid_poll_stops(self):
+        for state in ("CLOSED", "MERGED"):
+            self.assertTrue(rv.poll_done(pr(state=state), pending(), T0 + timedelta(minutes=2)), state)
+
+
+class WantsRereview(unittest.TestCase):
+    def test_summary_for_previous_commit_wants_rereview(self):
+        self.assertTrue(rv.wants_rereview(pr(summary={"status": "completed", "commit": "old"})))
+
+    def test_error_summary_for_previous_commit_wants_rereview(self):
+        self.assertTrue(rv.wants_rereview(pr(summary={"status": "error", "commit": "old"})))
+
+    def test_no_summary_means_no_rereview(self):
+        self.assertFalse(rv.wants_rereview(pr(summary=None)))
+        self.assertFalse(rv.wants_rereview(pr()))
+
+    def test_summary_already_for_head_means_no_rereview(self):
+        for status in ("completed", "running", "error", "unknown"):
+            self.assertFalse(rv.wants_rereview(pr(head_sha="abc1234def", summary={"status": status, "commit": "abc1234"})), status)
+
+    def test_running_summary_means_no_rereview(self):
+        # Codex is mid-review; compute's 10-minute nudge is the backstop.
+        self.assertFalse(rv.wants_rereview(pr(summary={"status": "running", "commit": "old"})))
+
+    def test_already_nudged_means_no_rereview(self):
+        self.assertFalse(rv.wants_rereview(pr(nudged=True, summary={"status": "completed", "commit": "old"})))
+
+    def test_summary_without_commit_means_no_rereview(self):
+        self.assertFalse(rv.wants_rereview(pr(summary={"status": "completed", "commit": None})))
+        self.assertFalse(rv.wants_rereview(pr(summary={"status": "completed", "commit": ""})))
+
+    def test_draft_closed_or_hotfix_means_no_rereview(self):
+        s = {"status": "completed", "commit": "old"}
+        self.assertFalse(rv.wants_rereview(pr(draft=True, summary=s)))
+        self.assertFalse(rv.wants_rereview(pr(state="CLOSED", summary=s)))
+        self.assertFalse(rv.wants_rereview(pr(labels=["hotfix"], summary=s)))
+
+
+class FakeGitHub:
+    """Records the side effects run_once performs; hands back a fixed PR from fetch."""
+    def __init__(self, prdict):
+        self.prdict, self.calls = prdict, []
+
+    def install(self, test):
+        for name, fn in (("fetch", self.fetch), ("post_status", self.post_status),
+                         ("resolve_thread", self.resolve_thread), ("comment", self.comment)):
+            orig = getattr(rv, name)
+            setattr(rv, name, fn)
+            test.addCleanup(setattr, rv, name, orig)
+        return self
+
+    def fetch(self, repo, n):
+        self.calls.append(("fetch", repo, n)); return json.loads(json.dumps(self.prdict))
+
+    def post_status(self, repo, sha, v):
+        self.calls.append(("status", sha, v["state"])); return "posted"
+
+    def resolve_thread(self, tid, reply):
+        self.calls.append(("resolve", tid))
+
+    def comment(self, repo, n, body):
+        self.calls.append(("comment", body))
+
+
+class RunOnce(unittest.TestCase):
+    def test_posts_status_and_resolves_queued_threads(self):
+        g = FakeGitHub(pr(reviews=[review(3)], threads=[thread("T2", 2, 3)])).install(self)
+        _, v, _ = rv.run_once("o/r", 7, now=T0 + timedelta(minutes=4))
+        self.assertEqual(v["state"], "success")
+        self.assertEqual(g.calls, [("fetch", "o/r", 7), ("status", "new", "success"), ("resolve", "T2")])
+
+    def test_nudges_when_compute_says_so(self):
+        g = FakeGitHub(pr()).install(self)
+        rv.run_once("o/r", 7, now=T0 + timedelta(minutes=11))
+        self.assertEqual(g.calls[-1], ("comment", "@codex review"))
+
+    def test_rereview_comment_goes_out_before_the_status_and_only_once(self):
+        # 11 min after the push compute would also nudge; the rereview comment must
+        # mark the SHA nudged so the same run does not post `@codex review` twice.
+        g = FakeGitHub(pr(summary={"status": "completed", "commit": "old"})).install(self)
+        rv.run_once("o/r", 7, rereview=True, now=T0 + timedelta(minutes=11))
+        comments = [c for c in g.calls if c[0] == "comment"]
+        self.assertEqual(comments, [("comment", "@codex review")])
+        self.assertLess(g.calls.index(("comment", "@codex review")), [c[0] for c in g.calls].index("status"))
+
+    def test_no_rereview_flag_no_rereview_comment(self):
+        g = FakeGitHub(pr(summary={"status": "completed", "commit": "old"})).install(self)
+        rv.run_once("o/r", 7, now=T0 + timedelta(minutes=1))
+        self.assertNotIn("comment", [c[0] for c in g.calls])
+
+
+class PollLoop(unittest.TestCase):
+    def run_poll(self, results, **kw):
+        """results: list of (state, pr-overrides) or Exception; one per iteration."""
+        seen, sleeps = [], []
+        it = iter(results)
+
+        def step(repo, n, rereview=False):
+            seen.append(rereview)
+            r = next(it)
+            if isinstance(r, Exception):
+                raise r
+            state, over = r
+            return pr(**over), dict(pending(), state=state), T0 + timedelta(minutes=len(seen))
+
+        v = rv.poll("o/r", 7, step=step, sleep=sleeps.append, **kw)
+        return v, seen, sleeps
+
+    def test_stops_on_first_non_pending_and_sleeps_between(self):
+        v, seen, sleeps = self.run_poll([("pending", {}), ("pending", {}), ("success", {})])
+        self.assertEqual(v["state"], "success"); self.assertEqual(len(seen), 3)
+        self.assertEqual(sleeps, [60, 60])
+
+    def test_rereview_only_on_first_iteration(self):
+        _, seen, _ = self.run_poll([("pending", {}), ("failure", {})], rereview=True)
+        self.assertEqual(seen, [True, False])
+
+    def test_draft_ends_after_one_iteration(self):
+        v, seen, sleeps = self.run_poll([("pending", {"draft": True})])
+        self.assertEqual(len(seen), 1); self.assertEqual(sleeps, [])
+
+    def test_transient_error_is_retried_and_rereview_survives_it(self):
+        err = subprocess.CalledProcessError(1, ["gh"], stderr="HTTP 502")
+        v, seen, _ = self.run_poll([err, ("success", {})], rereview=True)
+        self.assertEqual(v["state"], "success"); self.assertEqual(seen, [True, True])
+
+    def test_three_consecutive_errors_give_up(self):
+        err = subprocess.CalledProcessError(1, ["gh"], stderr="HTTP 502")
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.run_poll([("pending", {}), err, err, err, ("success", {})])
+
+    def test_error_count_resets_after_a_good_iteration(self):
+        err = subprocess.CalledProcessError(1, ["gh"], stderr="HTTP 502")
+        v, seen, _ = self.run_poll([err, err, ("pending", {}), err, err, ("success", {})])
+        self.assertEqual(v["state"], "success"); self.assertEqual(len(seen), 6)
+
+
+class FetchWiring(unittest.TestCase):
+    def test_fetch_reports_draft_and_state(self):
+        gql = {"data": {"repository": {"pullRequest": {
+            "headRefOid": "abc", "isDraft": True, "state": "OPEN", "labels": {"nodes": [{"name": "x"}]},
+            "commits": {"nodes": [{"commit": {"committedDate": iso(T0), "checkSuites": {"nodes": []}}}]},
+            "reviews": {"nodes": []}, "comments": {"nodes": []}, "reviewThreads": {"nodes": []}}}}}
+
+        def fake_gh(*args, stdin=None):
+            return json.dumps(gql) if "graphql" in args else "[]"
+        orig = rv.gh; rv.gh = fake_gh; self.addCleanup(setattr, rv, "gh", orig)
+        got = rv.fetch("o/r", 7)
+        self.assertIs(got["draft"], True); self.assertEqual(got["state"], "OPEN")
+        self.assertEqual(got["head_sha"], "abc"); self.assertEqual(got["labels"], ["x"])
+
+
+class CliDispatch(unittest.TestCase):
+    def patch(self, name, fn):
+        orig = getattr(rv, name); setattr(rv, name, fn); self.addCleanup(setattr, rv, name, orig)
+
+    def test_poll_subcommand(self):
+        calls = []
+        self.patch("poll", lambda repo, n, rereview=False: calls.append((repo, n, rereview)) or pending())
+        self.assertEqual(rv.main(["rv", "poll", "o/r", "5"]), 0)
+        self.assertEqual(rv.main(["rv", "poll", "o/r", "5", "--rereview"]), 0)
+        self.assertEqual(calls, [("o/r", 5, False), ("o/r", 5, True)])
+
+    def test_poll_rejects_unknown_flags(self):
+        self.patch("poll", lambda *a, **k: self.fail("poll must not run"))
+        self.assertEqual(rv.main(["rv", "poll", "o/r", "5", "--rereveiw"]), 2)
+        self.assertEqual(rv.main(["rv", "poll", "o/r"]), 2)
+
+    def test_one_shot_subcommand_uses_run_once(self):
+        calls = []
+        self.patch("run_once", lambda repo, n, rereview=False: calls.append((repo, n, rereview)) or (pr(), pending(), T0))
+        self.assertEqual(rv.main(["rv", "o/r", "9"]), 0)
+        self.assertEqual(calls, [("o/r", 9, False)])
+
+
+class DrillFixtures(unittest.TestCase):
+    def load(self, name):
+        with open(os.path.join(DRILLS, name)) as f:
+            return json.load(f)
+
+    def test_p1_open_is_failure(self):
+        p = self.load("p1-open.json")
+        self.assertIsNone(p["summary"]); self.assertIs(p["draft"], False)
+        self.assertEqual(p["reviews"][0]["commit_sha"], p["head_sha"])
+        v = compute(p, datetime.now(timezone.utc))
+        self.assertEqual(v["state"], "failure"); self.assertIn("unresolved P0/P1", v["description"])
+
+    def test_clean_is_success(self):
+        p = self.load("clean.json")
+        self.assertIsNone(p["summary"]); self.assertIs(p["draft"], False); self.assertEqual(p["threads"], [])
+        self.assertEqual(p["reviews"][0]["commit_sha"], p["head_sha"])
+        self.assertEqual(compute(p, datetime.now(timezone.utc))["state"], "success")
+
+
 if __name__ == "__main__":
     unittest.main()
