@@ -89,13 +89,14 @@ class Blocking(unittest.TestCase):
         v = compute(pr(reviews=[review(3)], threads=[thread("T2", 2, 3)]), T0 + timedelta(minutes=4))
         self.assertEqual(v["state"], "success"); self.assertEqual(v["queue"], ["T2"])
 
+    # R22: a round is a distinct reviewed SHA, so round 3 = three reviews on three SHAs.
     def test_round3_p1_is_queued_not_blocking(self):
-        p = pr(reviews=[review(3), review(6), review(9)], threads=[thread("T9", 1, 9)])
+        p = pr(reviews=[review(3, sha="a"), review(6, sha="b"), review(9)], threads=[thread("T9", 1, 9)])
         v = compute(p, T0 + timedelta(minutes=10))
         self.assertEqual(v["state"], "success"); self.assertEqual(v["queue"], ["T9"])
 
     def test_round3_p0_still_blocks(self):
-        p = pr(reviews=[review(3), review(6), review(9)], threads=[thread("T9", 0, 9)])
+        p = pr(reviews=[review(3, sha="a"), review(6, sha="b"), review(9)], threads=[thread("T9", 0, 9)])
         self.assertEqual(compute(p, T0 + timedelta(minutes=10))["state"], "failure")
 
     def test_unbadged_codex_thread_counts_as_p2(self):
@@ -476,7 +477,7 @@ class PollLoop(unittest.TestCase):
         seen, sleeps = [], []
         it = iter(results)
 
-        def step(repo, n, rereview=False):
+        def step(repo, n, rereview=False, asked_at=None):
             seen.append(rereview)
             r = next(it)
             if isinstance(r, Exception):
@@ -537,7 +538,7 @@ class CliDispatch(unittest.TestCase):
 
     def test_poll_subcommand(self):
         calls = []
-        self.patch("poll", lambda repo, n, rereview=False: calls.append((repo, n, rereview)) or pending())
+        self.patch("poll", lambda repo, n, rereview=False, asked_at=None: calls.append((repo, n, rereview)) or pending())
         self.assertEqual(rv.main(["rv", "poll", "o/r", "5"]), 0)
         self.assertEqual(rv.main(["rv", "poll", "o/r", "5", "--rereview"]), 0)
         self.assertEqual(calls, [("o/r", 5, False), ("o/r", 5, True)])
@@ -552,6 +553,101 @@ class CliDispatch(unittest.TestCase):
         self.patch("run_once", lambda repo, n, rereview=False: calls.append((repo, n, rereview)) or (pr(), pending(), T0))
         self.assertEqual(rv.main(["rv", "o/r", "9"]), 0)
         self.assertEqual(calls, [("o/r", 9, False)])
+
+
+# ==== Fix round 1 ======================================================================
+class Rounds(unittest.TestCase):  # R22
+    def test_two_reviews_of_the_same_sha_are_one_round_and_p1_still_blocks(self):
+        p = pr(reviews=[review(3), review(5), review(7)], threads=[thread("T1", 1, 3)])
+        v = compute(p, T0 + timedelta(minutes=8))
+        self.assertEqual(v["state"], "failure"); self.assertTrue(v["description"].startswith("round 1:"))
+
+    def test_empty_commit_sha_review_is_its_own_round(self):
+        # SHAs a + new = 2 rounds, plus two empty-SHA reviews = 4: P1 no longer blocks.
+        p = pr(reviews=[review(1, sha="a"), review(2, sha=""), review(3, sha=""), review(4)],
+               threads=[thread("T1", 1, 4)])
+        v = compute(p, T0 + timedelta(minutes=5))
+        self.assertEqual(v["state"], "success"); self.assertTrue(v["description"].startswith("round 4:"))
+
+    def test_second_distinct_sha_is_round_2_and_p1_blocks(self):
+        p = pr(reviews=[review(3, sha="a"), review(9)], threads=[thread("T9", 1, 9)])
+        v = compute(p, T0 + timedelta(minutes=10))
+        self.assertEqual(v["state"], "failure"); self.assertTrue(v["description"].startswith("round 2:"))
+
+
+ASK = T0 + timedelta(minutes=40)  # e.g. draft -> ready 40 min after the push
+
+
+class AskedAtClock(unittest.TestCase):  # R23
+    def test_ready_40_min_after_push_is_pending_not_unavailable_and_not_nudged(self):
+        v = compute(pr(asked_at=iso(ASK)), ASK + timedelta(seconds=30))
+        self.assertEqual(v["state"], "pending"); self.assertFalse(v["nudge"])
+        self.assertNotIn("codex-unavailable", v["description"])
+
+    def test_nudge_10_min_after_asked_at(self):
+        self.assertFalse(compute(pr(asked_at=iso(ASK)), ASK + timedelta(minutes=9, seconds=59))["nudge"])
+        self.assertTrue(compute(pr(asked_at=iso(ASK)), ASK + timedelta(minutes=10))["nudge"])
+
+    def test_unavailable_30_min_after_asked_at(self):
+        self.assertEqual(compute(pr(asked_at=iso(ASK)), ASK + timedelta(minutes=29, seconds=59))["state"], "pending")
+        v = compute(pr(asked_at=iso(ASK)), ASK + timedelta(minutes=30))
+        self.assertEqual(v["state"], "failure"); self.assertIn("codex-unavailable", v["description"])
+
+    def test_resolved_without_push_p1_still_blocks_when_asked_at_is_later(self):
+        # `cleared` stays on head_pushed_at: the thread (T0+3) is after the push (T0), so
+        # resolving it without a push must not clear it just because asked_at is later.
+        p = pr(asked_at=iso(ASK), reviews=[review(3)], threads=[thread("T1", 1, 3, resolved=True)])
+        self.assertEqual(compute(p, ASK + timedelta(minutes=1))["state"], "failure")
+
+    def test_after_filter_stays_on_head_pushed_at(self):
+        # a 👍 between the push and asked_at is still a verdict for this head (no summary)
+        r = {"user": CODEX, "content": "+1", "created_at": iso(T0 + timedelta(minutes=5))}
+        self.assertEqual(compute(pr(asked_at=iso(ASK), reactions=[r]), ASK + timedelta(minutes=1))["state"], "success")
+
+    def test_asked_at_before_push_is_ignored(self):
+        v = compute(pr(asked_at=iso(T0 - timedelta(hours=1))), T0 + timedelta(minutes=30))
+        self.assertEqual(v["state"], "failure"); self.assertIn("codex-unavailable", v["description"])
+
+    def test_poll_deadline_uses_the_later_of_push_and_asked_at(self):
+        p = pr(asked_at=iso(ASK))
+        self.assertFalse(rv.poll_done(p, pending(), ASK + timedelta(minutes=30, seconds=59)))
+        self.assertTrue(rv.poll_done(p, pending(), ASK + timedelta(minutes=31)))
+
+    def test_run_once_injects_asked_at_into_the_fetched_pr(self):
+        FakeGitHub(pr()).install(self)
+        got, v, _ = rv.run_once("o/r", 7, asked_at=iso(ASK), now=ASK + timedelta(minutes=1))
+        self.assertEqual(got["asked_at"], iso(ASK)); self.assertEqual(v["state"], "pending")
+
+    def test_poll_passes_asked_at_to_every_iteration(self):
+        seen = []
+
+        def step(repo, n, rereview=False, asked_at=None):
+            seen.append(asked_at)
+            return pr(), dict(pending(), state="pending" if len(seen) < 2 else "success"), T0
+
+        rv.poll("o/r", 7, asked_at=iso(ASK), step=step, sleep=lambda s: None)
+        self.assertEqual(seen, [iso(ASK), iso(ASK)])
+
+
+class PollSinceFlag(unittest.TestCase):
+    def setUp(self):
+        self.calls = []
+        orig = rv.poll
+        rv.poll = lambda repo, n, rereview=False, asked_at=None: self.calls.append((repo, n, rereview, asked_at)) or pending()
+        self.addCleanup(setattr, rv, "poll", orig)
+
+    def test_since_and_rereview_in_any_order(self):
+        s = "2026-09-27T22:04:49Z"
+        self.assertEqual(rv.main(["rv", "poll", "o/r", "5", "--since", s]), 0)
+        self.assertEqual(rv.main(["rv", "poll", "o/r", "5", "--since", s, "--rereview"]), 0)
+        self.assertEqual(rv.main(["rv", "poll", "o/r", "5", "--rereview", "--since", s]), 0)
+        self.assertEqual(self.calls, [("o/r", 5, False, s), ("o/r", 5, True, s), ("o/r", 5, True, s)])
+
+    def test_bad_since_is_a_usage_error(self):
+        for flags in (["--since"], ["--since", "yesterday"], ["--since", ""],
+                      ["--since", "2026-09-27T22:04:49Z", "--since", "2026-09-27T22:04:49Z"], ["--rereview", "--rereview"]):
+            self.assertEqual(rv.main(["rv", "poll", "o/r", "5", *flags]), 2, flags)
+        self.assertEqual(self.calls, [])
 
 
 class DrillFixtures(unittest.TestCase):

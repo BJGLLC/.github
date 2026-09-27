@@ -2,7 +2,7 @@
 """review-verdict: turn Codex's advisory review into one deterministic commit status.
 
 Pure part: compute(pr, now), parse_summary(body), pushed_at(commit_node), is_nudged(comments, head_pushed_at),
-poll_done(pr, verdict, now), wants_rereview(pr).
+poll_done(pr, verdict, now), wants_rereview(pr), clock_start(pr), parse_poll_flags(flags).
 Fetch/act part: fetch(repo, number) via `gh`; run_once = fetch -> [re-review request] -> compute ->
 post status -> auto-resolve queued threads -> nudge; poll = run_once every 60 s until poll_done.
 The reusable workflow (.github/workflows/review-verdict.yml) runs `poll` after a push and the
@@ -97,6 +97,17 @@ def is_open(pr):
     return pr.get("state", "OPEN") == "OPEN"
 
 
+def clock_start(pr):
+    """R23: when the wait for Codex began -- the later of the head push and the optional
+    `asked_at` (the event that asked Codex: PR opened, draft -> ready, reopened, pushed;
+    the poller's --since). It drives only the nudge / codex-unavailable ages and the poll
+    deadline; after() filtering and the thread `cleared` rule stay on head_pushed_at, so a
+    later asked_at can never clear a thread that was resolved without a push."""
+    pushed = ts(pr["head_pushed_at"])
+    asked = pr.get("asked_at")
+    return max(pushed, ts(asked)) if asked else pushed
+
+
 def compute(pr, now):
     if "hotfix" in pr.get("labels", []):
         return {"state": "success", "description": "hotfix: review skipped, post-hoc queued", "queue": [], "nudge": False}
@@ -145,7 +156,7 @@ def compute(pr, now):
         )
 
     if not has_verdict:
-        age = now - pushed
+        age = now - clock_start(pr)
         if age >= UNAVAILABLE_AFTER:
             return {"state": "failure", "description": "codex-unavailable: no verdict in 30 min. Retry `@codex review`, or label `hotfix` if urgent.", "queue": [], "nudge": False}
         nudge = age >= NUDGE_AFTER and not pr.get("nudged", False) and is_open(pr)
@@ -156,7 +167,11 @@ def compute(pr, now):
         # description too).
         return {"state": "pending", "description": f"waiting for Codex review of {head_sha[:7]}", "queue": [], "nudge": nudge}
 
-    round_no = len(reviews)  # distinct Codex review submissions on this PR, any SHA
+    # R22: a round is one reviewed SHA -- several Codex reviews of the same commit (e.g. a
+    # duplicate request) are one round; a review without a commit_sha cannot be matched to
+    # a SHA, so it counts as a round of its own.
+    round_no = (len({r["commit_sha"] for r in reviews if r.get("commit_sha")})
+                + sum(1 for r in reviews if not r.get("commit_sha")))
     blocking_max = 1 if round_no <= 2 else 0  # P0/P1 block in rounds 1-2, P0 only after
     blocking, queue = [], []
     for t in pr["threads"]:
@@ -183,12 +198,13 @@ def poll_done(pr, verdict, now):
     - the PR is a draft (Codex skips drafts; ready_for_review starts a new poller) -- so a
       draft push bills ~1 minute, not 31, or
     - the PR was closed/merged mid-poll (nobody will review it), or
-    - head_pushed_at + 31 min has passed, so a re-run long after a push does not wait again."""
+    - clock_start (later of head push / asked_at) + 31 min has passed, so a re-run long
+      after the push and the ask does not wait again."""
     if verdict["state"] != "pending":
         return True
     if pr.get("draft") or not is_open(pr):
         return True
-    return now >= ts(pr["head_pushed_at"]) + POLL_DEADLINE
+    return now >= clock_start(pr) + POLL_DEADLINE
 
 
 def wants_rereview(pr):
@@ -313,11 +329,14 @@ def comment(repo, number, body):
     gh("api", "-X", "POST", f"repos/{repo}/issues/{number}/comments", "-f", f"body={body}")
 
 
-def run_once(repo, number, rereview=False, now=None):
+def run_once(repo, number, rereview=False, now=None, asked_at=None):
     """The one-shot path, shared by `<repo> <n>` and every `poll` iteration:
     fetch -> [R6 re-review request] -> compute -> post status -> resolve queued -> nudge.
+    `asked_at` (the poller's --since) feeds compute's clock (R23).
     Returns (pr, verdict, now) so the poller can decide whether to keep going."""
     pr = fetch(repo, number)
+    if asked_at:
+        pr["asked_at"] = asked_at
     now = now or datetime.now(timezone.utc)
     if rereview and wants_rereview(pr):
         comment(repo, number, REVIEW_REQUEST)
@@ -333,17 +352,18 @@ def run_once(repo, number, rereview=False, now=None):
     return pr, v, now
 
 
-def poll(repo, number, rereview=False, *, step=None, sleep=time.sleep,
+def poll(repo, number, rereview=False, asked_at=None, *, step=None, sleep=time.sleep,
          interval=POLL_INTERVAL, max_errors=POLL_MAX_ERRORS):
     """run_once every `interval` s until poll_done. `rereview` applies to the first
-    successful iteration only. A failed iteration (gh/API hiccup) is retried; only
+    successful iteration only; `asked_at` to every iteration. A failed iteration
+    (gh/API hiccup) is retried; only
     `max_errors` consecutive failures end the poller, because a dead poller leaves the PR
     pending with no nudge and no 30-minute escalation until some other event arrives."""
     step = step or run_once
     errors = 0
     while True:
         try:
-            pr, v, now = step(repo, number, rereview=rereview)
+            pr, v, now = step(repo, number, rereview=rereview, asked_at=asked_at)
         except Exception as e:  # noqa: BLE001 -- bounded retry, re-raised below
             errors += 1
             detail = getattr(e, "stderr", "") or ""
@@ -359,8 +379,26 @@ def poll(repo, number, rereview=False, *, step=None, sleep=time.sleep,
 
 
 USAGE = ("usage: review_verdict.py compute <pr.json> [now-iso]\n"
-         "       review_verdict.py poll <owner/repo> <number> [--rereview]\n"
+         "       review_verdict.py poll <owner/repo> <number> [--rereview] [--since <iso>]\n"
          "       review_verdict.py <owner/repo> <number>")
+
+
+def parse_poll_flags(flags):
+    """[--rereview] [--since <iso-8601 UTC>] in any order, each at most once.
+    Returns (rereview, since) or None on a usage error (incl. an unparseable time)."""
+    rereview, since, i = False, None, 0
+    while i < len(flags):
+        if flags[i] == "--rereview" and not rereview:
+            rereview, i = True, i + 1
+        elif flags[i] == "--since" and since is None and i + 1 < len(flags):
+            try:
+                ts(flags[i + 1])
+            except ValueError:
+                return None
+            since, i = flags[i + 1], i + 2
+        else:
+            return None
+    return rereview, since
 
 
 def main(argv):
@@ -369,10 +407,11 @@ def main(argv):
         pr = json.load(open(args[1])); now = ts(args[2]) if len(args) > 2 else datetime.now(timezone.utc)
         print(json.dumps(compute(pr, now))); return 0
     try:
-        if args[:1] == ["poll"]:  # poll <repo> <n> [--rereview]  (after a push)
-            if len(args) not in (3, 4) or args[3:] not in ([], ["--rereview"]):
+        if args[:1] == ["poll"]:  # poll <repo> <n> [--rereview] [--since <iso>]  (after a push / ask)
+            flags = parse_poll_flags(args[3:]) if len(args) >= 3 else None
+            if flags is None:
                 print(USAGE, file=sys.stderr); return 2
-            poll(args[1], int(args[2]), rereview=args[3:] == ["--rereview"]); return 0
+            poll(args[1], int(args[2]), rereview=flags[0], asked_at=flags[1]); return 0
         if len(args) != 2:
             print(USAGE, file=sys.stderr); return 2
         run_once(args[0], int(args[1])); return 0
