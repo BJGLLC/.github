@@ -477,7 +477,7 @@ class PollLoop(unittest.TestCase):
         seen, sleeps = [], []
         it = iter(results)
 
-        def step(repo, n, rereview=False, asked_at=None):
+        def step(repo, n, rereview=False):  # R23b: no mode-specific clock input any more
             seen.append(rereview)
             r = next(it)
             if isinstance(r, Exception):
@@ -518,18 +518,30 @@ class PollLoop(unittest.TestCase):
 
 
 class FetchWiring(unittest.TestCase):
-    def test_fetch_reports_draft_and_state(self):
+    def fetch_with(self, ready=(), comments=()):
         gql = {"data": {"repository": {"pullRequest": {
             "headRefOid": "abc", "isDraft": True, "state": "OPEN", "labels": {"nodes": [{"name": "x"}]},
             "commits": {"nodes": [{"commit": {"committedDate": iso(T0), "checkSuites": {"nodes": []}}}]},
-            "reviews": {"nodes": []}, "comments": {"nodes": []}, "reviewThreads": {"nodes": []}}}}}
+            "timelineItems": {"nodes": [{"createdAt": r} for r in ready]},
+            "reviews": {"nodes": []}, "reviewThreads": {"nodes": []},
+            "comments": {"nodes": [{"author": {"login": a}, "body": b, "createdAt": t} for a, b, t in comments]}}}}}
 
         def fake_gh(*args, stdin=None):
             return json.dumps(gql) if "graphql" in args else "[]"
         orig = rv.gh; rv.gh = fake_gh; self.addCleanup(setattr, rv, "gh", orig)
-        got = rv.fetch("o/r", 7)
+        return rv.fetch("o/r", 7)
+
+    def test_fetch_reports_draft_and_state(self):
+        got = self.fetch_with()
         self.assertIs(got["draft"], True); self.assertEqual(got["state"], "OPEN")
         self.assertEqual(got["head_sha"], "abc"); self.assertEqual(got["labels"], ["x"])
+
+    def test_fetch_derives_asked_at_from_pr_state(self):  # R23b
+        self.assertEqual(self.fetch_with()["asked_at"], iso(T0))
+        self.assertEqual(self.fetch_with(ready=[iso(T0 + timedelta(minutes=40))])["asked_at"], iso(T0 + timedelta(minutes=40)))
+        got = self.fetch_with(ready=[iso(T0 + timedelta(minutes=40))],
+                              comments=[("blakejgruber", "@codex review", iso(T0 + timedelta(minutes=75)))])
+        self.assertEqual(got["asked_at"], iso(T0 + timedelta(minutes=75)))
 
 
 class CliDispatch(unittest.TestCase):
@@ -538,7 +550,7 @@ class CliDispatch(unittest.TestCase):
 
     def test_poll_subcommand(self):
         calls = []
-        self.patch("poll", lambda repo, n, rereview=False, asked_at=None: calls.append((repo, n, rereview)) or pending())
+        self.patch("poll", lambda repo, n, rereview=False: calls.append((repo, n, rereview)) or pending())
         self.assertEqual(rv.main(["rv", "poll", "o/r", "5"]), 0)
         self.assertEqual(rv.main(["rv", "poll", "o/r", "5", "--rereview"]), 0)
         self.assertEqual(calls, [("o/r", 5, False), ("o/r", 5, True)])
@@ -613,41 +625,51 @@ class AskedAtClock(unittest.TestCase):  # R23
         self.assertFalse(rv.poll_done(p, pending(), ASK + timedelta(minutes=30, seconds=59)))
         self.assertTrue(rv.poll_done(p, pending(), ASK + timedelta(minutes=31)))
 
-    def test_run_once_injects_asked_at_into_the_fetched_pr(self):
-        FakeGitHub(pr()).install(self)
-        got, v, _ = rv.run_once("o/r", 7, asked_at=iso(ASK), now=ASK + timedelta(minutes=1))
-        self.assertEqual(got["asked_at"], iso(ASK)); self.assertEqual(v["state"], "pending")
+    def test_once_path_uses_the_fetched_asked_at(self):
+        # Review Focus 4: the clock comes from fetch(), so a one-shot run (e.g. Codex's
+        # "running" summary edit) right after draft -> ready posts what the poller posts.
+        FakeGitHub(pr(asked_at=iso(ASK))).install(self)
+        _, v, _ = rv.run_once("o/r", 7, now=ASK + timedelta(minutes=1))
+        self.assertEqual(v["state"], "pending"); self.assertNotIn("codex-unavailable", v["description"])
 
-    def test_poll_passes_asked_at_to_every_iteration(self):
-        seen = []
-
-        def step(repo, n, rereview=False, asked_at=None):
-            seen.append(asked_at)
-            return pr(), dict(pending(), state="pending" if len(seen) < 2 else "success"), T0
-
-        rv.poll("o/r", 7, asked_at=iso(ASK), step=step, sleep=lambda s: None)
-        self.assertEqual(seen, [iso(ASK), iso(ASK)])
+    def test_same_pr_same_status_whichever_mode_runs(self):
+        now = ASK + timedelta(minutes=1)
+        FakeGitHub(pr(asked_at=iso(ASK), summary={"status": "running", "commit": "new"})).install(self)
+        _, once_v, _ = rv.run_once("o/r", 7, now=now)                 # e.g. Codex's "running" summary edit
+        _, poll_v, _ = rv.run_once("o/r", 7, rereview=True, now=now)  # a synchronize poller's first pass
+        self.assertEqual(once_v, poll_v); self.assertEqual(once_v["state"], "pending")
 
 
-class PollSinceFlag(unittest.TestCase):
-    def setUp(self):
-        self.calls = []
-        orig = rv.poll
-        rv.poll = lambda repo, n, rereview=False, asked_at=None: self.calls.append((repo, n, rereview, asked_at)) or pending()
-        self.addCleanup(setattr, rv, "poll", orig)
+class PollSinceRemoved(unittest.TestCase):  # R23b: the clock is fetched, not passed in
+    def test_since_is_a_usage_error(self):
+        orig = rv.poll; rv.poll = lambda *a, **k: self.fail("poll must not run"); self.addCleanup(setattr, rv, "poll", orig)
+        self.assertEqual(rv.main(["rv", "poll", "o/r", "5", "--since", "2026-09-27T22:04:49Z"]), 2)
+        self.assertEqual(rv.main(["rv", "poll", "o/r", "5", "--rereview", "--rereview"]), 2)
 
-    def test_since_and_rereview_in_any_order(self):
-        s = "2026-09-27T22:04:49Z"
-        self.assertEqual(rv.main(["rv", "poll", "o/r", "5", "--since", s]), 0)
-        self.assertEqual(rv.main(["rv", "poll", "o/r", "5", "--since", s, "--rereview"]), 0)
-        self.assertEqual(rv.main(["rv", "poll", "o/r", "5", "--rereview", "--since", s]), 0)
-        self.assertEqual(self.calls, [("o/r", 5, False, s), ("o/r", 5, True, s), ("o/r", 5, True, s)])
 
-    def test_bad_since_is_a_usage_error(self):
-        for flags in (["--since"], ["--since", "yesterday"], ["--since", ""],
-                      ["--since", "2026-09-27T22:04:49Z", "--since", "2026-09-27T22:04:49Z"], ["--rereview", "--rereview"]):
-            self.assertEqual(rv.main(["rv", "poll", "o/r", "5", *flags]), 2, flags)
-        self.assertEqual(self.calls, [])
+class DeriveAskedAt(unittest.TestCase):  # R23b: pure max-selection
+    def c(self, body, minutes, author="blakejgruber"):
+        return {"author": author, "body": body, "created_at": iso(T0 + timedelta(minutes=minutes))}
+
+    def test_none_present_is_head_pushed_at(self):
+        self.assertEqual(rv.derive_asked_at(iso(T0), [], []), iso(T0))
+
+    def test_push_wins_over_older_sources(self):
+        got = rv.derive_asked_at(iso(T0), [iso(T0 - timedelta(minutes=5))], [self.c("@codex review", -3)])
+        self.assertEqual(got, iso(T0))
+
+    def test_latest_ready_for_review_wins(self):
+        got = rv.derive_asked_at(iso(T0), [iso(T0 + timedelta(minutes=20)), iso(T0 + timedelta(minutes=40))], [])
+        self.assertEqual(got, iso(T0 + timedelta(minutes=40)))
+
+    def test_latest_codex_review_request_after_push_wins(self):
+        got = rv.derive_asked_at(iso(T0), [iso(T0 + timedelta(minutes=40))],
+                                 [self.c("@codex review", 50), self.c("  @codex review please", 60)])
+        self.assertEqual(got, iso(T0 + timedelta(minutes=60)))
+
+    def test_other_comments_do_not_count(self):
+        got = rv.derive_asked_at(iso(T0), [], [self.c("looks good", 50), self.c("please @codex review", 55)])
+        self.assertEqual(got, iso(T0))
 
 
 class DrillFixtures(unittest.TestCase):
