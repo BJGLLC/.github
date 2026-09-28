@@ -9,6 +9,9 @@ T0 = datetime(2026, 9, 26, 12, 0, tzinfo=timezone.utc)
 iso = lambda dt: dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 BADGE = "<sub>![P{p} Badge](https://img.shields.io/badge/P{p}-orange?style=flat)</sub> finding"
 FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures")
+# R32: pending descriptions for head "new" (the gate never comments; the description asks instead)
+WAIT_NEW = "waiting for Codex review of new"
+ASK_NEW = "no Codex review of new yet: comment @codex review"
 
 
 def pr(**over):
@@ -35,17 +38,22 @@ class Hotfix(unittest.TestCase):
     def test_label_short_circuits(self):
         v = compute(pr(labels=["hotfix"]), T0 + timedelta(minutes=1))
         self.assertEqual(v["state"], "success")
-        self.assertEqual(v["description"], "hotfix: review skipped, post-hoc queued")
+        # R32: nothing queues the post-hoc review any more; the merging agent requests it
+        self.assertEqual(v["description"], "hotfix: review skipped; comment @codex review after merge for the post-hoc review")
 
 
 class NoVerdictYet(unittest.TestCase):
     def test_pending_in_first_ten_minutes(self):
         v = compute(pr(), T0 + timedelta(minutes=5))
-        self.assertEqual(v["state"], "pending"); self.assertFalse(v["nudge"])
+        self.assertEqual(v["state"], "pending"); self.assertEqual(v["description"], WAIT_NEW)
 
-    def test_nudge_once_after_ten_minutes(self):
-        self.assertTrue(compute(pr(), T0 + timedelta(minutes=11))["nudge"])
-        self.assertFalse(compute(pr(nudged=True), T0 + timedelta(minutes=11))["nudge"])
+    # R32: the 10-minute nudge comment became a description that asks for one
+    def test_asks_for_a_review_request_after_ten_minutes(self):
+        self.assertEqual(compute(pr(), T0 + timedelta(minutes=11))["description"], ASK_NEW)
+        self.assertEqual(compute(pr(nudged=True), T0 + timedelta(minutes=11))["description"], WAIT_NEW)
+
+    def test_verdict_has_no_nudge_key(self):
+        self.assertEqual(set(compute(pr(), T0 + timedelta(minutes=11))), {"state", "description", "queue"})
 
     def test_unavailable_after_thirty_minutes(self):
         v = compute(pr(), T0 + timedelta(minutes=31))
@@ -249,10 +257,10 @@ class SummaryVerdict(unittest.TestCase):
         v = compute(p, T0 + timedelta(minutes=5))
         self.assertEqual(v["state"], "pending")
 
-    def test_running_summary_for_head_is_pending_with_no_nudge(self):
+    def test_running_summary_for_head_is_pending_and_does_not_ask(self):
         p = pr(summary={"status": "running", "commit": "new"})
         v = compute(p, T0 + timedelta(minutes=11))
-        self.assertEqual(v["state"], "pending"); self.assertFalse(v["nudge"])
+        self.assertEqual(v["state"], "pending"); self.assertEqual(v["description"], WAIT_NEW)
 
     def test_error_summary_for_head_is_codex_unavailable_failure(self):
         p = pr(summary={"status": "error", "commit": "new"})
@@ -324,9 +332,9 @@ DRAFT_DESC = "draft: Codex reviews when marked ready"
 
 
 class Draft(unittest.TestCase):
-    def test_draft_is_pending_with_draft_description_and_no_nudge(self):
+    def test_draft_is_pending_with_draft_description(self):
         v = compute(pr(draft=True), T0 + timedelta(minutes=11))
-        self.assertEqual(v, {"state": "pending", "description": DRAFT_DESC, "queue": [], "nudge": False})
+        self.assertEqual(v, {"state": "pending", "description": DRAFT_DESC, "queue": []})
 
     def test_draft_is_never_codex_unavailable(self):
         v = compute(pr(draft=True), T0 + timedelta(hours=5))
@@ -346,17 +354,17 @@ class Draft(unittest.TestCase):
         self.assertIn("waiting for Codex", compute(pr(draft=False), T0 + timedelta(minutes=5))["description"])
 
 
-class ClosedPrNeverNudged(unittest.TestCase):
-    def test_closed_or_merged_pr_is_not_nudged(self):
+class ClosedPrNeverAsks(unittest.TestCase):
+    def test_closed_or_merged_pr_does_not_ask_for_a_review(self):
         for state in ("CLOSED", "MERGED"):
-            self.assertFalse(compute(pr(state=state), T0 + timedelta(minutes=11))["nudge"], state)
+            self.assertEqual(compute(pr(state=state), T0 + timedelta(minutes=11))["description"], WAIT_NEW, state)
 
-    def test_open_pr_still_nudged(self):
-        self.assertTrue(compute(pr(state="OPEN"), T0 + timedelta(minutes=11))["nudge"])
+    def test_open_pr_still_asks(self):
+        self.assertEqual(compute(pr(state="OPEN"), T0 + timedelta(minutes=11))["description"], ASK_NEW)
 
 
 def pending():
-    return {"state": "pending", "description": "waiting", "queue": [], "nudge": False}
+    return {"state": "pending", "description": "waiting", "queue": []}
 
 
 class PollDone(unittest.TestCase):
@@ -386,47 +394,23 @@ class PollDone(unittest.TestCase):
             self.assertTrue(rv.poll_done(pr(state=state), pending(), T0 + timedelta(minutes=2)), state)
 
 
-class WantsRereview(unittest.TestCase):
-    def test_summary_for_previous_commit_wants_rereview(self):
-        self.assertTrue(rv.wants_rereview(pr(summary={"status": "completed", "commit": "old"})))
-
-    def test_error_summary_for_previous_commit_wants_rereview(self):
-        self.assertTrue(rv.wants_rereview(pr(summary={"status": "error", "commit": "old"})))
-
-    def test_no_summary_means_no_rereview(self):
-        self.assertFalse(rv.wants_rereview(pr(summary=None)))
-        self.assertFalse(rv.wants_rereview(pr()))
-
-    def test_summary_already_for_head_means_no_rereview(self):
-        for status in ("completed", "running", "error", "unknown"):
-            self.assertFalse(rv.wants_rereview(pr(head_sha="abc1234def", summary={"status": status, "commit": "abc1234"})), status)
-
-    def test_running_summary_means_no_rereview(self):
-        # Codex is mid-review; compute's 10-minute nudge is the backstop.
-        self.assertFalse(rv.wants_rereview(pr(summary={"status": "running", "commit": "old"})))
-
-    def test_already_nudged_means_no_rereview(self):
-        self.assertFalse(rv.wants_rereview(pr(nudged=True, summary={"status": "completed", "commit": "old"})))
-
-    def test_summary_without_commit_means_no_rereview(self):
-        self.assertFalse(rv.wants_rereview(pr(summary={"status": "completed", "commit": None})))
-        self.assertFalse(rv.wants_rereview(pr(summary={"status": "completed", "commit": ""})))
-
-    def test_draft_closed_or_hotfix_means_no_rereview(self):
-        s = {"status": "completed", "commit": "old"}
-        self.assertFalse(rv.wants_rereview(pr(draft=True, summary=s)))
-        self.assertFalse(rv.wants_rereview(pr(state="CLOSED", summary=s)))
-        self.assertFalse(rv.wants_rereview(pr(labels=["hotfix"], summary=s)))
+class NoBotComments(unittest.TestCase):  # R32: Codex ignores github-actions[bot] mentions
+    def test_rereview_and_comment_paths_are_gone(self):
+        for name in ("wants_rereview", "comment"):
+            self.assertFalse(hasattr(rv, name), name)
 
 
 class FakeGitHub:
-    """Records the side effects run_once performs; hands back a fixed PR from fetch."""
+    """Records the side effects run_once performs; hands back a fixed PR from fetch. Any
+    other gh call (e.g. posting a comment) fails the test: the gate must never comment."""
     def __init__(self, prdict):
         self.prdict, self.calls = prdict, []
 
     def install(self, test):
+        def no_other_gh(*args, **kw):
+            test.fail(f"unexpected gh call from run_once: {args[:4]}")
         for name, fn in (("fetch", self.fetch), ("post_status", self.post_status),
-                         ("resolve_thread", self.resolve_thread), ("comment", self.comment)):
+                         ("resolve_thread", self.resolve_thread), ("gh", no_other_gh)):
             orig = getattr(rv, name)
             setattr(rv, name, fn)
             test.addCleanup(setattr, rv, name, orig)
@@ -441,9 +425,6 @@ class FakeGitHub:
     def resolve_thread(self, tid, reply):
         self.calls.append(("resolve", tid))
 
-    def comment(self, repo, n, body):
-        self.calls.append(("comment", body))
-
 
 class RunOnce(unittest.TestCase):
     def test_posts_status_and_resolves_queued_threads(self):
@@ -452,24 +433,17 @@ class RunOnce(unittest.TestCase):
         self.assertEqual(v["state"], "success")
         self.assertEqual(g.calls, [("fetch", "o/r", 7), ("status", "new", "success"), ("resolve", "T2")])
 
-    def test_nudges_when_compute_says_so(self):
+    def test_never_comments_even_when_a_review_is_due(self):  # R32
+        # 11 min, no verdict, nobody asked: the old path posted `@codex review` here.
         g = FakeGitHub(pr()).install(self)
-        rv.run_once("o/r", 7, now=T0 + timedelta(minutes=11))
-        self.assertEqual(g.calls[-1], ("comment", "@codex review"))
+        _, v, _ = rv.run_once("o/r", 7, now=T0 + timedelta(minutes=11))
+        self.assertEqual(v["description"], ASK_NEW)
+        self.assertEqual(g.calls, [("fetch", "o/r", 7), ("status", "new", "pending")])
 
-    def test_rereview_comment_goes_out_before_the_status_and_only_once(self):
-        # 11 min after the push compute would also nudge; the rereview comment must
-        # mark the SHA nudged so the same run does not post `@codex review` twice.
-        g = FakeGitHub(pr(summary={"status": "completed", "commit": "old"})).install(self)
-        rv.run_once("o/r", 7, rereview=True, now=T0 + timedelta(minutes=11))
-        comments = [c for c in g.calls if c[0] == "comment"]
-        self.assertEqual(comments, [("comment", "@codex review")])
-        self.assertLess(g.calls.index(("comment", "@codex review")), [c[0] for c in g.calls].index("status"))
-
-    def test_no_rereview_flag_no_rereview_comment(self):
-        g = FakeGitHub(pr(summary={"status": "completed", "commit": "old"})).install(self)
-        rv.run_once("o/r", 7, now=T0 + timedelta(minutes=1))
-        self.assertNotIn("comment", [c[0] for c in g.calls])
+    def test_run_once_takes_no_rereview_flag(self):  # R32
+        FakeGitHub(pr()).install(self)
+        with self.assertRaises(TypeError):
+            rv.run_once("o/r", 7, rereview=True, now=T0)
 
 
 class PollLoop(unittest.TestCase):
@@ -478,8 +452,8 @@ class PollLoop(unittest.TestCase):
         seen, sleeps = [], []
         it = iter(results)
 
-        def step(repo, n, rereview=False):  # R23b: no mode-specific clock input any more
-            seen.append(rereview)
+        def step(repo, n):  # no mode-specific input at all (R23b clock, R32 no re-review flag)
+            seen.append(n)
             r = next(it)
             if isinstance(r, Exception):
                 raise r
@@ -494,18 +468,19 @@ class PollLoop(unittest.TestCase):
         self.assertEqual(v["state"], "success"); self.assertEqual(len(seen), 3)
         self.assertEqual(sleeps, [60, 60])
 
-    def test_rereview_only_on_first_iteration(self):
-        _, seen, _ = self.run_poll([("pending", {}), ("failure", {})], rereview=True)
-        self.assertEqual(seen, [True, False])
-
     def test_draft_ends_after_one_iteration(self):
         v, seen, sleeps = self.run_poll([("pending", {"draft": True})])
         self.assertEqual(len(seen), 1); self.assertEqual(sleeps, [])
 
-    def test_transient_error_is_retried_and_rereview_survives_it(self):
+    def test_transient_error_is_retried(self):
         err = subprocess.CalledProcessError(1, ["gh"], stderr="HTTP 502")
-        v, seen, _ = self.run_poll([err, ("success", {})], rereview=True)
-        self.assertEqual(v["state"], "success"); self.assertEqual(seen, [True, True])
+        v, seen, _ = self.run_poll([err, ("success", {})])
+        self.assertEqual(v["state"], "success"); self.assertEqual(len(seen), 2)
+
+    def test_poll_takes_no_rereview_flag(self):  # R32
+        with self.assertRaises(TypeError):
+            # the step accepts anything, so only poll()'s own signature can raise TypeError
+            rv.poll("o/r", 7, rereview=True, step=lambda r, n, **kw: self.fail("must not run"), sleep=lambda s: None)
 
     def test_three_consecutive_errors_give_up(self):
         err = subprocess.CalledProcessError(1, ["gh"], stderr="HTTP 502")
@@ -572,21 +547,21 @@ class CliDispatch(unittest.TestCase):
 
     def test_poll_subcommand(self):
         calls = []
-        self.patch("poll", lambda repo, n, rereview=False: calls.append((repo, n, rereview)) or pending())
+        self.patch("poll", lambda repo, n: calls.append((repo, n)) or pending())
         self.assertEqual(rv.main(["rv", "poll", "o/r", "5"]), 0)
-        self.assertEqual(rv.main(["rv", "poll", "o/r", "5", "--rereview"]), 0)
-        self.assertEqual(calls, [("o/r", 5, False), ("o/r", 5, True)])
+        self.assertEqual(calls, [("o/r", 5)])
 
-    def test_poll_rejects_unknown_flags(self):
+    def test_poll_rejects_extra_args_including_the_removed_rereview_flag(self):
         self.patch("poll", lambda *a, **k: self.fail("poll must not run"))
-        self.assertEqual(rv.main(["rv", "poll", "o/r", "5", "--rereveiw"]), 2)
+        for extra in (["--rereview"], ["--rereveiw"], ["--since", "2026-09-27T22:04:49Z"]):
+            self.assertEqual(rv.main(["rv", "poll", "o/r", "5", *extra]), 2, extra)
         self.assertEqual(rv.main(["rv", "poll", "o/r"]), 2)
 
     def test_one_shot_subcommand_uses_run_once(self):
         calls = []
-        self.patch("run_once", lambda repo, n, rereview=False: calls.append((repo, n, rereview)) or (pr(), pending(), T0))
+        self.patch("run_once", lambda repo, n: calls.append((repo, n)) or (pr(), pending(), T0))
         self.assertEqual(rv.main(["rv", "o/r", "9"]), 0)
-        self.assertEqual(calls, [("o/r", 9, False)])
+        self.assertEqual(calls, [("o/r", 9)])
 
 
 # ==== Fix round 1 ======================================================================
@@ -613,14 +588,13 @@ ASK = T0 + timedelta(minutes=40)  # e.g. draft -> ready 40 min after the push
 
 
 class AskedAtClock(unittest.TestCase):  # R23
-    def test_ready_40_min_after_push_is_pending_not_unavailable_and_not_nudged(self):
+    def test_ready_40_min_after_push_is_pending_not_unavailable_and_not_asking(self):
         v = compute(pr(asked_at=iso(ASK)), ASK + timedelta(seconds=30))
-        self.assertEqual(v["state"], "pending"); self.assertFalse(v["nudge"])
-        self.assertNotIn("codex-unavailable", v["description"])
+        self.assertEqual(v["state"], "pending"); self.assertEqual(v["description"], WAIT_NEW)
 
-    def test_nudge_10_min_after_asked_at(self):
-        self.assertFalse(compute(pr(asked_at=iso(ASK)), ASK + timedelta(minutes=9, seconds=59))["nudge"])
-        self.assertTrue(compute(pr(asked_at=iso(ASK)), ASK + timedelta(minutes=10))["nudge"])
+    def test_asks_10_min_after_asked_at(self):
+        self.assertEqual(compute(pr(asked_at=iso(ASK)), ASK + timedelta(minutes=9, seconds=59))["description"], WAIT_NEW)
+        self.assertEqual(compute(pr(asked_at=iso(ASK)), ASK + timedelta(minutes=10))["description"], ASK_NEW)
 
     def test_unavailable_30_min_after_asked_at(self):
         self.assertEqual(compute(pr(asked_at=iso(ASK)), ASK + timedelta(minutes=29, seconds=59))["state"], "pending")
@@ -655,18 +629,13 @@ class AskedAtClock(unittest.TestCase):  # R23
         self.assertEqual(v["state"], "pending"); self.assertNotIn("codex-unavailable", v["description"])
 
     def test_same_pr_same_status_whichever_mode_runs(self):
-        now = ASK + timedelta(minutes=1)
-        FakeGitHub(pr(asked_at=iso(ASK), summary={"status": "running", "commit": "new"})).install(self)
-        _, once_v, _ = rv.run_once("o/r", 7, now=now)                 # e.g. Codex's "running" summary edit
-        _, poll_v, _ = rv.run_once("o/r", 7, rereview=True, now=now)  # a synchronize poller's first pass
-        self.assertEqual(once_v, poll_v); self.assertEqual(once_v["state"], "pending")
-
-
-class PollSinceRemoved(unittest.TestCase):  # R23b: the clock is fetched, not passed in
-    def test_since_is_a_usage_error(self):
-        orig = rv.poll; rv.poll = lambda *a, **k: self.fail("poll must not run"); self.addCleanup(setattr, rv, "poll", orig)
-        self.assertEqual(rv.main(["rv", "poll", "o/r", "5", "--since", "2026-09-27T22:04:49Z"]), 2)
-        self.assertEqual(rv.main(["rv", "poll", "o/r", "5", "--rereview", "--rereview"]), 2)
+        # Review Focus 4: a one-shot run and a poller pass on the same SHA at the same time post
+        # the same status -- neither takes a mode-specific input (R23b clock, R32 no re-review).
+        now = ASK + timedelta(minutes=11)
+        FakeGitHub(pr(asked_at=iso(ASK), summary={"status": "completed", "commit": "new"})).install(self)
+        _, once_v, _ = rv.run_once("o/r", 7, now=now)
+        poll_v = rv.poll("o/r", 7, step=lambda r, n: rv.run_once(r, n, now=now), sleep=lambda s: None)
+        self.assertEqual(once_v, poll_v); self.assertEqual(once_v["state"], "success")
 
 
 class DeriveAskedAt(unittest.TestCase):  # R23d: max(push, latest draft -> ready); comments never count
@@ -692,26 +661,22 @@ class SilentCodexReplay(unittest.TestCase):  # R23c/R23d: every silent-Codex pat
         v = compute(p, now)
         return p, v, now
 
-    def gate_nudge(self, minutes):
-        return {"author": "github-actions", "body": "@codex review", "created_at": iso(T0 + timedelta(minutes=minutes))}
-
-    def test_opened_nudge_at_10_no_codex_is_unavailable_at_30_inside_the_poll_timeout(self):
+    def test_opened_no_codex_asks_at_10_unavailable_at_30_inside_the_poll_timeout(self):
+        # R32: nobody comments on the gate's behalf; the description asks from +10 on.
         _, v, _ = self.state_at(10, [])
-        self.assertTrue(v["nudge"])  # the gate posts its nudge here
-        nudged = [self.gate_nudge(10)]
-        _, v, _ = self.state_at(29, nudged)
-        self.assertEqual(v["state"], "pending"); self.assertFalse(v["nudge"])
-        p, v, now = self.state_at(30, nudged)
+        self.assertEqual(v["description"], ASK_NEW)
+        _, v, _ = self.state_at(29, [])
+        self.assertEqual(v["state"], "pending"); self.assertEqual(v["description"], ASK_NEW)
+        p, v, now = self.state_at(30, [])
         self.assertEqual(v["state"], "failure"); self.assertIn("codex-unavailable", v["description"])
         self.assertTrue(rv.poll_done(p, v, now))
         self.assertLess(now - T0, self.POLL_JOB_TIMEOUT)
 
-    def test_ready_for_review_nudge_no_codex_is_unavailable_30_min_after_ready(self):
+    def test_ready_for_review_no_codex_is_unavailable_30_min_after_ready(self):
         ready = [iso(T0 + timedelta(minutes=40))]  # poller starts at +40
-        nudged = [self.gate_nudge(50)]
-        _, v, _ = self.state_at(69, nudged, ready)
+        _, v, _ = self.state_at(69, [], ready)
         self.assertEqual(v["state"], "pending")
-        p, v, now = self.state_at(70, nudged, ready)
+        p, v, now = self.state_at(70, [], ready)
         self.assertEqual(v["state"], "failure"); self.assertTrue(rv.poll_done(p, v, now))
         self.assertLess(now - (T0 + timedelta(minutes=40)), self.POLL_JOB_TIMEOUT)
 
@@ -723,7 +688,7 @@ class SilentCodexReplay(unittest.TestCase):  # R23c/R23d: every silent-Codex pat
         # retry moved the deadline to +51, past the 35-min job timeout (killed while pending).
         retry = [self.human_retry(20)]
         _, v, _ = self.state_at(29, retry)
-        self.assertEqual(v["state"], "pending"); self.assertFalse(v["nudge"])  # the retry counts as the nudge
+        self.assertEqual(v["state"], "pending"); self.assertEqual(v["description"], WAIT_NEW)  # someone asked
         p, v, now = self.state_at(30, retry)
         self.assertEqual(v["state"], "failure"); self.assertIn("codex-unavailable", v["description"])
         self.assertTrue(rv.poll_done(p, v, now))
@@ -734,7 +699,7 @@ class SilentCodexReplay(unittest.TestCase):  # R23c/R23d: every silent-Codex pat
     def test_retry_after_codex_unavailable_is_recomputed_by_codexs_summary_edit(self):
         # spec §6: the status stays codex-unavailable after a retry; Codex's summary edit
         # (an issue_comment event -> one-shot run) recomputes it once the review lands.
-        retry = [self.gate_nudge(10), self.human_retry(35)]
+        retry = [self.human_retry(35)]
         _, v, _ = self.state_at(40, retry)
         self.assertEqual(v["state"], "failure"); self.assertIn("codex-unavailable", v["description"])
         _, v, _ = self.state_at(45, retry, summary={"status": "completed", "commit": "new"})
@@ -742,17 +707,17 @@ class SilentCodexReplay(unittest.TestCase):  # R23c/R23d: every silent-Codex pat
 
     # ---- R23e: PR creation and reopen are clock starts too -----------------------------
     def assert_relative_timings(self, start_min):
-        """From a clock start at T0+start_min (its own poller starts there): pending at +5,
-        nudge at +10, codex-unavailable at +30 -- all inside that poller's 35-min timeout."""
+        """From a clock start at T0+start_min (its own poller starts there): waiting at +5,
+        asking for `@codex review` at +10, codex-unavailable at +30 -- all inside that
+        poller's 35-min timeout."""
         starts = [iso(T0 + timedelta(minutes=start_min))]
         _, v, _ = self.state_at(start_min + 5, [], starts)
-        self.assertEqual(v["state"], "pending"); self.assertFalse(v["nudge"])
+        self.assertEqual(v["state"], "pending"); self.assertEqual(v["description"], WAIT_NEW)
         _, v, _ = self.state_at(start_min + 10, [], starts)
-        self.assertEqual(v["state"], "pending"); self.assertTrue(v["nudge"])
-        nudged = [self.gate_nudge(start_min + 10)]
-        _, v, _ = self.state_at(start_min + 29, nudged, starts)
+        self.assertEqual(v["state"], "pending"); self.assertEqual(v["description"], ASK_NEW)
+        _, v, _ = self.state_at(start_min + 29, [], starts)
         self.assertEqual(v["state"], "pending")
-        p, v, now = self.state_at(start_min + 30, nudged, starts)
+        p, v, now = self.state_at(start_min + 30, [], starts)
         self.assertEqual(v["state"], "failure"); self.assertIn("codex-unavailable", v["description"])
         self.assertTrue(rv.poll_done(p, v, now))
         self.assertLess(now - rv.ts(starts[0]), self.POLL_JOB_TIMEOUT)

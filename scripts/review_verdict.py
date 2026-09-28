@@ -2,9 +2,12 @@
 """review-verdict: turn Codex's advisory review into one deterministic commit status.
 
 Pure part: compute(pr, now), parse_summary(body), pushed_at(commit_node), is_nudged(comments, head_pushed_at),
-poll_done(pr, verdict, now), wants_rereview(pr), clock_start(pr), derive_asked_at(...).
-Fetch/act part: fetch(repo, number) via `gh`; run_once = fetch -> [re-review request] -> compute ->
-post status -> auto-resolve queued threads -> nudge; poll = run_once every 60 s until poll_done.
+poll_done(pr, verdict, now), clock_start(pr), derive_asked_at(...).
+Fetch/act part: fetch(repo, number) via `gh`; run_once = fetch -> compute -> post status ->
+auto-resolve queued threads; poll = run_once every 60 s until poll_done.
+The gate never comments on a PR (R32: Codex ignores github-actions[bot] mentions): when a
+review is due, the pending status description asks a human or agent to comment
+`@codex review`; agents also request re-reviews and the post-hoc review of a hotfix merge.
 The reusable workflow (.github/workflows/review-verdict.yml) runs `poll` after a push and the
 one-shot `<repo> <n>` for every other event. Spec: claude-dotfiles
 docs/superpowers/specs/2026-09-26-review-system-v4-design.md §6.
@@ -18,12 +21,13 @@ import time
 from datetime import datetime, timedelta, timezone
 
 CODEX = "chatgpt-codex-connector"
-NUDGE_AFTER = timedelta(minutes=10)
+NUDGE_AFTER = timedelta(minutes=10)    # after this with no verdict and nobody asking, the status asks
 UNAVAILABLE_AFTER = timedelta(minutes=30)
 POLL_DEADLINE = timedelta(minutes=31)  # a poller never waits past clock_start + 31 min
 POLL_INTERVAL = 60                     # seconds between poll iterations
 POLL_MAX_ERRORS = 3                    # consecutive failed iterations before the poller gives up
 DRAFT_DESC = "draft: Codex reviews when marked ready"
+HOTFIX_DESC = "hotfix: review skipped; comment @codex review after merge for the post-hoc review"
 REVIEW_REQUEST = "@codex review"
 BADGE = re.compile(r"P([0-3]) Badge\]")
 NO_ISSUES = re.compile(r"didn'?t find any major issues", re.I)
@@ -109,20 +113,21 @@ def clock_start(pr):
 
 
 def compute(pr, now):
-    """The verdict for the PR's head. Pure: every mode (poll, one-shot, dispatch) feeds it
-    the same fetch() output, so two runs on the same SHA post the same status.
-    The nudge (10 min) and codex-unavailable (30 min) ages run from clock_start(pr) (push or
-    draft -> ready). A retry `@codex review` does NOT restart the window: the status stays
-    codex-unavailable until Codex's summary edit (an issue_comment event -> one-shot run)
-    recomputes it once the review lands (spec §6)."""
+    """The verdict {state, description, queue} for the PR's head. Pure: every mode (poll,
+    one-shot, dispatch) feeds it the same fetch() output, so two runs on the same SHA post
+    the same status. The ask (10 min) and codex-unavailable (30 min) ages run from
+    clock_start(pr). The gate never comments (R32): once a review is due and nobody has
+    asked, the pending description asks for `@codex review` instead. A retry does NOT
+    restart the window: the status stays codex-unavailable until Codex's summary edit (an
+    issue_comment event -> one-shot run) recomputes it once the review lands (spec §6)."""
     if "hotfix" in pr.get("labels", []):
-        return {"state": "success", "description": "hotfix: review skipped, post-hoc queued", "queue": [], "nudge": False}
+        return {"state": "success", "description": HOTFIX_DESC, "queue": []}
 
     # Codex does not review drafts (it reviews on draft -> ready), so a draft has no
     # verdict to wait for: pending (drafts cannot merge anyway), never codex-unavailable,
-    # never nudged, nothing queued. ready_for_review starts a fresh poller.
+    # never asking, nothing queued. ready_for_review starts a fresh poller.
     if pr.get("draft"):
-        return {"state": "pending", "description": DRAFT_DESC, "queue": [], "nudge": False}
+        return {"state": "pending", "description": DRAFT_DESC, "queue": []}
 
     head_sha = pr["head_sha"]
     pushed = ts(pr["head_pushed_at"])
@@ -140,7 +145,7 @@ def compute(pr, now):
     summary_status = summary.get("status") if summary_for_head else None
 
     if any(ERROR.search(c["body"]) for c in head_comments) or summary_status == "error":
-        return {"state": "failure", "description": CODEX_UNAVAILABLE_DESC, "queue": [], "nudge": False}
+        return {"state": "failure", "description": CODEX_UNAVAILABLE_DESC, "queue": []}
 
     # Stale-verdict race fix (review focus 2): a Codex review only counts as a verdict
     # for THIS head when its commit_sha actually matches -- being merely "submitted
@@ -164,14 +169,17 @@ def compute(pr, now):
     if not has_verdict:
         age = now - clock_start(pr)
         if age >= UNAVAILABLE_AFTER:
-            return {"state": "failure", "description": "codex-unavailable: no verdict in 30 min. Retry `@codex review`, or label `hotfix` if urgent.", "queue": [], "nudge": False}
-        nudge = age >= NUDGE_AFTER and not pr.get("nudged", False) and is_open(pr)
-        if summary_status == "running":
-            nudge = False  # Codex is already working this SHA; don't ping it again
-        # No minute count in the description: it must be stable across polls of the
-        # same SHA, or every poll posts a "changed" status (post_status compares
-        # description too).
-        return {"state": "pending", "description": f"waiting for Codex review of {head_sha[:7]}", "queue": [], "nudge": nudge}
+            return {"state": "failure", "description": "codex-unavailable: no verdict in 30 min. Retry `@codex review`, or label `hotfix` if urgent.", "queue": []}
+        # R32: the old nudge condition now picks the description instead of posting a comment.
+        # Not when Codex is already working this SHA, someone already asked after the push, or
+        # the PR is closed.
+        ask = (age >= NUDGE_AFTER and not pr.get("nudged", False) and is_open(pr)
+               and summary_status != "running")
+        # No minute count in either description: it must be stable across polls of the same
+        # SHA, or every poll posts a "changed" status (post_status compares description too).
+        desc = (f"no Codex review of {head_sha[:7]} yet: comment {REVIEW_REQUEST}" if ask
+                else f"waiting for Codex review of {head_sha[:7]}")
+        return {"state": "pending", "description": desc, "queue": []}
 
     # R22: a round is one reviewed SHA -- several Codex reviews of the same commit (e.g. a
     # duplicate request) are one round; a review without a commit_sha cannot be matched to
@@ -194,8 +202,8 @@ def compute(pr, now):
             if not t["is_resolved"]:
                 queue.append(t["id"])
     if blocking:
-        return {"state": "failure", "description": f"round {round_no}: {len(blocking)} unresolved P0/P1 (push a fix): {', '.join(blocking)}"[:140], "queue": queue, "nudge": False}
-    return {"state": "success", "description": f"round {round_no}: no blocking findings" + (f"; {len(queue)} queued for janitor" if queue else ""), "queue": queue, "nudge": False}
+        return {"state": "failure", "description": f"round {round_no}: {len(blocking)} unresolved P0/P1 (push a fix): {', '.join(blocking)}"[:140], "queue": queue}
+    return {"state": "success", "description": f"round {round_no}: no blocking findings" + (f"; {len(queue)} queued for janitor" if queue else ""), "queue": queue}
 
 
 def poll_done(pr, verdict, now):
@@ -211,23 +219,6 @@ def poll_done(pr, verdict, now):
     if pr.get("draft") or not is_open(pr):
         return True
     return now >= clock_start(pr) + POLL_DEADLINE
-
-
-def wants_rereview(pr):
-    """R6: after a fix push, should the poller ask Codex to re-review? (Codex never
-    re-reviews a push on its own.) True iff Codex's summary exists for a commit that is
-    NOT the head, Codex is not mid-review (`running` for any commit -- the row may still
-    name the previous commit when a review starts; compute's 10-minute nudge is the
-    backstop), and nobody has already asked (`nudged`). Never for drafts (Codex skips
-    them), closed PRs, or hotfixes (review skipped by design)."""
-    s = pr.get("summary")
-    if not s or not s.get("commit"):
-        return False
-    if pr["head_sha"].startswith(s["commit"]) or s.get("status") == "running":
-        return False
-    if pr.get("nudged") or pr.get("draft") or not is_open(pr) or "hotfix" in pr.get("labels", []):
-        return False
-    return True
 
 
 # ---- fetch / act (thin; every decision is in the pure functions above) ------------
@@ -250,8 +241,8 @@ def pushed_at(commit_node):
 
 def is_nudged(comments, head_pushed_at):
     """True if any comment (any author) whose stripped body starts with
-    '@codex review' was created after head_pushed_at -- i.e. this SHA has already
-    been nudged, so main() should not nudge it again."""
+    '@codex review' was created after head_pushed_at -- i.e. someone already asked Codex
+    about this SHA, so the pending status stops asking for it (R32)."""
     pushed = ts(head_pushed_at)
     return any(c["body"].strip().startswith(REVIEW_REQUEST) and ts(c["created_at"]) > pushed for c in comments)
 
@@ -262,8 +253,8 @@ def derive_asked_at(head_pushed_at, event_times):
     `event_times` -- the PR's createdAt and its READY_FOR_REVIEW / REOPENED timeline events
     (a branch can sit long before its PR opens; Codex reviews on open and on draft -> ready).
     Returns the winning ISO timestamp string.
-    `@codex review` comments (any author: the gate's nudge / re-review request or a human or
-    agent retry) never move it -- they only count for is_nudged(). Each clock start is an
+    `@codex review` comments (a human or agent request or retry) never move it -- they only
+    count for is_nudged(). Each clock start is an
     event that starts its own poller (push -> synchronize, PR created -> opened, draft ->
     ready -> ready_for_review, reopen -> reopened), so clock_start + 31 min always falls
     inside that poller's 35-min job timeout; a comment-moved clock (R23b/c) could push the
@@ -345,42 +336,32 @@ def resolve_thread(thread_id, reply):
     gh("api", "graphql", "-f", "query=mutation($id:ID!){ resolveReviewThread(input:{threadId:$id}){ thread{id} } }", "-F", f"id={thread_id}")
 
 
-def comment(repo, number, body):
-    gh("api", "-X", "POST", f"repos/{repo}/issues/{number}/comments", "-f", f"body={body}")
-
-
-def run_once(repo, number, rereview=False, now=None):
+def run_once(repo, number, now=None):
     """The one-shot path, shared by `<repo> <n>` and every `poll` iteration:
-    fetch -> [R6 re-review request] -> compute -> post status -> resolve queued -> nudge.
-    No mode-specific clock input: asked_at comes from fetch() (R23b).
+    fetch -> compute -> post status -> resolve queued threads. No mode-specific input
+    (asked_at comes from fetch(), R23b) and no PR comments (R32).
     Returns (pr, verdict, now) so the poller can decide whether to keep going."""
     pr = fetch(repo, number)
     now = now or datetime.now(timezone.utc)
-    if rereview and wants_rereview(pr):
-        comment(repo, number, REVIEW_REQUEST)
-        pr["nudged"] = True  # this SHA is now asked; compute must not nudge it a second time
-        print("re-review requested", flush=True)
     v = compute(pr, now)
     print(json.dumps({"pr": number, "sha": pr["head_sha"], **v}), flush=True)
     print(post_status(repo, pr["head_sha"], v), flush=True)
     for tid in v["queue"]:
         resolve_thread(tid, f"{QUEUE_MARK}: advisory finding, handed to the weekly janitor (review v4 §7).")
-    if v["nudge"]:
-        comment(repo, number, REVIEW_REQUEST)
     return pr, v, now
 
 
-def poll(repo, number, rereview=False, *, step=None, sleep=time.sleep,
+def poll(repo, number, *, step=None, sleep=time.sleep,
          interval=POLL_INTERVAL, max_errors=POLL_MAX_ERRORS):
-    """run_once every `interval` s until poll_done. `rereview` applies to the first
-    successful iteration only. A failed iteration (gh/API hiccup) is retried; only
-    `max_errors` consecutive failures end the poller, because a dead poller leaves the PR
-    pending with no nudge and no 30-minute escalation until some other event arrives."""
+    """run_once every `interval` s until poll_done. A failed iteration (gh/API hiccup) is
+    retried; only `max_errors` consecutive failures end the poller, because a dead poller
+    leaves the PR pending with no ask and no 30-minute escalation until some other event
+    arrives."""
     step = step or run_once
     errors = 0
     while True:
         try:
-            pr, v, now = step(repo, number, rereview=rereview)
+            pr, v, now = step(repo, number)
         except Exception as e:  # noqa: BLE001 -- bounded retry, re-raised below
             errors += 1
             detail = getattr(e, "stderr", "") or ""
@@ -389,14 +370,14 @@ def poll(repo, number, rereview=False, *, step=None, sleep=time.sleep,
                 raise
             sleep(interval)
             continue
-        errors, rereview = 0, False
+        errors = 0
         if poll_done(pr, v, now):
             return v
         sleep(interval)
 
 
 USAGE = ("usage: review_verdict.py compute <pr.json> [now-iso]\n"
-         "       review_verdict.py poll <owner/repo> <number> [--rereview]\n"
+         "       review_verdict.py poll <owner/repo> <number>\n"
          "       review_verdict.py <owner/repo> <number>")
 
 
@@ -406,10 +387,10 @@ def main(argv):
         pr = json.load(open(args[1])); now = ts(args[2]) if len(args) > 2 else datetime.now(timezone.utc)
         print(json.dumps(compute(pr, now))); return 0
     try:
-        if args[:1] == ["poll"]:  # poll <repo> <n> [--rereview]  (after a push / ask)
-            if len(args) not in (3, 4) or args[3:] not in ([], ["--rereview"]):
+        if args[:1] == ["poll"]:  # poll <repo> <n>  (after a push / open / ready / reopen)
+            if len(args) != 3:
                 print(USAGE, file=sys.stderr); return 2
-            poll(args[1], int(args[2]), rereview=args[3:] == ["--rereview"]); return 0
+            poll(args[1], int(args[2])); return 0
         if len(args) != 2:
             print(USAGE, file=sys.stderr); return 2
         run_once(args[0], int(args[1])); return 0
