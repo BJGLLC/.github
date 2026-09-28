@@ -5,28 +5,34 @@
 #
 # The `github` context here is the CALLER's (event, payload, repository, token), so the jobs pick
 # their mode from the caller's event:
-#   poll   — pull_request opened/synchronize/reopened/ready_for_review: wait for Codex, <=31 min
-#            after it was asked (asked_at, which the script derives from PR state: the latest of
-#            the push, the PR's creation, the last draft->ready and the last reopen -- each of
-#            which starts its own poller; `@codex review` comments never move it, so the deadline
-#            always falls inside this poller's 35-min timeout). No cron: the $25/mo hard
+#   poll   — pull_request opened/synchronize/reopened/ready_for_review. On synchronize (a new
+#            head) it first asks Codex: one `@codex review` comment with a hidden per-SHA
+#            marker, skipped for drafts, `hotfix`, closed PRs and heads someone already asked
+#            about (SSSF-25, Blake 2026-09-28; reverses R32 "the gate never comments"). Codex
+#            reviews opened / ready PRs by itself, so those are never nudged. Then it waits for
+#            Codex <=8 min after it was asked (asked_at, which the script derives from PR state:
+#            the latest of the push, the PR's creation, the last draft->ready and the last
+#            reopen -- each of which starts its own poller; `@codex review` comments never move
+#            it). Codex's reply fires issue_comment / pull_request_review, which recompute by
+#            themselves, so a longer hold only bills runner minutes. No cron: the $25/mo hard
 #            Actions budget cannot carry one.
 #   once   — every other event: one fetch -> compute -> post, or a drill (workflow_dispatch;
 #            only `p1-open`, and a drill may only ever post failure -- R39: a success drill
 #            satisfied the required check on any head).
 # pull_request `closed` runs nothing (a running poller sees the close and stops by itself).
-# The gate NEVER asks Codex (R32): it only replies `queued-for-janitor` on the P2/P3 threads it
-# resolves. (Codex's summary edit is flaky (R35); a bot's mention did get a review on #72.) When a
-# review is due and nobody has asked, the pending status says "no Codex review of <sha> yet:
-# comment @codex review"; agents request re-reviews after a fix push, and the post-hoc
-# review after a `hotfix` merge, themselves. Event data and dispatch inputs reach shell only
-# via env: (never ${{ }} inside run:). Agent order after a blocking finding: reply to each
-# fixed thread naming the fix and resolve it, THEN push the fix, THEN comment @codex review.
-# Every run after the push then sees those threads already resolved, and they clear (their
-# findings predate the push). Thread replies also arrive as pull_request_review events (a
-# GraphQL thread reply creates a COMMENTED review by the replier), but a bare resolve triggers
-# nothing (pull_request_review_thread is not an Actions trigger); recompute by dispatching
-# the caller with -f pr=<n>.
+# Codex silent: the poller stops at +8 min with the status pending. Any later event, or
+# `gh workflow run <caller>.yml -f pr=<n>`, recomputes: at +10 the pending description asks
+# for `@codex review` if nobody asked; at +30 it posts the codex-unavailable failure. If nobody
+# recomputes, the status stays pending, and pending blocks the merge: it fails safe.
+# P2/P3 threads get a `queued-for-janitor` reply (the queue entry); the gate never resolves
+# them (resolveReviewThread needs contents: write, which no caller grants). Event data and
+# dispatch inputs reach shell only via env: (never ${{ }} inside run:). Agent order after a
+# blocking finding: reply to each fixed thread naming the fix and resolve it, THEN push the
+# fix (the gate asks Codex for the re-review). Every run after the push then sees those
+# threads already resolved, and they clear (their findings predate the push). Thread replies
+# also arrive as pull_request_review events (a GraphQL thread reply creates a COMMENTED
+# review by the replier), but a bare resolve triggers nothing (pull_request_review_thread is
+# not an Actions trigger); recompute by dispatching the caller with -f pr=<n>.
 name: review-verdict
 on:
   workflow_call:
@@ -36,10 +42,11 @@ on:
 permissions:
   contents: read
   checks: read            # fetch() reads checkSuites to date the push; without it gh exits 1 and nothing posts
-  pull-requests: write    # the queued-for-janitor marker reply. Resolving the thread needs contents: write,
-                          # which no caller grants (SSSF-25, BJGLLC/.github#5): the resolve warns, never fails
+  pull-requests: write    # the `@codex review` nudge comment and the queued-for-janitor thread reply (a PR
+                          # comment needs only this: probe run 36483153709). No resolve: that needs
+                          # contents: write, which no caller grants (SSSF-25, BJGLLC/.github#5)
   statuses: write         # the review-verdict status
-  issues: read            # REST issue-comments scan for Codex's summary (R46); the gate posts no comments (R32)
+  issues: read            # REST issue-comments scan for Codex's summary (R46)
 defaults:
   run:
     shell: bash
@@ -47,14 +54,24 @@ jobs:
   poll:
     if: github.event_name == 'pull_request' && contains(fromJSON('["opened","synchronize","reopened","ready_for_review"]'), github.event.action)
     runs-on: ubuntu-latest
-    timeout-minutes: 35
-    concurrency:          # a newer push cancels the superseded poller for the same PR
+    timeout-minutes: 12   # the 8-min window + the last 60-s sleep + the nudge + slack
+    concurrency:          # a newer push cancels the superseded poller for the same PR; one poller
+                          # per PR at a time is also what makes the nudge's marker check race-free
       group: review-verdict-poll-${{ github.repository }}-${{ github.event.pull_request.number }}
       cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
         with: { repository: BJGLLC/.github, ref: main, persist-credentials: false }
-      - name: Poll until Codex's verdict lands (<=31 min after it was last asked)
+      - name: Ask Codex to review the new head (synchronize only; once per head)
+        if: github.event.action == 'synchronize'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          [[ "$PR" =~ ^[1-9][0-9]*$ ]] || { echo "::error::no PR number in the pull_request payload"; exit 1; }
+          python3 scripts/review_verdict.py nudge "$GITHUB_REPOSITORY" "$PR"
+      - name: Poll until Codex's verdict lands (<=8 min after it was last asked)
+        if: ${{ !cancelled() }}   # a failed nudge (red, annotated) must not leave the head without a status
         env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}
@@ -66,6 +83,11 @@ jobs:
     if: github.event_name != 'pull_request' || !contains(fromJSON('["opened","synchronize","reopened","ready_for_review","closed"]'), github.event.action)
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    concurrency:          # one one-shot per PR at a time; a newer event waits (a pending one is
+                          # replaced by the newest, which recomputes from fresh state). Racing
+                          # runs double-replied on cd-marketing #165 (SSSF-25).
+      group: review-verdict-once-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
         with: { repository: BJGLLC/.github, ref: main, persist-credentials: false }
