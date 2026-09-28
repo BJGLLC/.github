@@ -388,11 +388,12 @@ def queue_threads(queue):
     (SSSF-25: one failed resolve aborted the loop, and the later threads never got a marker).
     The marker reply IS the queue entry: compute() skips marked threads and the janitor finds
     them by it. Resolving only collapses the thread on the PR.
-    - reply fails   -> ::error:: annotation, then QueueError after the loop: the run fails loud
-                       and the unmarked thread is queued again by the next run.
+    - reply fails   -> ::error:: annotation; the thread id is returned (run_once withholds
+                       success and fails the run; the unmarked thread is queued again next run).
     - resolve fails -> ::warning:: annotation only: the finding is queued; the thread stays
                        open. resolveReviewThread needs `contents: write` (SSSF-25 drill,
-                       BJGLLC/.github#5); the callers grant `contents: read`."""
+                       BJGLLC/.github#5); the callers grant `contents: read`.
+    Returns the ids that did NOT get their marker."""
     not_queued = []
     for tid in queue:
         try:
@@ -410,21 +411,37 @@ def queue_threads(queue):
                     if FORBIDDEN in why else "")
             print(annotation("warning", f"{tid} is queued for the janitor (marker reply posted) but stays "
                                         f"open: resolve failed ({why}).{hint}"), flush=True)
-    if not_queued:
-        raise QueueError(not_queued)
+    return not_queued
+
+
+def withhold_success(v, not_queued, number):
+    """Pure: the verdict to publish once the queue ran. A lost marker must never publish
+    success (Codex P1 on BJGLLC/.github#6: auto-merge would take the PR while the finding was
+    never recorded, and a failed reply creates no follow-up event). An existing failure keeps
+    its own description: it names the finding to fix, and the fix push re-runs the queue."""
+    if not not_queued or v["state"] != "success":
+        return v
+    desc = (f"janitor hand-off failed for {len(not_queued)} P2/P3 thread(s); "
+            f"re-run the review-verdict workflow with -f pr={number}")
+    return {**v, "state": "failure", "description": desc[:140]}
 
 
 def run_once(repo, number, now=None):
     """The one-shot path, shared by `<repo> <n>` and every `poll` iteration:
-    fetch -> compute -> post status -> queue P2/P3 threads for the janitor. No mode-specific
-    input (asked_at comes from fetch(), R23b) and no PR comments (R32).
+    fetch -> compute -> queue P2/P3 threads for the janitor -> post status. Queue BEFORE
+    publishing, so success is only ever posted once every finding is durable (a lost marker
+    posts failure, then raises QueueError). No mode-specific input (asked_at comes from
+    fetch(), R23b) and no PR comments (R32).
     Returns (pr, verdict, now) so the poller can decide whether to keep going."""
     pr = fetch(repo, number)
     now = now or datetime.now(timezone.utc)
     v = compute(pr, now)
     print(json.dumps({"pr": number, "sha": pr["head_sha"], **v}), flush=True)
+    not_queued = queue_threads(v["queue"])
+    v = withhold_success(v, not_queued, number)
     print(post_status(repo, pr["head_sha"], v), flush=True)
-    queue_threads(v["queue"])
+    if not_queued:
+        raise QueueError(not_queued)
     return pr, v, now
 
 

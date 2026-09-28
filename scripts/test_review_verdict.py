@@ -420,7 +420,7 @@ class FakeGitHub:
     other gh call (e.g. posting a comment) fails the test: the gate must never comment.
     fail_reply / fail_resolve: thread ids whose reply / resolve raises like a failed gh call."""
     def __init__(self, prdict, fail_reply=(), fail_resolve=()):
-        self.prdict, self.calls = prdict, []
+        self.prdict, self.calls, self.posted = prdict, [], []
         self.fail_reply, self.fail_resolve = set(fail_reply), set(fail_resolve)
 
     def install(self, test):
@@ -438,7 +438,7 @@ class FakeGitHub:
         self.calls.append(("fetch", repo, n)); return json.loads(json.dumps(self.prdict))
 
     def post_status(self, repo, sha, v):
-        self.calls.append(("status", sha, v["state"])); return "posted"
+        self.calls.append(("status", sha, v["state"])); self.posted.append(dict(v)); return "posted"
 
     def reply_thread(self, tid, body):
         self.calls.append(("reply", tid))
@@ -468,7 +468,8 @@ class RunOnce(unittest.TestCase):
         g = FakeGitHub(pr(reviews=[review(3)], threads=[thread("T2", 2, 3)])).install(self)
         _, v, _ = rv.run_once("o/r", 7, now=T0 + timedelta(minutes=4))
         self.assertEqual(v["state"], "success")
-        self.assertEqual(g.calls, [("fetch", "o/r", 7), ("status", "new", "success"), ("reply", "T2"), ("resolve", "T2")])
+        # queue first, then publish (Codex P1 on BJGLLC/.github#6): success only once it is durable
+        self.assertEqual(g.calls, [("fetch", "o/r", 7), ("reply", "T2"), ("resolve", "T2"), ("status", "new", "success")])
 
     def test_queue_reply_carries_the_janitor_marker(self):  # the reply IS the durable queue entry
         bodies = []
@@ -518,15 +519,35 @@ class QueueFailures(unittest.TestCase):  # SSSF-25: resolveReviewThread needs co
 
     def test_failed_marker_reply_fails_the_run_after_every_thread_is_tried(self):
         # No marker = not queued = lost for the janitor unless someone notices: fail loudly,
-        # but only after the status is posted and every other thread got its marker.
+        # but only after every other thread got its marker and the status is posted.
         g = self.two_queued(fail_reply={"T2"})
         result, out = run_once_capturing(g, self.NOW)
         self.assertIsInstance(result, rv.QueueError)
         self.assertIn("T2", str(result))
         self.assertEqual([c for c in g.calls if c[0] in ("status", "reply", "resolve")],
-                         [("status", "new", "success"), ("reply", "T2"), ("reply", "T3"), ("resolve", "T3")])
+                         [("reply", "T2"), ("reply", "T3"), ("resolve", "T3"), ("status", "new", "failure")])
         err = [l for l in out.splitlines() if l.startswith("::error")]
         self.assertEqual(len(err), 1, out); self.assertIn("T2", err[0])
+
+    def test_a_lost_marker_never_publishes_success(self):
+        # Codex P1 on BJGLLC/.github#6: posting success BEFORE queueing let a PR auto-merge
+        # while a finding was never recorded (a failed reply creates no follow-up event).
+        # Queue first; a lost marker turns would-be success into failure with the remedy.
+        g = self.two_queued(fail_reply={"T2"})
+        run_once_capturing(g, self.NOW)
+        self.assertEqual(len(g.posted), 1)
+        self.assertEqual(g.posted[0]["state"], "failure")
+        self.assertIn("-f pr=7", g.posted[0]["description"])
+        self.assertLessEqual(len(g.posted[0]["description"]), 140)  # the statuses API limit
+
+    def test_a_lost_marker_keeps_an_existing_blocking_failure(self):
+        # Already failing on a P1: that description (the finding to fix) stays; the push that
+        # fixes it re-runs the queue anyway.
+        g = FakeGitHub(pr(reviews=[review(3)], threads=[thread("T1", 1, 3), thread("T2", 2, 3)]),
+                       fail_reply={"T2"}).install(self)
+        run_once_capturing(g, self.NOW)
+        self.assertEqual(g.posted[0]["state"], "failure")
+        self.assertIn("unresolved P0/P1", g.posted[0]["description"])
 
     def test_annotation_text_is_escaped_to_one_line(self):
         # A workflow command is one stdout line; a raw newline in gh's stderr would cut it.
