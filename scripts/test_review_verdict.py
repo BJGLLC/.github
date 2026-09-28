@@ -332,6 +332,8 @@ class NudgedHelper(unittest.TestCase):
 # ==== Task 8 (SSSF-23): drafts, poll loop, re-review, drills ========================
 # New names are reached through the module (rv.*) so the older tests above keep
 # running while these are RED.
+import contextlib
+import io
 import json
 import re
 import subprocess
@@ -410,17 +412,23 @@ class NoBotComments(unittest.TestCase):  # R32: Codex ignores github-actions[bot
             self.assertFalse(hasattr(rv, name), name)
 
 
+FORBIDDEN = "gh: Resource not accessible by integration\n"  # what resolveReviewThread returned live (SSSF-25)
+
+
 class FakeGitHub:
     """Records the side effects run_once performs; hands back a fixed PR from fetch. Any
-    other gh call (e.g. posting a comment) fails the test: the gate must never comment."""
-    def __init__(self, prdict):
+    other gh call (e.g. posting a comment) fails the test: the gate must never comment.
+    fail_reply / fail_resolve: thread ids whose reply / resolve raises like a failed gh call."""
+    def __init__(self, prdict, fail_reply=(), fail_resolve=()):
         self.prdict, self.calls = prdict, []
+        self.fail_reply, self.fail_resolve = set(fail_reply), set(fail_resolve)
 
     def install(self, test):
         def no_other_gh(*args, **kw):
             test.fail(f"unexpected gh call from run_once: {args[:4]}")
         for name, fn in (("fetch", self.fetch), ("post_status", self.post_status),
-                         ("resolve_thread", self.resolve_thread), ("gh", no_other_gh)):
+                         ("reply_thread", self.reply_thread), ("resolve_thread", self.resolve_thread),
+                         ("gh", no_other_gh)):
             orig = getattr(rv, name)
             setattr(rv, name, fn)
             test.addCleanup(setattr, rv, name, orig)
@@ -432,8 +440,27 @@ class FakeGitHub:
     def post_status(self, repo, sha, v):
         self.calls.append(("status", sha, v["state"])); return "posted"
 
-    def resolve_thread(self, tid, reply):
+    def reply_thread(self, tid, body):
+        self.calls.append(("reply", tid))
+        if tid in self.fail_reply:
+            raise subprocess.CalledProcessError(1, ["gh", "api", "graphql"], stderr="HTTP 502: Bad Gateway\n")
+
+    def resolve_thread(self, tid):
         self.calls.append(("resolve", tid))
+        if tid in self.fail_resolve:
+            raise subprocess.CalledProcessError(1, ["gh", "api", "graphql"], stderr=FORBIDDEN)
+
+
+def run_once_capturing(g, now):
+    """run_once with stdout captured (the annotations are workflow commands on stdout).
+    Returns (run_once's result or the exception it raised, captured stdout)."""
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        try:
+            result = rv.run_once("o/r", 7, now=now)
+        except Exception as e:  # noqa: BLE001 -- the test inspects it
+            return e, out.getvalue()
+    return result, out.getvalue()
 
 
 class RunOnce(unittest.TestCase):
@@ -441,7 +468,14 @@ class RunOnce(unittest.TestCase):
         g = FakeGitHub(pr(reviews=[review(3)], threads=[thread("T2", 2, 3)])).install(self)
         _, v, _ = rv.run_once("o/r", 7, now=T0 + timedelta(minutes=4))
         self.assertEqual(v["state"], "success")
-        self.assertEqual(g.calls, [("fetch", "o/r", 7), ("status", "new", "success"), ("resolve", "T2")])
+        self.assertEqual(g.calls, [("fetch", "o/r", 7), ("status", "new", "success"), ("reply", "T2"), ("resolve", "T2")])
+
+    def test_queue_reply_carries_the_janitor_marker(self):  # the reply IS the durable queue entry
+        bodies = []
+        g = FakeGitHub(pr(reviews=[review(3)], threads=[thread("T2", 2, 3)])).install(self)
+        rv.reply_thread = lambda tid, body: bodies.append(body) or g.reply_thread(tid, body)
+        rv.run_once("o/r", 7, now=T0 + timedelta(minutes=4))
+        self.assertEqual(len(bodies), 1); self.assertIn(rv.QUEUE_MARK, bodies[0])
 
     def test_never_comments_even_when_a_review_is_due(self):  # R32
         # 11 min, no verdict, nobody asked: the old path posted `@codex review` here.
@@ -454,6 +488,63 @@ class RunOnce(unittest.TestCase):
         FakeGitHub(pr()).install(self)
         with self.assertRaises(TypeError):
             rv.run_once("o/r", 7, rereview=True, now=T0)
+
+
+class QueueFailures(unittest.TestCase):  # SSSF-25: resolveReviewThread needs contents: write
+    NOW = T0 + timedelta(minutes=4)
+
+    def two_queued(self, **fail):
+        return FakeGitHub(pr(reviews=[review(3)], threads=[thread("T2", 2, 3), thread("T3", 3, 3)]), **fail).install(self)
+
+    def test_resolve_forbidden_after_the_marker_is_a_warning_and_not_a_failure(self):
+        # Live 9/28 (cd-pages #18, cd-marketing #165): the reply landed, the resolve was
+        # FORBIDDEN. The finding IS queued (marker reply), so the run must not go red for it...
+        g = self.two_queued(fail_resolve={"T2"})
+        result, out = run_once_capturing(g, self.NOW)
+        self.assertNotIsInstance(result, Exception, out)
+        self.assertEqual(result[1]["state"], "success")
+        # ...but it is loud: a warning annotation naming the thread and the missing permission.
+        warn = [l for l in out.splitlines() if l.startswith("::warning")]
+        self.assertEqual(len(warn), 1, out)
+        self.assertIn("T2", warn[0]); self.assertIn("contents: write", warn[0])
+
+    def test_one_failed_thread_never_stops_the_others(self):
+        # Live 9/28 (dotfiles #71): the first FORBIDDEN resolve aborted the loop, so threads 2
+        # and 3 never got their marker -- then a human resolved them and the janitor lost them.
+        g = self.two_queued(fail_resolve={"T2"})
+        run_once_capturing(g, self.NOW)
+        self.assertEqual([c for c in g.calls if c[0] in ("reply", "resolve")],
+                         [("reply", "T2"), ("resolve", "T2"), ("reply", "T3"), ("resolve", "T3")])
+
+    def test_failed_marker_reply_fails_the_run_after_every_thread_is_tried(self):
+        # No marker = not queued = lost for the janitor unless someone notices: fail loudly,
+        # but only after the status is posted and every other thread got its marker.
+        g = self.two_queued(fail_reply={"T2"})
+        result, out = run_once_capturing(g, self.NOW)
+        self.assertIsInstance(result, rv.QueueError)
+        self.assertIn("T2", str(result))
+        self.assertEqual([c for c in g.calls if c[0] in ("status", "reply", "resolve")],
+                         [("status", "new", "success"), ("reply", "T2"), ("reply", "T3"), ("resolve", "T3")])
+        err = [l for l in out.splitlines() if l.startswith("::error")]
+        self.assertEqual(len(err), 1, out); self.assertIn("T2", err[0])
+
+    def test_annotation_text_is_escaped_to_one_line(self):
+        # A workflow command is one stdout line; a raw newline in gh's stderr would cut it.
+        self.assertEqual(rv.annotation("warning", "a%b\r\nc"),
+                         "::warning title=review-verdict janitor queue::a%25b%0D%0Ac")
+
+    def test_the_poller_retries_a_failed_marker(self):
+        # QueueError is an iteration failure like any gh error: the poller tries again, and the
+        # next fetch still lists the unmarked thread in the queue.
+        v, seen, _ = PollLoop.run_poll(self, [rv.QueueError(["T2"]), ("success", {})])
+        self.assertEqual(v["state"], "success"); self.assertEqual(len(seen), 2)
+
+    def test_cli_exits_nonzero_on_queue_error(self):
+        def boom(repo, n):
+            raise rv.QueueError(["T2"])
+        orig = rv.run_once; rv.run_once = boom; self.addCleanup(setattr, rv, "run_once", orig)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(rv.main(["rv", "o/r", "9"]), 1)
 
 
 class PollLoop(unittest.TestCase):

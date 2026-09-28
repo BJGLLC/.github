@@ -4,7 +4,7 @@
 Pure part: compute(pr, now), parse_summary(body), pushed_at(commit_node), is_nudged(comments, head_pushed_at),
 poll_done(pr, verdict, now), clock_start(pr), derive_asked_at(...).
 Fetch/act part: fetch(repo, number) via `gh`; run_once = fetch -> compute -> post status ->
-auto-resolve queued threads; poll = run_once every 60 s until poll_done.
+queue_threads (marker reply, then resolve); poll = run_once every 60 s until poll_done.
 The gate never asks Codex (R32): it only replies `queued-for-janitor` on the P2/P3 threads it
 resolves. When a review is due, the pending status description asks a human or agent to
 comment `@codex review`; agents also request re-reviews and the post-hoc review of a hotfix
@@ -356,23 +356,75 @@ def post_status(repo, sha, verdict):
     return "posted"
 
 
-def resolve_thread(thread_id, reply):
-    gh("api", "graphql", "-f", "query=mutation($id:ID!,$b:String!){ addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$id, body:$b}){ comment{id} } }", "-F", f"id={thread_id}", "-F", f"b={reply}")
+QUEUE_REPLY = f"{QUEUE_MARK}: advisory finding, handed to the weekly janitor (review v4 §7)."
+FORBIDDEN = "Resource not accessible by integration"
+
+
+class QueueError(Exception):
+    """Some queued threads did not get their `queued-for-janitor` marker reply, so nothing
+    records them for the janitor. Raised only after every thread was tried. Those threads stay
+    unmarked and unresolved, so the next run (a poll retry or the next event) queues them again."""
+    def __init__(self, thread_ids):
+        self.thread_ids = list(thread_ids)
+        super().__init__(f"not queued for the janitor (marker reply failed): {', '.join(self.thread_ids)}")
+
+
+def annotation(level, message):
+    """One GitHub Actions workflow-command line (a warning/error annotation on the run)."""
+    msg = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    return f"::{level} title=review-verdict janitor queue::{msg}"
+
+
+def reply_thread(thread_id, body):
+    gh("api", "graphql", "-f", "query=mutation($id:ID!,$b:String!){ addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$id, body:$b}){ comment{id} } }", "-F", f"id={thread_id}", "-F", f"b={body}")
+
+
+def resolve_thread(thread_id):
     gh("api", "graphql", "-f", "query=mutation($id:ID!){ resolveReviewThread(input:{threadId:$id}){ thread{id} } }", "-F", f"id={thread_id}")
+
+
+def queue_threads(queue):
+    """Hand each queued P2/P3 thread to the janitor, trying every thread even when one fails
+    (SSSF-25: one failed resolve aborted the loop, and the later threads never got a marker).
+    The marker reply IS the queue entry: compute() skips marked threads and the janitor finds
+    them by it. Resolving only collapses the thread on the PR.
+    - reply fails   -> ::error:: annotation, then QueueError after the loop: the run fails loud
+                       and the unmarked thread is queued again by the next run.
+    - resolve fails -> ::warning:: annotation only: the finding is queued; the thread stays
+                       open. resolveReviewThread needs `contents: write` (SSSF-25 drill,
+                       BJGLLC/.github#5); the callers grant `contents: read`."""
+    not_queued = []
+    for tid in queue:
+        try:
+            reply_thread(tid, QUEUE_REPLY)
+        except subprocess.CalledProcessError as e:
+            not_queued.append(tid)
+            print(annotation("error", f"{tid} NOT queued for the janitor: the marker reply failed "
+                                      f"({(e.stderr or '').strip()}). The next run retries it."), flush=True)
+            continue
+        try:
+            resolve_thread(tid)
+        except subprocess.CalledProcessError as e:
+            why = (e.stderr or "").strip()
+            hint = (" resolveReviewThread needs contents: write, which the caller's token does not grant (SSSF-25)."
+                    if FORBIDDEN in why else "")
+            print(annotation("warning", f"{tid} is queued for the janitor (marker reply posted) but stays "
+                                        f"open: resolve failed ({why}).{hint}"), flush=True)
+    if not_queued:
+        raise QueueError(not_queued)
 
 
 def run_once(repo, number, now=None):
     """The one-shot path, shared by `<repo> <n>` and every `poll` iteration:
-    fetch -> compute -> post status -> resolve queued threads. No mode-specific input
-    (asked_at comes from fetch(), R23b) and no PR comments (R32).
+    fetch -> compute -> post status -> queue P2/P3 threads for the janitor. No mode-specific
+    input (asked_at comes from fetch(), R23b) and no PR comments (R32).
     Returns (pr, verdict, now) so the poller can decide whether to keep going."""
     pr = fetch(repo, number)
     now = now or datetime.now(timezone.utc)
     v = compute(pr, now)
     print(json.dumps({"pr": number, "sha": pr["head_sha"], **v}), flush=True)
     print(post_status(repo, pr["head_sha"], v), flush=True)
-    for tid in v["queue"]:
-        resolve_thread(tid, f"{QUEUE_MARK}: advisory finding, handed to the weekly janitor (review v4 §7).")
+    queue_threads(v["queue"])
     return pr, v, now
 
 
@@ -421,6 +473,8 @@ def main(argv):
         run_once(args[0], int(args[1])); return 0
     except subprocess.CalledProcessError as e:
         print(f"gh failed (exit {e.returncode}): {e.stderr}", file=sys.stderr); return 1
+    except QueueError as e:
+        print(f"review-verdict: {e}", file=sys.stderr); return 1
 
 
 if __name__ == "__main__":

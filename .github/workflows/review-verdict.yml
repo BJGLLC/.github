@@ -36,7 +36,8 @@ on:
 permissions:
   contents: read
   checks: read            # fetch() reads checkSuites to date the push; without it gh exits 1 and nothing posts
-  pull-requests: write    # resolve queued threads
+  pull-requests: write    # the queued-for-janitor marker reply. Resolving the thread needs contents: write,
+                          # which no caller grants (SSSF-25, BJGLLC/.github#5): the resolve warns, never fails
   statuses: write         # the review-verdict status
   issues: read            # REST issue-comments scan for Codex's summary (R46); the gate posts no comments (R32)
 defaults:
