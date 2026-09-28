@@ -387,9 +387,9 @@ class PollDone(unittest.TestCase):
         for state in ("success", "failure"):
             self.assertTrue(rv.poll_done(pr(), dict(pending(), state=state), T0 + timedelta(minutes=1)), state)
 
-    def test_stops_at_31_minutes_after_push(self):
-        self.assertFalse(rv.poll_done(pr(), pending(), T0 + timedelta(minutes=30, seconds=59)))
-        self.assertTrue(rv.poll_done(pr(), pending(), T0 + timedelta(minutes=31)))
+    def test_stops_8_minutes_after_the_clock_start(self):  # SSSF-25 short poll (was 31)
+        self.assertFalse(rv.poll_done(pr(), pending(), T0 + timedelta(minutes=7, seconds=59)))
+        self.assertTrue(rv.poll_done(pr(), pending(), T0 + timedelta(minutes=8)))
 
     def test_rerun_long_after_push_stops_immediately(self):
         self.assertTrue(rv.poll_done(pr(), pending(), T0 + timedelta(days=2)))
@@ -406,28 +406,29 @@ class PollDone(unittest.TestCase):
             self.assertTrue(rv.poll_done(pr(state=state), pending(), T0 + timedelta(minutes=2)), state)
 
 
-class NoBotComments(unittest.TestCase):  # R32: Codex ignores github-actions[bot] mentions
-    def test_rereview_and_comment_paths_are_gone(self):
-        for name in ("wants_rereview", "comment"):
-            self.assertFalse(hasattr(rv, name), name)
-
-
-FORBIDDEN = "gh: Resource not accessible by integration\n"  # what resolveReviewThread returned live (SSSF-25)
+class NoRereviewFlag(unittest.TestCase):  # R32's re-review flag stays gone; the nudge is its own subcommand
+    def test_rereview_path_is_gone(self):
+        self.assertFalse(hasattr(rv, "wants_rereview"))
 
 
 class FakeGitHub:
     """Records the side effects run_once performs; hands back a fixed PR from fetch. Any
-    other gh call (e.g. posting a comment) fails the test: the gate must never comment.
-    fail_reply / fail_resolve: thread ids whose reply / resolve raises like a failed gh call."""
-    def __init__(self, prdict, fail_reply=(), fail_resolve=()):
+    other gh call (e.g. posting a comment) fails the test: run_once never comments (only the
+    `nudge` subcommand does, on synchronize).
+    fail_reply / fail_check: thread ids whose marker reply / fresh marker check raises like a
+    failed gh call. queued_now: thread ids the fresh check finds already marked (another run
+    replied after this run's fetch). A thread this fake replied to reads as marked from then on."""
+    def __init__(self, prdict, fail_reply=(), fail_check=(), queued_now=()):
         self.prdict, self.calls, self.posted = prdict, [], []
-        self.fail_reply, self.fail_resolve = set(fail_reply), set(fail_resolve)
+        self.fail_reply, self.fail_check = set(fail_reply), set(fail_check)
+        self.queued_now = set(queued_now)
 
     def install(self, test):
         def no_other_gh(*args, **kw):
             test.fail(f"unexpected gh call from run_once: {args[:4]}")
         for name, fn in (("fetch", self.fetch), ("post_status", self.post_status),
-                         ("reply_thread", self.reply_thread), ("resolve_thread", self.resolve_thread),
+                         ("reply_thread", self.reply_thread), ("thread_is_queued", self.thread_is_queued),
+                         ("post_comment", lambda *a, **k: test.fail("run_once must never comment")),
                          ("gh", no_other_gh)):
             orig = getattr(rv, name)
             setattr(rv, name, fn)
@@ -440,15 +441,17 @@ class FakeGitHub:
     def post_status(self, repo, sha, v):
         self.calls.append(("status", sha, v["state"])); self.posted.append(dict(v)); return "posted"
 
+    def thread_is_queued(self, tid):
+        self.calls.append(("check", tid))
+        if tid in self.fail_check:
+            raise subprocess.CalledProcessError(1, ["gh", "api", "graphql"], stderr="HTTP 502: Bad Gateway\n")
+        return tid in self.queued_now
+
     def reply_thread(self, tid, body):
         self.calls.append(("reply", tid))
         if tid in self.fail_reply:
             raise subprocess.CalledProcessError(1, ["gh", "api", "graphql"], stderr="HTTP 502: Bad Gateway\n")
-
-    def resolve_thread(self, tid):
-        self.calls.append(("resolve", tid))
-        if tid in self.fail_resolve:
-            raise subprocess.CalledProcessError(1, ["gh", "api", "graphql"], stderr=FORBIDDEN)
+        self.queued_now.add(tid)
 
 
 def run_once_capturing(g, now):
@@ -464,12 +467,13 @@ def run_once_capturing(g, now):
 
 
 class RunOnce(unittest.TestCase):
-    def test_posts_status_and_resolves_queued_threads(self):
+    def test_posts_status_and_queues_threads_without_resolving_them(self):
         g = FakeGitHub(pr(reviews=[review(3)], threads=[thread("T2", 2, 3)])).install(self)
         _, v, _ = rv.run_once("o/r", 7, now=T0 + timedelta(minutes=4))
         self.assertEqual(v["state"], "success")
-        # queue first, then publish (Codex P1 on BJGLLC/.github#6): success only once it is durable
-        self.assertEqual(g.calls, [("fetch", "o/r", 7), ("reply", "T2"), ("resolve", "T2"), ("status", "new", "success")])
+        # queue first, then publish (Codex P1 on BJGLLC/.github#6): success only once it is durable.
+        # SSSF-25: fresh marker check, then the reply; no resolve (it needs contents: write).
+        self.assertEqual(g.calls, [("fetch", "o/r", 7), ("check", "T2"), ("reply", "T2"), ("status", "new", "success")])
 
     def test_queue_reply_carries_the_janitor_marker(self):  # the reply IS the durable queue entry
         bodies = []
@@ -491,31 +495,29 @@ class RunOnce(unittest.TestCase):
             rv.run_once("o/r", 7, rereview=True, now=T0)
 
 
-class QueueFailures(unittest.TestCase):  # SSSF-25: resolveReviewThread needs contents: write
+class QueueFailures(unittest.TestCase):  # SSSF-25: every thread is tried; a lost marker never passes
     NOW = T0 + timedelta(minutes=4)
 
     def two_queued(self, **fail):
         return FakeGitHub(pr(reviews=[review(3)], threads=[thread("T2", 2, 3), thread("T3", 3, 3)]), **fail).install(self)
 
-    def test_resolve_forbidden_after_the_marker_is_a_warning_and_not_a_failure(self):
-        # Live 9/28 (cd-pages #18, cd-marketing #165): the reply landed, the resolve was
-        # FORBIDDEN. The finding IS queued (marker reply), so the run must not go red for it...
-        g = self.two_queued(fail_resolve={"T2"})
+    def test_the_gate_never_resolves_a_thread(self):
+        # 9/28 decision "Drop the resolve": resolveReviewThread needs contents: write, callers
+        # grant read (drill BJGLLC/.github#5). The marker reply is the queue entry; threads stay open.
+        self.assertFalse(hasattr(rv, "resolve_thread"))
+        with open(rv.__file__) as f:
+            self.assertNotIn("resolveReviewThread(input", f.read())  # the mutation itself
+        g = self.two_queued()
         result, out = run_once_capturing(g, self.NOW)
-        self.assertNotIsInstance(result, Exception, out)
-        self.assertEqual(result[1]["state"], "success")
-        # ...but it is loud: a warning annotation naming the thread and the missing permission.
-        warn = [l for l in out.splitlines() if l.startswith("::warning")]
-        self.assertEqual(len(warn), 1, out)
-        self.assertIn("T2", warn[0]); self.assertIn("contents: write", warn[0])
+        self.assertEqual(result[1]["state"], "success", out)
+        self.assertEqual([c for c in g.calls if c[0] == "reply"], [("reply", "T2"), ("reply", "T3")])
 
     def test_one_failed_thread_never_stops_the_others(self):
-        # Live 9/28 (dotfiles #71): the first FORBIDDEN resolve aborted the loop, so threads 2
-        # and 3 never got their marker -- then a human resolved them and the janitor lost them.
-        g = self.two_queued(fail_resolve={"T2"})
+        # Live 9/28 (dotfiles #71): one failure aborted the loop, so threads 2 and 3 never got
+        # their marker. A failed fresh check on T2 still leaves T2 replied (see QueueDedupe) and T3 tried.
+        g = self.two_queued(fail_check={"T2"})
         run_once_capturing(g, self.NOW)
-        self.assertEqual([c for c in g.calls if c[0] in ("reply", "resolve")],
-                         [("reply", "T2"), ("resolve", "T2"), ("reply", "T3"), ("resolve", "T3")])
+        self.assertEqual([c for c in g.calls if c[0] == "reply"], [("reply", "T2"), ("reply", "T3")])
 
     def test_failed_marker_reply_fails_the_run_after_every_thread_is_tried(self):
         # No marker = not queued = lost for the janitor unless someone notices: fail loudly,
@@ -524,8 +526,8 @@ class QueueFailures(unittest.TestCase):  # SSSF-25: resolveReviewThread needs co
         result, out = run_once_capturing(g, self.NOW)
         self.assertIsInstance(result, rv.QueueError)
         self.assertIn("T2", str(result))
-        self.assertEqual([c for c in g.calls if c[0] in ("status", "reply", "resolve")],
-                         [("reply", "T2"), ("reply", "T3"), ("resolve", "T3"), ("status", "new", "failure")])
+        self.assertEqual([c for c in g.calls if c[0] in ("status", "reply")],
+                         [("reply", "T2"), ("reply", "T3"), ("status", "new", "failure")])
         err = [l for l in out.splitlines() if l.startswith("::error")]
         self.assertEqual(len(err), 1, out); self.assertIn("T2", err[0])
 
@@ -794,8 +796,8 @@ class AskedAtClock(unittest.TestCase):  # R23
 
     def test_poll_deadline_uses_the_later_of_push_and_asked_at(self):
         p = pr(asked_at=iso(ASK))
-        self.assertFalse(rv.poll_done(p, pending(), ASK + timedelta(minutes=30, seconds=59)))
-        self.assertTrue(rv.poll_done(p, pending(), ASK + timedelta(minutes=31)))
+        self.assertFalse(rv.poll_done(p, pending(), ASK + timedelta(minutes=7, seconds=59)))
+        self.assertTrue(rv.poll_done(p, pending(), ASK + timedelta(minutes=8)))
 
     def test_once_path_uses_the_fetched_asked_at(self):
         # Review Focus 4: the clock comes from fetch(), so a one-shot run (e.g. Codex's
@@ -826,8 +828,27 @@ class DeriveAskedAt(unittest.TestCase):  # R23d: max(push, latest draft -> ready
         self.assertEqual(got, iso(T0 + timedelta(minutes=40)))
 
 
-class SilentCodexReplay(unittest.TestCase):  # R23c/R23d: every silent-Codex path ends inside the poll timeout
-    POLL_JOB_TIMEOUT = timedelta(minutes=35)  # reusable workflow, poll job timeout-minutes
+UNAVAILABLE_30 = "codex-unavailable: no verdict in 30 min. Retry `@codex review`, or label `hotfix` if urgent."
+
+
+def poll_job_timeout():
+    """The reusable workflow's poll job timeout-minutes (plain text: CI's python may lack PyYAML)."""
+    lines = open(REUSABLE_WF).read().splitlines()
+    start = lines.index("  poll:")
+    for l in lines[start + 1:]:
+        if l.strip().startswith("timeout-minutes:"):
+            return timedelta(minutes=int(l.split(":")[1].split("#")[0]))
+        if re.match(r"^  \S", l):
+            break
+    raise AssertionError("poll job has no timeout-minutes")
+
+
+REUSABLE_WF = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".github", "workflows", "review-verdict.yml")
+
+
+class SilentCodexReplay(unittest.TestCase):  # R23c/R23d; SSSF-25: the poller stops at +8, a recompute escalates
+    def setUp(self):
+        self.POLL_JOB_TIMEOUT = poll_job_timeout()
 
     def state_at(self, minutes, comments, ready=(), summary=None):
         """Rebuild the PR exactly as fetch() would (nudged from the comments, asked_at from push/ready)."""
@@ -837,40 +858,46 @@ class SilentCodexReplay(unittest.TestCase):  # R23c/R23d: every silent-Codex pat
         v = compute(p, now)
         return p, v, now
 
-    def test_opened_no_codex_asks_at_10_unavailable_at_30_inside_the_poll_timeout(self):
-        # R32: nobody comments on the gate's behalf; the description asks from +10 on.
-        _, v, _ = self.state_at(10, [])
-        self.assertEqual(v["description"], ASK_NEW)
-        _, v, _ = self.state_at(29, [])
-        self.assertEqual(v["state"], "pending"); self.assertEqual(v["description"], ASK_NEW)
-        p, v, now = self.state_at(30, [])
-        self.assertEqual(v["state"], "failure"); self.assertIn("codex-unavailable", v["description"])
+    def recompute_at(self, minutes, comments, ready=()):
+        """What a workflow_dispatch recompute (the `once` job -> run_once) POSTS at T0+minutes."""
+        p, _, now = self.state_at(minutes, comments, ready)
+        g = FakeGitHub(p).install(self)
+        rv.run_once("o/r", 7, now=now)
+        return g.posted[-1]
+
+    def test_opened_no_codex_poller_stops_pending_at_8_and_a_recompute_escalates(self):
+        # SSSF-25: the poller holds a runner for at most 8 min, then stops with the PR pending.
+        p, v, now = self.state_at(8, [])
+        self.assertEqual((v["state"], v["description"]), ("pending", WAIT_NEW))
         self.assertTrue(rv.poll_done(p, v, now))
         self.assertLess(now - T0, self.POLL_JOB_TIMEOUT)
+        # Recomputes (dispatch or any later event) still ask at +10 and fail at +30, exactly as today.
+        self.assertEqual(self.recompute_at(10, [])["description"], ASK_NEW)
+        self.assertEqual(self.recompute_at(29, [])["state"], "pending")
+        self.assertEqual(self.recompute_at(30, []), {"state": "failure", "description": UNAVAILABLE_30, "queue": []})
 
     def test_ready_for_review_no_codex_is_unavailable_30_min_after_ready(self):
         ready = [iso(T0 + timedelta(minutes=40))]  # poller starts at +40
-        _, v, _ = self.state_at(69, [], ready)
-        self.assertEqual(v["state"], "pending")
-        p, v, now = self.state_at(70, [], ready)
-        self.assertEqual(v["state"], "failure"); self.assertTrue(rv.poll_done(p, v, now))
-        self.assertLess(now - (T0 + timedelta(minutes=40)), self.POLL_JOB_TIMEOUT)
+        p, v, now = self.state_at(48, [], ready)
+        self.assertEqual(v["state"], "pending"); self.assertTrue(rv.poll_done(p, v, now))
+        self.assertEqual(self.recompute_at(69, [], ready)["state"], "pending")
+        self.assertEqual(self.recompute_at(70, [], ready)["description"], UNAVAILABLE_30)
 
     def human_retry(self, minutes):
         return {"author": "blakejgruber", "body": "@codex review", "created_at": iso(T0 + timedelta(minutes=minutes))}
 
     def test_human_retry_at_20_does_not_restart_the_window(self):
-        # Reviewer's scenario (R23d): push t=0, human retry t=+20, Codex silent. Under R23c the
-        # retry moved the deadline to +51, past the 35-min job timeout (killed while pending).
+        # Reviewer's scenario (R23d): push t=0, human retry t=+20, Codex silent. A retry never
+        # moves the clock, so a recompute at +30 is codex-unavailable, not pending until +50.
         retry = [self.human_retry(20)]
-        _, v, _ = self.state_at(29, retry)
-        self.assertEqual(v["state"], "pending"); self.assertEqual(v["description"], WAIT_NEW)  # someone asked
-        p, v, now = self.state_at(30, retry)
-        self.assertEqual(v["state"], "failure"); self.assertIn("codex-unavailable", v["description"])
-        self.assertTrue(rv.poll_done(p, v, now))
-        p31, v31, now31 = self.state_at(31, retry)
-        self.assertTrue(rv.poll_done(p31, v31, now31))
-        self.assertLess(now31 - T0, self.POLL_JOB_TIMEOUT)
+        self.assertEqual(self.recompute_at(29, retry), {"state": "pending", "description": WAIT_NEW, "queue": []})
+        self.assertEqual(self.recompute_at(30, retry)["description"], UNAVAILABLE_30)
+
+    def test_the_gates_own_nudge_never_postpones_codex_unavailable(self):
+        # The gate's `@codex review` counts as asked (no ask description) but moves no clock.
+        nudge = [{"author": "github-actions", "body": rv.nudge_body("new"), "created_at": iso(T0 + timedelta(seconds=20))}]
+        self.assertEqual(self.recompute_at(12, nudge)["description"], WAIT_NEW)
+        self.assertEqual(self.recompute_at(30, nudge), {"state": "failure", "description": UNAVAILABLE_30, "queue": []})
 
     def test_retry_after_codex_unavailable_is_recomputed_by_codexs_summary_edit(self):
         # spec §6: the status stays codex-unavailable after a retry; Codex's summary edit
@@ -883,20 +910,20 @@ class SilentCodexReplay(unittest.TestCase):  # R23c/R23d: every silent-Codex pat
 
     # ---- R23e: PR creation and reopen are clock starts too -----------------------------
     def assert_relative_timings(self, start_min):
-        """From a clock start at T0+start_min (its own poller starts there): waiting at +5,
-        asking for `@codex review` at +10, codex-unavailable at +30 -- all inside that
-        poller's 35-min timeout."""
+        """From a clock start at T0+start_min (its own poller starts there): waiting at +5, the
+        poller done at +8 (inside its job timeout); then recomputes ask for `@codex review` at
+        +10 and post codex-unavailable at +30."""
         starts = [iso(T0 + timedelta(minutes=start_min))]
         _, v, _ = self.state_at(start_min + 5, [], starts)
         self.assertEqual(v["state"], "pending"); self.assertEqual(v["description"], WAIT_NEW)
-        _, v, _ = self.state_at(start_min + 10, [], starts)
-        self.assertEqual(v["state"], "pending"); self.assertEqual(v["description"], ASK_NEW)
-        _, v, _ = self.state_at(start_min + 29, [], starts)
-        self.assertEqual(v["state"], "pending")
-        p, v, now = self.state_at(start_min + 30, [], starts)
-        self.assertEqual(v["state"], "failure"); self.assertIn("codex-unavailable", v["description"])
-        self.assertTrue(rv.poll_done(p, v, now))
+        p, v, now = self.state_at(start_min + 7, [], starts)
+        self.assertFalse(rv.poll_done(p, v, now))
+        p, v, now = self.state_at(start_min + 8, [], starts)
+        self.assertEqual(v["state"], "pending"); self.assertTrue(rv.poll_done(p, v, now))
         self.assertLess(now - rv.ts(starts[0]), self.POLL_JOB_TIMEOUT)
+        self.assertEqual(self.recompute_at(start_min + 10, [], starts)["description"], ASK_NEW)
+        self.assertEqual(self.recompute_at(start_min + 29, [], starts)["state"], "pending")
+        self.assertEqual(self.recompute_at(start_min + 30, [], starts)["description"], UNAVAILABLE_30)
 
     def test_pr_opened_45_min_after_the_push(self):
         self.assert_relative_timings(45)   # the P1: previously codex-unavailable on the first poll
@@ -1104,6 +1131,256 @@ class DrillFixtures(unittest.TestCase):
         self.assertIsNone(p["summary"]); self.assertIs(p["draft"], False); self.assertEqual(p["threads"], [])
         self.assertEqual(p["reviews"][0]["commit_sha"], p["head_sha"])
         self.assertEqual(compute(p, datetime.now(timezone.utc))["state"], "success")
+
+
+# ==== SSSF-25 (9/28, Blake: "Nudge + short poll", "Drop the resolve"; reverses R32) ========
+HEAD = "c0ffee1234" + "0" * 30
+
+
+def asked(body, minutes, author="blakejgruber"):
+    return {"author": author, "body": body, "created_at": iso(T0 + timedelta(minutes=minutes))}
+
+
+def fetched(comments=(), **over):
+    """A PR as fetch() returns it right after the push (nudged derived from the comments)."""
+    comments = list(comments)
+    return pr(**{"head_sha": HEAD, "state": "OPEN", "draft": False, "comments": comments,
+                 "nudged": rv.is_nudged(comments, iso(T0)), **over})
+
+
+def workflow():
+    try:
+        import yaml
+    except ImportError:
+        raise unittest.SkipTest("PyYAML not installed")
+    with open(REUSABLE_WF) as f:
+        return yaml.safe_load(f)
+
+
+class NudgeDecision(unittest.TestCase):
+    """On synchronize the gate posts one `@codex review` unless nobody needs it."""
+    def test_a_fresh_push_nobody_asked_about_is_nudged(self):
+        self.assertTrue(rv.nudge_decision(fetched())[0])
+
+    def test_draft_hotfix_and_closed_are_skipped(self):
+        for over in ({"draft": True}, {"labels": ["hotfix"]}, {"state": "CLOSED"}, {"state": "MERGED"}):
+            with self.subTest(**{k: str(v) for k, v in over.items()}):
+                post, why = rv.nudge_decision(fetched(**over))
+                self.assertFalse(post); self.assertTrue(why)
+
+    def test_someone_already_asked_after_the_push(self):  # any author, anywhere in the comment
+        for body, author in (("@codex review", "blakejgruber"), ("Fixed in c0ffee1. @codex review", "claude-agent"),
+                             ("@codex review", "github-actions")):
+            with self.subTest(body=body, author=author):
+                self.assertFalse(rv.nudge_decision(fetched([asked(body, 1, author)]))[0])
+
+    def test_a_request_before_the_push_is_about_the_old_head(self):
+        self.assertTrue(rv.nudge_decision(fetched([asked("@codex review", -1)]))[0])
+
+    def test_codexs_own_boilerplate_is_not_a_request(self):
+        # Codex's summary, clean-review and error comments all say: comment "@codex review".
+        for body in ('Codex Review: Something went wrong. Try again later by commenting "@codex review"',
+                     '<!-- codex-pull-request-review-summary -->\n- Comment "@codex review" or "@codex security review".'):
+            with self.subTest(body=body[:30]):
+                self.assertTrue(rv.nudge_decision(fetched([asked(body, 1, CODEX + "[bot]")]))[0])
+
+    def test_the_gates_marker_for_this_head_skips_whatever_the_timestamps_say(self):
+        # e.g. a re-run: the marker names the SHA, so it counts even when dated before the push
+        mark = asked(rv.nudge_body(HEAD), -5, "github-actions")
+        post, why = rv.nudge_decision(fetched([mark]))
+        self.assertFalse(post); self.assertIn("already nudged", why)
+
+    def test_the_marker_for_a_previous_head_does_not_count(self):
+        self.assertTrue(rv.nudge_decision(fetched([asked(rv.nudge_body("0ld" + "1" * 37), -5, "github-actions")]))[0])
+
+
+class NudgeBody(unittest.TestCase):
+    def test_first_line_is_the_request_and_the_marker_is_hidden(self):
+        body = rv.nudge_body(HEAD)
+        self.assertEqual(body.splitlines()[0], "@codex review")
+        self.assertIn(f"<!-- review-verdict:nudge {HEAD} -->", body)  # full SHA, an HTML comment
+        self.assertEqual(body.count("@codex review"), 1)
+
+
+class FakeNudgeGitHub:
+    """A shared PR whose comment list grows when post_comment is called, so two runs see
+    each other's comments (runs are serialized per PR by the poll job's concurrency group)."""
+    def __init__(self, test, prdict):
+        self.pr, self.posts = prdict, []
+        for name, fn in (("fetch", self.fetch), ("post_comment", self.post_comment),
+                         ("gh", lambda *a, **k: test.fail(f"unexpected gh call: {a[:4]}"))):
+            orig = getattr(rv, name); setattr(rv, name, fn); test.addCleanup(setattr, rv, name, orig)
+        self.now = T0 + timedelta(seconds=20)
+
+    def fetch(self, repo, n):
+        p = json.loads(json.dumps(self.pr))
+        p["nudged"] = rv.is_nudged(p["comments"], p["head_pushed_at"])
+        return p
+
+    def post_comment(self, repo, n, body):
+        self.posts.append((repo, n, body))
+        self.pr["comments"].append({"author": "github-actions", "body": body, "created_at": iso(self.now)})
+
+
+class RunNudge(unittest.TestCase):
+    def quiet(self, fn, *a):
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            return fn(*a), out.getvalue()
+
+    def test_posts_exactly_one_request_with_the_head_marker(self):
+        g = FakeNudgeGitHub(self, fetched())
+        posted, _ = self.quiet(rv.run_nudge, "o/r", 7)
+        self.assertTrue(posted)
+        self.assertEqual(g.posts, [("o/r", 7, rv.nudge_body(HEAD))])
+
+    def test_two_runs_one_second_apart_post_once(self):
+        g = FakeNudgeGitHub(self, fetched())
+        self.quiet(rv.run_nudge, "o/r", 7)
+        g.now += timedelta(seconds=1)
+        posted, out = self.quiet(rv.run_nudge, "o/r", 7)
+        self.assertFalse(posted); self.assertEqual(len(g.posts), 1); self.assertIn("already", out)
+
+    def test_skips_post_nothing(self):
+        for p in (fetched(draft=True), fetched(labels=["hotfix"]), fetched([asked("@codex review", 1)])):
+            g = FakeNudgeGitHub(self, p)
+            self.assertFalse(self.quiet(rv.run_nudge, "o/r", 7)[0]); self.assertEqual(g.posts, [])
+
+    def test_post_comment_uses_the_issue_comments_endpoint(self):
+        calls = []
+        orig = rv.gh; rv.gh = lambda *a, **k: calls.append(a) or "{}"; self.addCleanup(setattr, rv, "gh", orig)
+        rv.post_comment("o/r", 7, "hi")
+        self.assertEqual(calls, [("api", "-X", "POST", "repos/o/r/issues/7/comments", "-f", "body=hi")])
+
+
+class NudgeCli(unittest.TestCase):
+    def patch(self, name, fn):
+        orig = getattr(rv, name); setattr(rv, name, fn); self.addCleanup(setattr, rv, name, orig)
+
+    def test_nudge_subcommand(self):
+        calls = []
+        self.patch("run_nudge", lambda repo, n: calls.append((repo, n)) or True)
+        self.assertEqual(rv.main(["rv", "nudge", "o/r", "5"]), 0)
+        self.assertEqual(calls, [("o/r", 5)])
+
+    def test_nudge_rejects_bad_args(self):
+        self.patch("run_nudge", lambda *a: self.fail("must not run"))
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(rv.main(["rv", "nudge", "o/r"]), 2)
+            self.assertEqual(rv.main(["rv", "nudge", "o/r", "5", "x"]), 2)
+
+    def test_a_failed_nudge_exits_1_with_an_error_annotation_naming_the_remedy(self):
+        def boom(repo, n):
+            raise subprocess.CalledProcessError(1, ["gh"], stderr="HTTP 403: Resource not accessible by integration\n")
+        self.patch("run_nudge", boom)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(rv.main(["rv", "nudge", "o/r", "5"]), 1)
+        err = [l for l in out.getvalue().splitlines() if l.startswith("::error")]
+        self.assertEqual(len(err), 1, out.getvalue()); self.assertIn("@codex review", err[0]); self.assertIn("403", err[0])
+
+
+class NudgeWiring(unittest.TestCase):
+    def poll_steps(self):
+        return workflow()["jobs"]["poll"]["steps"]
+
+    def test_the_nudge_runs_in_the_poll_job_on_synchronize_only_before_the_poll(self):
+        steps = self.poll_steps()
+        runs = [s.get("run", "").splitlines() for s in steps]
+        i = next(i for i, r in enumerate(runs) if 'python3 scripts/review_verdict.py nudge "$GITHUB_REPOSITORY" "$PR"' in r)
+        j = next(i for i, r in enumerate(runs) if 'python3 scripts/review_verdict.py poll "$GITHUB_REPOSITORY" "$PR"' in r)
+        self.assertLess(i, j)
+        self.assertEqual(steps[i]["env"]["PR"], "${{ github.event.pull_request.number }}")
+        cond = steps[i]["if"]
+        self.assertIn("github.event.action == 'synchronize'", cond)
+        for other in ("opened", "ready_for_review", "reopened"):  # Codex auto-reviews open / ready
+            self.assertNotIn(other, cond)
+
+    def test_a_failed_nudge_never_skips_the_poll(self):
+        steps = self.poll_steps()
+        poll = next(s for s in steps if "review_verdict.py poll" in s.get("run", ""))
+        self.assertIn("!cancelled()", poll.get("if", ""))
+
+    def test_poll_runs_are_serialized_per_pr(self):  # what makes the marker check race-free
+        c = workflow()["jobs"]["poll"]["concurrency"]
+        self.assertIn("github.event.pull_request.number", c["group"]); self.assertIs(c["cancel-in-progress"], True)
+
+    def test_permissions_are_unchanged_no_caller_edit(self):
+        # Posting a PR comment needs only pull-requests: write (probe, run 36483153709); the 11
+        # byte-identical callers grant exactly these, and a reusable workflow cannot elevate.
+        self.assertEqual(workflow()["permissions"], {"contents": "read", "checks": "read", "pull-requests": "write",
+                                                     "statuses": "write", "issues": "read"})
+
+
+class ShortPoll(unittest.TestCase):
+    def test_window_is_8_minutes(self):
+        self.assertEqual(rv.POLL_WINDOW, timedelta(minutes=8))
+        self.assertFalse(hasattr(rv, "POLL_DEADLINE"))
+
+    def test_job_timeout_covers_the_window_and_stays_short(self):
+        # window + the last sleep + slack for the nudge, checkout and a slow fetch
+        t = poll_job_timeout()
+        self.assertGreaterEqual(t, rv.POLL_WINDOW + timedelta(seconds=rv.POLL_INTERVAL) + timedelta(minutes=2))
+        self.assertLessEqual(t, timedelta(minutes=15))
+
+    def test_dispatch_recompute_is_the_one_shot_path(self):
+        once = workflow()["jobs"]["once"]
+        self.assertIn("github.event_name != 'pull_request'", once["if"])
+        run = next(s["run"] for s in once["steps"] if s.get("name", "").startswith("Compute + post"))
+        self.assertEqual(run.strip(), 'python3 scripts/review_verdict.py "$GITHUB_REPOSITORY" "$PR"')
+
+
+class QueueDedupe(unittest.TestCase):
+    """A thread that carries the queued-for-janitor reply is never queued twice. cd-marketing
+    #165: the poller and a pull_request_review one-shot both fetched the unmarked thread and
+    replied 1 s apart. Marker checked at fetch (compute) AND right before the reply."""
+    NOW = T0 + timedelta(minutes=4)
+
+    def test_an_open_thread_with_the_marker_is_not_queued_again(self):
+        t = thread("T2", 2, 3)
+        t["comments"].append({"author": "github-actions", "body": rv.QUEUE_REPLY, "created_at": iso(T0 + timedelta(minutes=3)), "commit_sha": "new"})
+        v = compute(pr(reviews=[review(3)], threads=[t]), self.NOW)
+        self.assertEqual(v, {"state": "success", "description": "round 1: no blocking findings", "queue": []})
+
+    def test_a_reply_that_landed_after_this_runs_fetch_is_not_repeated(self):
+        g = FakeGitHub(pr(reviews=[review(3)], threads=[thread("T2", 2, 3)]), queued_now={"T2"}).install(self)
+        result, out = run_once_capturing(g, self.NOW)
+        self.assertNotIsInstance(result, Exception, out)
+        self.assertNotIn(("reply", "T2"), g.calls)
+        self.assertEqual(g.posted[-1]["state"], "success")
+
+    def test_racing_runs_reply_once(self):
+        # Both runs fetched before either replied (the #165 interleaving); they share GitHub.
+        stale = pr(reviews=[review(3)], threads=[thread("T2", 2, 3)])
+        a = FakeGitHub(stale).install(self)
+        run_once_capturing(a, self.NOW)
+        b = FakeGitHub(stale, queued_now=a.queued_now).install(self)
+        run_once_capturing(b, self.NOW + timedelta(seconds=1))
+        replies = [c for c in a.calls + b.calls if c[0] == "reply"]
+        self.assertEqual(replies, [("reply", "T2")])
+
+    def test_a_failed_fresh_check_still_replies(self):  # a duplicate reply beats a lost finding
+        g = FakeGitHub(pr(reviews=[review(3)], threads=[thread("T2", 2, 3)]), fail_check={"T2"}).install(self)
+        result, out = run_once_capturing(g, self.NOW)
+        self.assertIn(("reply", "T2"), g.calls); self.assertEqual(g.posted[-1]["state"], "success")
+        self.assertTrue(any(l.startswith("::warning") and "T2" in l for l in out.splitlines()), out)
+
+    def test_thread_is_queued_reads_the_thread_fresh(self):
+        seen = []
+        def fake_gh(*args, **kw):
+            seen.append(args)
+            return json.dumps({"data": {"node": {"comments": {"nodes": [{"body": "x"}, {"body": rv.QUEUE_REPLY}]}}}})
+        orig = rv.gh; rv.gh = fake_gh; self.addCleanup(setattr, rv, "gh", orig)
+        self.assertTrue(rv.thread_is_queued("T9"))
+        self.assertIn("id=T9", seen[0]); self.assertIn("graphql", seen[0])
+        rv.gh = lambda *a, **k: json.dumps({"data": {"node": {"comments": {"nodes": [{"body": "x"}]}}}})
+        self.assertFalse(rv.thread_is_queued("T9"))
+
+    def test_one_shot_runs_are_serialized_per_pr(self):
+        c = workflow()["jobs"]["once"]["concurrency"]
+        for key in ("github.event.pull_request.number", "github.event.issue.number", "inputs.pr"):
+            self.assertIn(key, c["group"])
+        self.assertIs(c["cancel-in-progress"], False)  # queue behind, never kill a half-done queue
+        self.assertNotEqual(c["group"], workflow()["jobs"]["poll"]["concurrency"]["group"])
 
 
 if __name__ == "__main__":
