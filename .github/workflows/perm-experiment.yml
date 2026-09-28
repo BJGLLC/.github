@@ -1,31 +1,20 @@
-# DRILL (SSSF-25) — throwaway, never merges. Which GITHUB_TOKEN permission does
-# resolveReviewThread need? Each job resolves its own thread (matched by body) with a
-# different permission set; job A also re-checks that the queue reply works with today's set.
+# DRILL (SSSF-25) — throwaway, never merges.
+# Round 1 (run 36480794129, commit before this one): resolveReviewThread needs contents: write.
+# Round 2 (this commit): can the gate post a PR comment (the R32-reversal nudge) with the
+# permissions the callers already grant (pull-requests: write, issues: read)?
 name: perm-experiment
 on:
   pull_request: { types: [synchronize] }
 jobs:
-  exp-a-prw-contents-read:
+  exp-d-prw-issues-read:
     runs-on: ubuntu-latest
-    permissions: { pull-requests: write, contents: read }
+    permissions: { pull-requests: write, issues: read, contents: read }
     steps:
-      - uses: actions/checkout@v4
-        with: { persist-credentials: false }
-      - run: bash drills-sssf-25/resolve.sh
-        env: { GH_TOKEN: "${{ github.token }}", PR: "${{ github.event.pull_request.number }}", MARK: exp-A, REPLY: "1" }
-  exp-b-prw-contents-write:
+      - env: { GH_TOKEN: "${{ github.token }}", PR: "${{ github.event.pull_request.number }}" }
+        run: gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$PR/comments" -f body="SSSF-25 probe D (pull-requests write, issues read)" --jq .html_url
+  exp-e-prread-issues-write:
     runs-on: ubuntu-latest
-    permissions: { pull-requests: write, contents: write }
+    permissions: { pull-requests: read, issues: write, contents: read }
     steps:
-      - uses: actions/checkout@v4
-        with: { persist-credentials: false }
-      - run: bash drills-sssf-25/resolve.sh
-        env: { GH_TOKEN: "${{ github.token }}", PR: "${{ github.event.pull_request.number }}", MARK: exp-B, REPLY: "0" }
-  exp-c-prread-contents-write:
-    runs-on: ubuntu-latest
-    permissions: { pull-requests: read, contents: write }
-    steps:
-      - uses: actions/checkout@v4
-        with: { persist-credentials: false }
-      - run: bash drills-sssf-25/resolve.sh
-        env: { GH_TOKEN: "${{ github.token }}", PR: "${{ github.event.pull_request.number }}", MARK: exp-C, REPLY: "0" }
+      - env: { GH_TOKEN: "${{ github.token }}", PR: "${{ github.event.pull_request.number }}" }
+        run: gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$PR/comments" -f body="SSSF-25 probe E (pull-requests read, issues write)" --jq .html_url
