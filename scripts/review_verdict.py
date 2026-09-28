@@ -5,9 +5,10 @@ Pure part: compute(pr, now), parse_summary(body), pushed_at(commit_node), is_nud
 poll_done(pr, verdict, now), clock_start(pr), derive_asked_at(...).
 Fetch/act part: fetch(repo, number) via `gh`; run_once = fetch -> compute -> post status ->
 auto-resolve queued threads; poll = run_once every 60 s until poll_done.
-The gate never comments on a PR (R32: Codex ignores github-actions[bot] mentions): when a
-review is due, the pending status description asks a human or agent to comment
-`@codex review`; agents also request re-reviews and the post-hoc review of a hotfix merge.
+The gate never asks Codex (R32): it only replies `queued-for-janitor` on the P2/P3 threads it
+resolves. When a review is due, the pending status description asks a human or agent to
+comment `@codex review`; agents also request re-reviews and the post-hoc review of a hotfix
+merge. (Codex's summary edit is flaky (R35); a bot's mention did get a review on #72.)
 The reusable workflow (.github/workflows/review-verdict.yml) runs `poll` after a push and the
 one-shot `<repo> <n>` for every other event. Spec: claude-dotfiles
 docs/superpowers/specs/2026-09-26-review-system-v4-design.md §6.
@@ -32,7 +33,9 @@ REVIEW_REQUEST = "@codex review"
 BADGE = re.compile(r"P([0-3]) Badge\]")
 NO_ISSUES = re.compile(r"didn'?t find any major issues", re.I)
 REVIEWED_COMMIT = re.compile(r"reviewed\s+commit\W*?([0-9a-f]+)(?![0-9a-z])", re.I)
-ERROR =re.compile(r"codex (encountered an error|was unable|could not|failed)", re.I)
+# Codex's real error comment (intranet #59, file-mine #14-#17): 'Codex Review: Something went
+# wrong. Try again later by commenting "@codex review"'. The older phrasings stay as fallbacks.
+ERROR = re.compile(r"codex review:\s*something went wrong|codex (encountered an error|was unable|could not|failed)", re.I)
 QUEUE_MARK = "queued-for-janitor"
 CODEX_UNAVAILABLE_DESC = "codex-unavailable: Codex errored. Retry `@codex review`, or label `hotfix` if urgent."
 SUMMARY_MARKER = "<!-- codex-pull-request-review-summary -->"
@@ -124,8 +127,10 @@ def compute(pr, now):
     """The verdict {state, description, queue} for the PR's head. Pure: every mode (poll,
     one-shot, dispatch) feeds it the same fetch() output, so two runs on the same SHA post
     the same status. The ask (10 min) and codex-unavailable (30 min) ages run from
-    clock_start(pr). The gate never comments (R32): once a review is due and nobody has
-    asked, the pending description asks for `@codex review` instead. A retry does NOT
+    clock_start(pr). The gate never asks Codex (R32; it only replies `queued-for-janitor` on
+    P2/P3 threads it resolves): once a review is due and nobody has asked, the pending
+    description asks for `@codex review` instead. An error comment counts only when no head
+    verdict exists, so a successful retry wins over an earlier error. A retry does NOT
     restart the window: the status stays codex-unavailable until Codex's summary edit (an
     issue_comment event -> one-shot run) recomputes it once the review lands (spec §6)."""
     if "hotfix" in pr.get("labels", []):
@@ -152,8 +157,9 @@ def compute(pr, now):
     summary_for_head = bool(summary and summary.get("commit") and head_sha.startswith(summary["commit"]))
     summary_status = summary.get("status") if summary_for_head else None
 
-    if any(ERROR.search(c["body"]) for c in head_comments) or summary_status == "error":
-        return {"state": "failure", "description": CODEX_UNAVAILABLE_DESC, "queue": []}
+    # Checked only AFTER the verdict (final review, Minor 1): an error comment followed by a
+    # retry that lands a head verdict must not stay red forever. No verdict -> fail at once.
+    errored = any(ERROR.search(c["body"]) for c in head_comments) or summary_status == "error"
 
     # Stale-verdict race fix (review focus 2): a Codex review only counts as a verdict
     # for THIS head when its commit_sha actually matches -- being merely "submitted
@@ -180,6 +186,8 @@ def compute(pr, now):
         )
 
     if not has_verdict:
+        if errored:
+            return {"state": "failure", "description": CODEX_UNAVAILABLE_DESC, "queue": []}
         age = now - clock_start(pr)
         if age >= UNAVAILABLE_AFTER:
             return {"state": "failure", "description": "codex-unavailable: no verdict in 30 min. Retry `@codex review`, or label `hotfix` if urgent.", "queue": []}
@@ -200,6 +208,8 @@ def compute(pr, now):
     round_no = (len({r["commit_sha"] for r in reviews if r.get("commit_sha")})
                 + sum(1 for r in reviews if not r.get("commit_sha")))
     blocking_max = 1 if round_no <= 2 else 0  # P0/P1 block in rounds 1-2, P0 only after
+    # A clean first pass is comments/👍, not a review submission (round_no 0); label it round 1.
+    label = f"round {max(round_no, 1)}"
     blocking, queue = [], []
     for t in pr["threads"]:
         if not t["comments"] or not is_codex(t["comments"][0]["author"]):
@@ -215,8 +225,8 @@ def compute(pr, now):
             if not t["is_resolved"]:
                 queue.append(t["id"])
     if blocking:
-        return {"state": "failure", "description": f"round {round_no}: {len(blocking)} unresolved P0/P1 (push a fix): {', '.join(blocking)}"[:140], "queue": queue}
-    return {"state": "success", "description": f"round {round_no}: no blocking findings" + (f"; {len(queue)} queued for janitor" if queue else ""), "queue": queue}
+        return {"state": "failure", "description": f"{label}: {len(blocking)} unresolved P0/P1 (push a fix): {', '.join(blocking)}"[:140], "queue": queue}
+    return {"state": "success", "description": f"{label}: no blocking findings" + (f"; {len(queue)} queued for janitor" if queue else ""), "queue": queue}
 
 
 def poll_done(pr, verdict, now):

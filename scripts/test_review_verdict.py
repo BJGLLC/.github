@@ -783,7 +783,8 @@ class StuckRunningSummary(unittest.TestCase):  # E8 replay (dotfiles #75, head 5
 
     def test_head_named_no_issues_comment_is_a_verdict_despite_running_summary(self):
         v = compute(self.e8(), T0 + timedelta(minutes=3))
-        self.assertEqual(v["state"], "success"); self.assertEqual(v["description"], "round 0: no blocking findings")
+        # F1: a clean first pass has no Codex review submission (round_no 0) but reads "round 1"
+        self.assertEqual(v["state"], "success"); self.assertEqual(v["description"], "round 1: no blocking findings")
 
     def test_no_issues_comment_naming_another_sha_is_not_a_verdict(self):
         v = compute(self.e8(body=E8_BODY.replace("5cf2a667d3", "deadbeef00")), T0 + timedelta(minutes=3))
@@ -792,6 +793,122 @@ class StuckRunningSummary(unittest.TestCase):  # E8 replay (dotfiles #75, head 5
     def test_thumbs_up_alone_never_overrides_a_summary(self):  # R13 guard
         v = compute(self.e8(with_comment=False), T0 + timedelta(minutes=3))
         self.assertEqual(v["state"], "pending"); self.assertEqual(v["description"], "waiting for Codex review of 5cf2a66")
+
+
+# ==== F1 (final review): C1 drill bypass, the real error text, the round label ============
+import shutil
+import tempfile
+
+ORG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+REUSABLE = os.path.join(ORG, ".github", "workflows", "review-verdict.yml")
+SELF_CALLER = os.path.join(ORG, ".github", "workflows", "review-verdict-self.yml")
+
+
+def step_run_body(workflow_path, step_name_prefix):
+    """The `run: |` block of the step whose `- name:` starts with step_name_prefix, dedented.
+    Plain text parsing on purpose: CI's system python may lack PyYAML (the C1 test must run)."""
+    lines = open(workflow_path).read().splitlines()
+    start = next(i for i, l in enumerate(lines) if l.strip().startswith(f"- name: {step_name_prefix}"))
+    run_at = next(i for i in range(start + 1, len(lines)) if lines[i].strip() == "run: |")
+    indent = len(lines[run_at]) - len(lines[run_at].lstrip()) + 2
+    body = []
+    for l in lines[run_at + 1:]:
+        if l.strip() and len(l) - len(l.lstrip()) < indent:
+            break
+        body.append(l[indent:])
+    return "\n".join(body) + "\n"
+
+
+@unittest.skipUnless(shutil.which("bash") and shutil.which("jq"), "needs bash + jq (as on ubuntu-latest)")
+class DrillCanOnlyFail(unittest.TestCase):  # R39 / C1: `-f drill=clean` posted a required-passing success
+    def run_drill(self, drill, p1_open_fixture=None):
+        """Execute the reusable workflow's real drill step body with a stub `gh` (logs, never
+        calls GitHub) and the real script + fixtures. Returns (exit code, status POSTs)."""
+        tmp = tempfile.mkdtemp(); self.addCleanup(shutil.rmtree, tmp)
+        shutil.copytree(os.path.join(ORG, "scripts", "drills"), os.path.join(tmp, "scripts", "drills"))
+        shutil.copy(os.path.join(ORG, "scripts", "review_verdict.py"), os.path.join(tmp, "scripts"))
+        if p1_open_fixture:
+            shutil.copy(os.path.join(ORG, "scripts", "drills", p1_open_fixture), os.path.join(tmp, "scripts", "drills", "p1-open.json"))
+        os.makedirs(os.path.join(tmp, "bin"))
+        log = os.path.join(tmp, "gh.log")
+        stub = os.path.join(tmp, "bin", "gh")
+        with open(stub, "w") as f:
+            f.write('#!/usr/bin/env bash\nif [ "$1 $2" = "pr view" ]; then echo headsha123; exit 0; fi\n'
+                    f'printf "%s\\n" "$*" >> "{log}"\n')
+        os.chmod(stub, 0o755)
+        env = {"PATH": os.path.join(tmp, "bin") + os.pathsep + os.environ["PATH"], "HOME": tmp,
+               "GH_TOKEN": "stub-not-a-token", "GITHUB_REPOSITORY": "o/r", "PR": "12", "DRILL": drill}
+        r = subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", step_run_body(REUSABLE, "Drill")],
+                           cwd=tmp, env=env, capture_output=True, text=True)
+        posts = open(log).read().splitlines() if os.path.exists(log) else []
+        return r.returncode, [p for p in posts if "/statuses/" in p]
+
+    def test_clean_drill_is_refused_and_posts_nothing(self):
+        rc, posts = self.run_drill("clean")
+        self.assertNotEqual(rc, 0); self.assertEqual(posts, [])
+
+    def test_p1_open_drill_posts_failure(self):
+        rc, posts = self.run_drill("p1-open")
+        self.assertEqual(rc, 0); self.assertEqual(len(posts), 1)
+        self.assertIn("state=failure", posts[0]); self.assertIn("description=DRILL p1-open: ", posts[0])
+
+    def test_guard_stops_a_drill_whose_fixture_computes_success(self):
+        rc, posts = self.run_drill("p1-open", p1_open_fixture="clean.json")
+        self.assertNotEqual(rc, 0); self.assertEqual(posts, [])
+
+    def test_unknown_drill_is_refused(self):
+        rc, posts = self.run_drill("../../etc/passwd")
+        self.assertNotEqual(rc, 0); self.assertEqual(posts, [])
+
+
+class SelfCallerDrillInput(unittest.TestCase):  # R39: don't advertise a drill that no longer exists
+    def test_self_caller_does_not_offer_clean(self):
+        line = next(l for l in open(SELF_CALLER) if l.strip().startswith("drill:"))
+        self.assertIn("p1-open", line); self.assertNotIn("clean", line)
+
+
+REAL_ERROR = 'Codex Review: Something went wrong. Try again later by commenting "@codex review"'
+F1_HEAD = "abcdef1234" + "0" * 30
+
+
+class ErrorChannel(unittest.TestCase):  # final-review Minor 1
+    def c(self, body, minutes, author=CODEX):
+        return {"author": author, "body": body, "created_at": iso(T0 + timedelta(minutes=minutes))}
+
+    def test_real_error_text_matches(self):
+        self.assertTrue(rv.ERROR.search(REAL_ERROR))
+
+    def test_error_alone_is_codex_unavailable(self):
+        v = compute(pr(head_sha=F1_HEAD, comments=[self.c(REAL_ERROR, 2)]), T0 + timedelta(minutes=3))
+        self.assertEqual(v["state"], "failure"); self.assertIn("codex-unavailable: Codex errored", v["description"])
+
+    def test_error_then_retry_then_head_verdict_is_success(self):
+        clean = "Codex Review: Didn't find any major issues. Nice work!\n\n**Reviewed commit:** `abcdef1234`"
+        comments = [self.c(REAL_ERROR, 2), self.c("@codex review", 3, author="blakejgruber"), self.c(clean, 6)]
+        p = pr(head_sha=F1_HEAD, comments=comments, summary={"status": "completed", "commit": "abcdef1"})
+        v = compute(p, T0 + timedelta(minutes=7))
+        self.assertEqual(v["state"], "success"); self.assertEqual(v["description"], "round 1: no blocking findings")
+
+    def test_error_then_retry_then_head_sha_review_is_success(self):
+        comments = [self.c(REAL_ERROR, 2), self.c("@codex review", 3, author="blakejgruber")]
+        p = pr(head_sha=F1_HEAD, comments=comments, reviews=[review(6, sha=F1_HEAD)])
+        self.assertEqual(compute(p, T0 + timedelta(minutes=7))["state"], "success")
+
+    def test_error_then_retry_still_running_is_codex_unavailable(self):
+        comments = [self.c(REAL_ERROR, 2), self.c("@codex review", 3, author="blakejgruber")]
+        p = pr(head_sha=F1_HEAD, comments=comments, summary={"status": "running", "commit": "abcdef1"})
+        self.assertEqual(compute(p, T0 + timedelta(minutes=4))["state"], "failure")
+
+
+class RoundLabel(unittest.TestCase):  # F1: the label shows round >=1; blocking uses the true count
+    def test_clean_first_pass_reads_round_1(self):
+        r = {"user": CODEX, "content": "+1", "created_at": iso(T0 + timedelta(minutes=3))}
+        self.assertEqual(compute(pr(reactions=[r]), T0 + timedelta(minutes=4))["description"], "round 1: no blocking findings")
+
+    def test_blocking_without_a_review_submission_reads_round_1(self):
+        r = {"user": CODEX, "content": "+1", "created_at": iso(T0 + timedelta(minutes=3))}
+        v = compute(pr(reactions=[r], threads=[thread("T1", 1, 3)]), T0 + timedelta(minutes=4))
+        self.assertEqual(v["state"], "failure"); self.assertTrue(v["description"].startswith("round 1: 1 unresolved P0/P1"))
 
 
 class DrillFixtures(unittest.TestCase):
