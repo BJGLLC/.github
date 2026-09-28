@@ -1,1 +1,2 @@
 SSSF-25 live proof of the review-verdict nudge. Throwaway: this PR is closed unmerged.
+commit 2: a new head, so the gate should ask Codex once.
