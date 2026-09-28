@@ -48,9 +48,9 @@ def ts(s):
 
 
 def _normalize_login(name):
-    """Strip a trailing '[bot]' suffix so review/comment/reaction/thread authors compare
-    correctly against CODEX regardless of whether GitHub reported the App identity
-    (reviews/comments: 'chatgpt-codex-connector') or the bot identity (reactions:
+    """Strip a trailing '[bot]' suffix so review/comment/thread authors compare correctly
+    against CODEX regardless of whether GitHub reported the App identity (GraphQL:
+    'chatgpt-codex-connector') or the bot identity (REST, e.g. the summary scan:
     'chatgpt-codex-connector[bot]')."""
     if not name:
         return name
@@ -151,7 +151,6 @@ def compute(pr, now):
     # no-major-issues comment channels -- it's Codex's own status board, not a finding.
     head_comments = [c for c in pr["comments"]
                       if is_codex(c["author"]) and after(c["created_at"]) and SUMMARY_MARKER not in c["body"]]
-    head_reactions = [r for r in pr["reactions"] if is_codex(r["user"]) and r["content"] == "+1" and after(r["created_at"])]
 
     summary = pr.get("summary")
     summary_for_head = bool(summary and summary.get("commit") and head_sha.startswith(summary["commit"]))
@@ -164,26 +163,23 @@ def compute(pr, now):
     # Stale-verdict race fix (review focus 2): a Codex review only counts as a verdict
     # for THIS head when its commit_sha actually matches -- being merely "submitted
     # after the push" is not enough (that let a stale review on an old commit pass an
-    # unreviewed new head). When Codex's sticky summary exists it is authoritative and
-    # the 👍 / no-major-issues comment channels are ignored entirely -- except (R35) a
-    # no-issues comment naming the head as its Reviewed commit, since Codex's summary edit is
-    # flaky (E8: stuck "Running" after a clean review). Without a summary, those channels
-    # (plus a same-SHA or empty-sha-after-push review) are the fallback.
+    # unreviewed new head). When Codex's sticky summary exists it is authoritative, except
+    # (R35) a no-issues comment naming the head as its Reviewed commit also counts, since
+    # Codex's summary edit is flaky (E8: stuck "Running" after a clean review). Without a
+    # summary (none yet, or -- before R46 -- one outside the fetched window) the same SHA-named
+    # comment, a same-SHA review or an empty-sha-after-push review are the fallback. A 👍 or a
+    # SHA-less no-issues comment is never a verdict (R46): after a push it may still be about
+    # the previous head -- the stale-verdict race again, on PRs with 100+ comments.
     has_head_sha_review = any(r.get("commit_sha") == head_sha for r in reviews)
+    head_named_no_issues = any(
+        NO_ISSUES.search(c["body"]) and (rc := reviewed_commit(c["body"])) and head_sha.lower().startswith(rc)
+        for c in head_comments)
     if summary is not None:
-        head_named_no_issues = any(
-            NO_ISSUES.search(c["body"]) and (rc := reviewed_commit(c["body"])) and head_sha.lower().startswith(rc)
-            for c in head_comments)
         has_verdict = (summary_status == "completed") or has_head_sha_review or head_named_no_issues
     else:
         empty_sha_review_after_push = any(
             not r.get("commit_sha") and after(r["submitted_at"]) for r in reviews)
-        has_verdict = bool(
-            has_head_sha_review
-            or empty_sha_review_after_push
-            or head_reactions
-            or any(NO_ISSUES.search(c["body"]) for c in head_comments)
-        )
+        has_verdict = has_head_sha_review or empty_sha_review_after_push or head_named_no_issues
 
     if not has_verdict:
         if errored:
@@ -208,7 +204,7 @@ def compute(pr, now):
     round_no = (len({r["commit_sha"] for r in reviews if r.get("commit_sha")})
                 + sum(1 for r in reviews if not r.get("commit_sha")))
     blocking_max = 1 if round_no <= 2 else 0  # P0/P1 block in rounds 1-2, P0 only after
-    # A clean first pass is comments/👍, not a review submission (round_no 0); label it round 1.
+    # A clean first pass is a comment, not a review submission (round_no 0); label it round 1.
     label = f"round {max(round_no, 1)}"
     blocking, queue = [], []
     for t in pr["threads"]:
@@ -285,35 +281,45 @@ def derive_asked_at(head_pushed_at, event_times):
     return max([head_pushed_at, *event_times], key=ts)
 
 
-def reactions_from_rest(items):
-    """Map the REST 'list reactions' payload to compute()'s {"user","content","created_at"}
-    shape. GraphQL's Reaction.user is typed User, so a Bot's own 👍 comes back null there
-    -- the REST issue-reactions endpoint reports it correctly (as e.g.
-    'chatgpt-codex-connector[bot]'), so that's what fetch() reads instead."""
-    return [{
-        "user": (item.get("user") or {}).get("login", ""),
-        "content": item.get("content", ""),
-        "created_at": item.get("created_at", ""),
-    } for item in items]
-
-
 GQL = """
 query($owner:String!,$name:String!,$n:Int!){ repository(owner:$owner,name:$name){ pullRequest(number:$n){
   headRefOid isDraft state createdAt labels(first:20){nodes{name}}
   timelineItems(last:5, itemTypes:[READY_FOR_REVIEW_EVENT, REOPENED_EVENT]){nodes{... on ReadyForReviewEvent{createdAt} ... on ReopenedEvent{createdAt}}}
   commits(last:1){nodes{commit{committedDate checkSuites(first:20){nodes{createdAt app{slug}}}}}}
   reviews(first:100){nodes{author{login} submittedAt commit{oid}}}
-  comments(last:100){nodes{author{login} body createdAt}}
+  comments(last:100){totalCount nodes{author{login} body createdAt}}
   reviewThreads(first:100){nodes{id isResolved comments(first:20){nodes{author{login} body createdAt commit{oid}}}}}
 }}}"""
 
 
+def _codex_summaries(comments):
+    return [c for c in comments if is_codex(c["author"]) and SUMMARY_MARKER in c["body"]]
+
+
 def _newest_summary(comments):
-    codex_marked = [c for c in comments if is_codex(c["author"]) and SUMMARY_MARKER in c["body"]]
+    codex_marked = _codex_summaries(comments)
     if not codex_marked:
         return None
     newest = max(codex_marked, key=lambda c: ts(c["created_at"]))
     return parse_summary(newest["body"])
+
+
+def needs_summary_scan(window_comments, total_count):
+    """R46: the GraphQL query sees only comments(last:100). Scan the full history for Codex's
+    summary only when it isn't in that window AND older comments exist -- so a normal PR
+    costs no extra call and a long one costs ceil(N/100) REST pages."""
+    return not _codex_summaries(window_comments) and total_count > len(window_comments)
+
+
+def _scan_for_summaries(repo, number):
+    """Every Codex-summary-marked comment on the PR, however old. REST + --paginate + a --jq
+    filter that emits one compact JSON object per match (a plain --paginate would print
+    '[..][..]' page arrays, which json.loads can't parse). Authors come back as ...[bot];
+    is_codex normalizes that."""
+    jq = (f'.[] | select(.body | contains("{SUMMARY_MARKER}")) '
+          '| {author: .user.login, body: .body, created_at: .created_at} | tojson')
+    out = gh("api", "--paginate", f"repos/{repo}/issues/{number}/comments?per_page=100", "--jq", jq)
+    return [json.loads(line) for line in out.splitlines() if line.strip()]
 
 
 def fetch(repo, number):
@@ -323,24 +329,20 @@ def fetch(repo, number):
     login = lambda x: (x or {}).get("login", "")
     comments = [{"author": login(c["author"]), "body": c["body"], "created_at": c["createdAt"]} for c in p["comments"]["nodes"]]
     head_pushed_at = pushed_at(p["commits"]["nodes"][0])
-    # Reactions come from REST, not GraphQL: GraphQL's Reaction.user is typed User, so
-    # a Bot's own 👍 (Codex reacts as chatgpt-codex-connector[bot]) comes back null there.
-    # Single page, no --paginate: gh concatenates array pages as separate JSON documents
-    # ("[..][..]"), which json.loads can't parse; Codex adds at most a couple of
-    # reactions per PR, so one page of 100 is ample.
-    reactions_raw = json.loads(gh("api", f"repos/{repo}/issues/{number}/reactions?per_page=100"))
+    summary_sources = comments
+    if needs_summary_scan(comments, p["comments"]["totalCount"]):
+        summary_sources = comments + _scan_for_summaries(repo, number)
     return {
         "head_sha": p["headRefOid"], "head_pushed_at": head_pushed_at,
         "draft": p["isDraft"], "state": p["state"],
         "labels": [l["name"] for l in p["labels"]["nodes"]],
         "reviews": [{"author": login(r["author"]), "submitted_at": r["submittedAt"], "commit_sha": (r["commit"] or {}).get("oid", "")} for r in p["reviews"]["nodes"]],
         "comments": comments,
-        "reactions": reactions_from_rest(reactions_raw),
         "threads": [{"id": t["id"], "is_resolved": t["isResolved"], "comments": [
             {"author": login(c["author"]), "body": c["body"], "created_at": c["createdAt"], "commit_sha": (c["commit"] or {}).get("oid", "")} for c in t["comments"]["nodes"]]} for t in p["reviewThreads"]["nodes"]],
         "nudged": is_nudged(comments, head_pushed_at),
         "asked_at": derive_asked_at(head_pushed_at, [p["createdAt"], *(e["createdAt"] for e in p["timelineItems"]["nodes"] if e.get("createdAt"))]),
-        "summary": _newest_summary(comments),
+        "summary": _newest_summary(summary_sources),
     }
 
 

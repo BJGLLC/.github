@@ -38,7 +38,7 @@ permissions:
   checks: read            # fetch() reads checkSuites to date the push; without it gh exits 1 and nothing posts
   pull-requests: write    # resolve queued threads
   statuses: write         # the review-verdict status
-  issues: read            # PR reactions (REST issues endpoint); the gate posts no comments (R32)
+  issues: read            # REST issue-comments scan for Codex's summary (R46); the gate posts no comments (R32)
 defaults:
   run:
     shell: bash

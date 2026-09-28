@@ -17,7 +17,7 @@ permissions:
   checks: read
   pull-requests: write
   statuses: write
-  issues: write
+  issues: read            # the gate posts no issue comments (R32); the reusable workflow needs read only
 jobs:
   verdict:
     # Skipped jobs bill nothing. issue_comment: only Codex's own comments on a PR. pull_request:

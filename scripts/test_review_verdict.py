@@ -2,7 +2,7 @@ import os
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from review_verdict import compute, parse_summary, pushed_at, is_nudged, ts, reactions_from_rest
+from review_verdict import compute, parse_summary, pushed_at, is_nudged, ts
 
 CODEX = "chatgpt-codex-connector"
 T0 = datetime(2026, 9, 26, 12, 0, tzinfo=timezone.utc)
@@ -69,14 +69,29 @@ class NoVerdictYet(unittest.TestCase):
         self.assertEqual(v["state"], "pending")
 
 
-class VerdictShapes(unittest.TestCase):
-    def test_thumbs_up_reaction_is_success(self):
-        r = {"user": CODEX, "content": "+1", "created_at": iso(T0 + timedelta(minutes=3))}
-        self.assertEqual(compute(pr(reactions=[r]), T0 + timedelta(minutes=4))["state"], "success")
+HEX_HEAD = "abc1234def" + "0" * 30  # head for tests that need a Reviewed-commit SHA to prefix it
 
-    def test_no_major_issues_comment_is_success(self):
+
+def named_clean(sha, minutes, author=CODEX):
+    """Codex's real clean-review comment, naming the commit it reviewed (R35 shape)."""
+    return {"author": author, "created_at": iso(T0 + timedelta(minutes=minutes)),
+            "body": f"Codex Review: Didn't find any major issues. Nice work!\n\n**Reviewed commit:** `{sha}`"}
+
+
+class VerdictShapes(unittest.TestCase):
+    # R46: without a summary, only verdicts that name the head count -- a 👍 or a SHA-less
+    # no-issues comment after the push may belong to an older head (the stale-verdict race).
+    def test_thumbs_up_alone_is_not_a_verdict(self):
+        r = {"user": CODEX, "content": "+1", "created_at": iso(T0 + timedelta(minutes=3))}
+        self.assertEqual(compute(pr(reactions=[r]), T0 + timedelta(minutes=4))["state"], "pending")
+
+    def test_sha_less_no_major_issues_comment_is_not_a_verdict(self):
         c = {"author": CODEX, "body": "Didn't find any major issues. Nice work!", "created_at": iso(T0 + timedelta(minutes=3))}
-        self.assertEqual(compute(pr(comments=[c]), T0 + timedelta(minutes=4))["state"], "success")
+        self.assertEqual(compute(pr(comments=[c]), T0 + timedelta(minutes=4))["state"], "pending")
+
+    def test_head_named_no_major_issues_comment_is_success_without_summary(self):
+        v = compute(pr(head_sha=HEX_HEAD, comments=[named_clean("abc1234def", 3)]), T0 + timedelta(minutes=4))
+        self.assertEqual(v["state"], "success")
 
 
 class Blocking(unittest.TestCase):
@@ -119,9 +134,9 @@ class Blocking(unittest.TestCase):
 
 # ---- Amendment A1: [bot] suffix normalization -------------------------------------
 class BotSuffix(unittest.TestCase):
-    def test_bot_suffixed_reaction_is_success(self):
-        r = {"user": "chatgpt-codex-connector[bot]", "content": "+1", "created_at": iso(T0 + timedelta(minutes=3))}
-        self.assertEqual(compute(pr(reactions=[r]), T0 + timedelta(minutes=4))["state"], "success")
+    def test_bot_suffixed_comment_author_counts(self):  # REST reports Codex as ...[bot]
+        c = named_clean("abc1234def", 3, author="chatgpt-codex-connector[bot]")
+        self.assertEqual(compute(pr(head_sha=HEX_HEAD, comments=[c]), T0 + timedelta(minutes=4))["state"], "success")
 
     def test_bot_suffixed_review_author_counts_as_head_verdict(self):
         r = {"author": "chatgpt-codex-connector[bot]", "submitted_at": iso(T0 + timedelta(minutes=3)), "commit_sha": "new"}
@@ -156,10 +171,20 @@ class StaleVerdictRace(unittest.TestCase):
         v = compute(pr(reviews=[review(3, sha="old")]), T0 + timedelta(minutes=4))
         self.assertEqual(v["state"], "pending")
 
-    def test_no_summary_fallback_still_succeeds_on_thumbs_up(self):
+    def test_no_summary_fallback_ignores_thumbs_up(self):  # R46 (was: succeeded on 👍)
         r = {"user": CODEX, "content": "+1", "created_at": iso(T0 + timedelta(minutes=3))}
         v = compute(pr(reactions=[r]), T0 + timedelta(minutes=4))
-        self.assertEqual(v["state"], "success")
+        self.assertEqual(v["state"], "pending")
+
+    def test_no_summary_stale_thumbs_up_and_old_sha_no_issues_is_pending(self):  # R46
+        # Summary out of the fetched window: a 👍 and a no-issues comment after the push,
+        # but the comment reviewed the previous head. Neither is a verdict for this head.
+        r = {"user": "chatgpt-codex-connector[bot]", "content": "+1", "created_at": iso(T0 + timedelta(minutes=2))}
+        old = named_clean("0dd5a00000", 2)
+        self.assertEqual(rv.reviewed_commit(old["body"]), "0dd5a00000")  # parses: rejected for the SHA, not the format
+        p = pr(head_sha=HEX_HEAD, reactions=[r], comments=[old], summary=None)
+        v = compute(p, T0 + timedelta(minutes=3))
+        self.assertEqual(v["state"], "pending"); self.assertEqual(v["description"], "waiting for Codex review of abc1234")
 
 
 # ---- Minor (a): running summary for head still escalates at 30 min ----------------
@@ -196,26 +221,11 @@ class SummaryCommentExcludedFromChannels(unittest.TestCase):
         self.assertNotIn("codex-unavailable", v["description"])
 
 
-# ---- Amendment (review focus 2, part 2): REST reactions mapping -------------------
-class ReactionsFromRest(unittest.TestCase):
-    def test_maps_realistic_rest_payload(self):
-        sample = [
-            {"id": 111, "node_id": "MDg6UmVhY3Rpb24x",
-             "user": {"login": "chatgpt-codex-connector[bot]", "id": 1, "type": "Bot"},
-             "content": "+1", "created_at": "2026-09-27T22:10:00Z"},
-            {"id": 112, "node_id": "MDg6UmVhY3Rpb24y",
-             "user": {"login": "blakejgruber", "id": 2, "type": "User"},
-             "content": "heart", "created_at": "2026-09-27T22:11:00Z"},
-        ]
-        expected = [
-            {"user": "chatgpt-codex-connector[bot]", "content": "+1", "created_at": "2026-09-27T22:10:00Z"},
-            {"user": "blakejgruber", "content": "heart", "created_at": "2026-09-27T22:11:00Z"},
-        ]
-        self.assertEqual(reactions_from_rest(sample), expected)
-
-    def test_handles_null_user(self):
-        sample = [{"id": 1, "user": None, "content": "+1", "created_at": "2026-09-27T22:10:00Z"}]
-        self.assertEqual(reactions_from_rest(sample), [{"user": "", "content": "+1", "created_at": "2026-09-27T22:10:00Z"}])
+# ---- R46: 👍 is no longer an input anywhere, so its REST fetch + mapper are gone -----
+class ReactionsNotFetched(unittest.TestCase):
+    def test_reactions_mapper_is_gone(self):
+        import review_verdict
+        self.assertFalse(hasattr(review_verdict, "reactions_from_rest"))
 
 
 # ---- Amendment A2: sticky summary comment -----------------------------------------
@@ -493,22 +503,76 @@ class PollLoop(unittest.TestCase):
         self.assertEqual(v["state"], "success"); self.assertEqual(len(seen), 6)
 
 
+class NeedsSummaryScan(unittest.TestCase):  # R46: pure decision behind the marker scan
+    SUMMARY = {"author": CODEX, "body": "<!-- codex-pull-request-review-summary -->\n| x |", "created_at": iso(T0)}
+    OTHER = {"author": "blakejgruber", "body": "hi", "created_at": iso(T0)}
+
+    def test_window_is_complete(self):
+        self.assertFalse(rv.needs_summary_scan([self.OTHER], 1))
+
+    def test_summary_in_window(self):
+        self.assertFalse(rv.needs_summary_scan([self.SUMMARY, self.OTHER], 250))
+
+    def test_older_comments_exist_and_no_summary_in_window(self):
+        self.assertTrue(rv.needs_summary_scan([self.OTHER], 250))
+
+    def test_a_human_quoting_the_marker_does_not_count_as_the_summary(self):
+        quoted = dict(self.SUMMARY, author="blakejgruber")
+        self.assertTrue(rv.needs_summary_scan([quoted], 250))
+
+
 class FetchWiring(unittest.TestCase):
-    def fetch_with(self, ready=(), comments=(), created=None):
+    def fetch_with(self, ready=(), comments=(), created=None, total=None, scanned=()):
         """ready = createdAt of READY_FOR_REVIEW / REOPENED timeline events; created = PR createdAt
-        (default: an hour before the push, i.e. the PR predates its head)."""
+        (default: an hour before the push, i.e. the PR predates its head); total = the PR's
+        comments.totalCount (default: all of them are in the fetched window); scanned = what
+        the full-history REST marker scan returns. self.calls records every gh call."""
         gql = {"data": {"repository": {"pullRequest": {
             "headRefOid": "abc", "isDraft": True, "state": "OPEN", "labels": {"nodes": [{"name": "x"}]},
             "createdAt": created or iso(T0 - timedelta(hours=1)),
             "commits": {"nodes": [{"commit": {"committedDate": iso(T0), "checkSuites": {"nodes": []}}}]},
             "timelineItems": {"nodes": [{"createdAt": r} for r in ready]},
             "reviews": {"nodes": []}, "reviewThreads": {"nodes": []},
-            "comments": {"nodes": [{"author": {"login": a}, "body": b, "createdAt": t} for a, b, t in comments]}}}}}
+            "comments": {"totalCount": len(comments) if total is None else total,
+                         "nodes": [{"author": {"login": a}, "body": b, "createdAt": t} for a, b, t in comments]}}}}}
+        self.calls = []
 
         def fake_gh(*args, stdin=None):
-            return json.dumps(gql) if "graphql" in args else "[]"
+            self.calls.append(args)
+            if "graphql" in args:
+                return json.dumps(gql)
+            if any("reactions" in a for a in args):
+                self.fail("fetch must not read reactions any more (R46)")
+            if any(a.endswith("/comments?per_page=100") for a in args):
+                return "".join(json.dumps(s) + "\n" for s in scanned)
+            self.fail(f"unexpected gh call: {args}")
         orig = rv.gh; rv.gh = fake_gh; self.addCleanup(setattr, rv, "gh", orig)
         return rv.fetch("o/r", 7)
+
+    def rest_calls(self):
+        return [c for c in self.calls if "graphql" not in c]
+
+    # ---- R46: find Codex's summary even when it sits outside comments(last:100) ----
+    def test_no_scan_when_the_window_holds_every_comment(self):
+        got = self.fetch_with(comments=[("blakejgruber", "hi", iso(T0))])
+        self.assertIsNone(got["summary"]); self.assertEqual(self.rest_calls(), [])
+
+    def test_no_scan_when_the_summary_is_in_the_window(self):
+        body = read_fixture("summary-completed.md")
+        got = self.fetch_with(comments=[(CODEX, body, iso(T0))], total=150)
+        self.assertEqual(got["summary"], {"status": "completed", "commit": "e176ac7"}); self.assertEqual(self.rest_calls(), [])
+
+    def test_scan_finds_a_summary_outside_the_window(self):
+        body = read_fixture("summary-completed.md")
+        scanned = [{"author": "chatgpt-codex-connector[bot]", "body": body, "created_at": iso(T0 - timedelta(days=2))}]
+        got = self.fetch_with(comments=[("blakejgruber", "hi", iso(T0))], total=150, scanned=scanned)
+        self.assertEqual(got["summary"], {"status": "completed", "commit": "e176ac7"})
+        (call,) = self.rest_calls()
+        self.assertIn("--paginate", call); self.assertIn("repos/o/r/issues/7/comments?per_page=100", call)
+
+    def test_scan_finding_nothing_leaves_no_summary(self):
+        got = self.fetch_with(comments=[("blakejgruber", "hi", iso(T0))], total=150, scanned=[])
+        self.assertIsNone(got["summary"]); self.assertEqual(len(self.rest_calls()), 1)
 
     def test_fetch_reports_draft_and_state(self):
         got = self.fetch_with()
@@ -608,9 +672,9 @@ class AskedAtClock(unittest.TestCase):  # R23
         self.assertEqual(compute(p, ASK + timedelta(minutes=1))["state"], "failure")
 
     def test_after_filter_stays_on_head_pushed_at(self):
-        # a 👍 between the push and asked_at is still a verdict for this head (no summary)
-        r = {"user": CODEX, "content": "+1", "created_at": iso(T0 + timedelta(minutes=5))}
-        self.assertEqual(compute(pr(asked_at=iso(ASK), reactions=[r]), ASK + timedelta(minutes=1))["state"], "success")
+        # a head-named clean comment between the push and asked_at is still a verdict (no summary)
+        p = pr(head_sha=HEX_HEAD, asked_at=iso(ASK), comments=[named_clean("abc1234def", 5)])
+        self.assertEqual(compute(p, ASK + timedelta(minutes=1))["state"], "success")
 
     def test_asked_at_before_push_is_ignored(self):
         v = compute(pr(asked_at=iso(T0 - timedelta(hours=1))), T0 + timedelta(minutes=30))
@@ -902,12 +966,12 @@ class ErrorChannel(unittest.TestCase):  # final-review Minor 1
 
 class RoundLabel(unittest.TestCase):  # F1: the label shows round >=1; blocking uses the true count
     def test_clean_first_pass_reads_round_1(self):
-        r = {"user": CODEX, "content": "+1", "created_at": iso(T0 + timedelta(minutes=3))}
-        self.assertEqual(compute(pr(reactions=[r]), T0 + timedelta(minutes=4))["description"], "round 1: no blocking findings")
+        p = pr(head_sha=HEX_HEAD, comments=[named_clean("abc1234def", 3)])
+        self.assertEqual(compute(p, T0 + timedelta(minutes=4))["description"], "round 1: no blocking findings")
 
     def test_blocking_without_a_review_submission_reads_round_1(self):
-        r = {"user": CODEX, "content": "+1", "created_at": iso(T0 + timedelta(minutes=3))}
-        v = compute(pr(reactions=[r], threads=[thread("T1", 1, 3)]), T0 + timedelta(minutes=4))
+        p = pr(head_sha=HEX_HEAD, comments=[named_clean("abc1234def", 3)], threads=[thread("T1", 1, 3)])
+        v = compute(p, T0 + timedelta(minutes=4))
         self.assertEqual(v["state"], "failure"); self.assertTrue(v["description"].startswith("round 1: 1 unresolved P0/P1"))
 
 
