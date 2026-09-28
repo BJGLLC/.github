@@ -1,0 +1,16 @@
+# DRILL (SSSF-25, PR #8 only, never merges): on a title edit, post a PLAIN `@codex review` as
+# github-actions[bot] -- the control for the gate's marker-bearing nudge.
+name: probe-plain-nudge
+on:
+  pull_request: { types: [edited] }
+permissions:
+  pull-requests: write
+jobs:
+  probe:
+    if: github.event.changes.title != null
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$PR/comments" -f body='@codex review'
