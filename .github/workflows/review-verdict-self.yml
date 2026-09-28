@@ -5,7 +5,7 @@
 # Recompute by hand: gh workflow run review-verdict-self.yml -f pr=<n>
 name: review-verdict-self
 on:
-  pull_request: { types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled, closed] }
+  pull_request: { types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled] }
   pull_request_review: { types: [submitted] }   # also fires on thread replies (a reply is a COMMENTED review)
   issue_comment: { types: [created, edited] }   # Codex edits its sticky summary comment per round
   workflow_dispatch:
@@ -22,12 +22,15 @@ jobs:
   verdict:
     # Skipped jobs bill nothing. issue_comment: only Codex's own comments on a PR. pull_request:
     # label churn only for `hotfix`; nothing for a draft (ready_for_review arrives with draft=false
-    # and starts the poller) except `closed`, which carries the hotfix post-hoc step.
+    # and starts the poller). No `closed` trigger: the gate posts no comments (R32), so a close has
+    # nothing to do (a running poller notices it by itself).
     if: >-
       (github.event_name != 'issue_comment' || (github.event.issue.pull_request && startsWith(github.event.comment.user.login, 'chatgpt-codex-connector')))
       && (github.event_name != 'pull_request' || ((!contains(fromJSON('["labeled","unlabeled"]'), github.event.action) || github.event.label.name == 'hotfix')
-      && (!github.event.pull_request.draft || github.event.action == 'closed')))
+      && !github.event.pull_request.draft))
     uses: BJGLLC/.github/.github/workflows/review-verdict.yml@main
     with:
-      pr: ${{ inputs.pr || 0 }}
+      # R33: github.event.inputs values are strings (null outside workflow_dispatch); the
+      # reusable input is type: number, so parse explicitly -- `inputs.pr || 0` passed '72'.
+      pr: ${{ fromJSON(github.event.inputs.pr || '0') }}
       drill: ${{ inputs.drill || '' }}
