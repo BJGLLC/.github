@@ -31,7 +31,8 @@ HOTFIX_DESC = "hotfix: review skipped; comment @codex review after merge for the
 REVIEW_REQUEST = "@codex review"
 BADGE = re.compile(r"P([0-3]) Badge\]")
 NO_ISSUES = re.compile(r"didn'?t find any major issues", re.I)
-ERROR = re.compile(r"codex (encountered an error|was unable|could not|failed)", re.I)
+REVIEWED_COMMIT = re.compile(r"reviewed\s+commit\W*?([0-9a-f]+)(?![0-9a-z])", re.I)
+ERROR =re.compile(r"codex (encountered an error|was unable|could not|failed)", re.I)
 QUEUE_MARK = "queued-for-janitor"
 CODEX_UNAVAILABLE_DESC = "codex-unavailable: Codex errored. Retry `@codex review`, or label `hotfix` if urgent."
 SUMMARY_MARKER = "<!-- codex-pull-request-review-summary -->"
@@ -61,6 +62,13 @@ def priority(thread):
     first = thread["comments"][0]["body"]
     m = BADGE.search(first)
     return int(m.group(1)) if m else 2
+
+
+def reviewed_commit(body):
+    """The SHA in a Codex comment's `**Reviewed commit:** `5cf2a667d3`` line, lowercase, or
+    None when absent or shorter than 7 hex chars (too short to name a commit safely)."""
+    m = REVIEWED_COMMIT.search(body)
+    return m.group(1).lower() if m and len(m.group(1)) >= 7 else None
 
 
 def _summary_status_word(status_cell):
@@ -151,11 +159,16 @@ def compute(pr, now):
     # for THIS head when its commit_sha actually matches -- being merely "submitted
     # after the push" is not enough (that let a stale review on an old commit pass an
     # unreviewed new head). When Codex's sticky summary exists it is authoritative and
-    # the 👍 / no-major-issues comment channels are ignored entirely; without a summary,
-    # those channels (plus a same-SHA or empty-sha-after-push review) are the fallback.
+    # the 👍 / no-major-issues comment channels are ignored entirely -- except (R35) a
+    # no-issues comment naming the head as its Reviewed commit, since Codex's summary edit is
+    # flaky (E8: stuck "Running" after a clean review). Without a summary, those channels
+    # (plus a same-SHA or empty-sha-after-push review) are the fallback.
     has_head_sha_review = any(r.get("commit_sha") == head_sha for r in reviews)
     if summary is not None:
-        has_verdict = (summary_status == "completed") or has_head_sha_review
+        head_named_no_issues = any(
+            NO_ISSUES.search(c["body"]) and (rc := reviewed_commit(c["body"])) and head_sha.lower().startswith(rc)
+            for c in head_comments)
+        has_verdict = (summary_status == "completed") or has_head_sha_review or head_named_no_issues
     else:
         empty_sha_review_after_push = any(
             not r.get("commit_sha") and after(r["submitted_at"]) for r in reviews)

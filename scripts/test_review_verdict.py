@@ -755,6 +755,45 @@ class ClockStartsHaveAPoller(unittest.TestCase):  # R23e invariant
         self.assertIn("github.event_name == 'pull_request'", cond)
 
 
+# ==== Task 8d (R35): Codex's sticky summary can stay "Running" after a clean review ====
+E8_HEAD = "5cf2a667d3" + "0" * 30
+E8_BODY = "Codex Review: Didn't find any major issues. Nice work!\n\n**Reviewed commit:** `5cf2a667d3`"  # dotfiles #75
+
+
+class ReviewedCommit(unittest.TestCase):
+    def test_real_body(self):
+        self.assertEqual(rv.reviewed_commit(E8_BODY), "5cf2a667d3")
+
+    def test_no_sha(self):
+        self.assertIsNone(rv.reviewed_commit("Codex Review: Didn't find any major issues. Nice work!"))
+
+    def test_uppercase_sha_is_lowercased(self):
+        self.assertEqual(rv.reviewed_commit(E8_BODY.replace("5cf2a667d3", "5CF2A667D3")), "5cf2a667d3")
+
+    def test_sha_under_7_chars_is_none(self):
+        self.assertIsNone(rv.reviewed_commit(E8_BODY.replace("5cf2a667d3", "5cf2a6")))
+
+
+class StuckRunningSummary(unittest.TestCase):  # E8 replay (dotfiles #75, head 5cf2a66)
+    def e8(self, body=E8_BODY, with_comment=True):
+        thumbs = {"user": "chatgpt-codex-connector[bot]", "content": "+1", "created_at": iso(T0 + timedelta(minutes=2))}
+        comments = [{"author": CODEX, "body": body, "created_at": iso(T0 + timedelta(minutes=2))}] if with_comment else []
+        return pr(head_sha=E8_HEAD, summary={"status": "running", "commit": "5cf2a66"},
+                  reactions=[thumbs], comments=comments)
+
+    def test_head_named_no_issues_comment_is_a_verdict_despite_running_summary(self):
+        v = compute(self.e8(), T0 + timedelta(minutes=3))
+        self.assertEqual(v["state"], "success"); self.assertEqual(v["description"], "round 0: no blocking findings")
+
+    def test_no_issues_comment_naming_another_sha_is_not_a_verdict(self):
+        v = compute(self.e8(body=E8_BODY.replace("5cf2a667d3", "deadbeef00")), T0 + timedelta(minutes=3))
+        self.assertEqual(v["state"], "pending"); self.assertEqual(v["description"], "waiting for Codex review of 5cf2a66")
+
+    def test_thumbs_up_alone_never_overrides_a_summary(self):  # R13 guard
+        v = compute(self.e8(with_comment=False), T0 + timedelta(minutes=3))
+        self.assertEqual(v["state"], "pending"); self.assertEqual(v["description"], "waiting for Codex review of 5cf2a66")
+
+
 class DrillFixtures(unittest.TestCase):
     def load(self, name):
         with open(os.path.join(DRILLS, name)) as f:
