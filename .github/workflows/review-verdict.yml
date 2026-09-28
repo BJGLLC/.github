@@ -11,9 +11,12 @@
 #            which starts its own poller; `@codex review` comments never move it, so the deadline
 #            always falls inside this poller's 35-min timeout). No cron: the $25/mo hard
 #            Actions budget cannot carry one.
-#   once   — every other event: one fetch -> compute -> post, or a drill (workflow_dispatch).
+#   once   — every other event: one fetch -> compute -> post, or a drill (workflow_dispatch;
+#            only `p1-open`, and a drill may only ever post failure -- R39: a success drill
+#            satisfied the required check on any head).
 # pull_request `closed` runs nothing (a running poller sees the close and stops by itself).
-# The gate NEVER comments on a PR (R32: Codex ignores github-actions[bot] mentions). When a
+# The gate NEVER asks Codex (R32): it only replies `queued-for-janitor` on the P2/P3 threads it
+# resolves. (Codex's summary edit is flaky (R35); a bot's mention did get a review on #72.) When a
 # review is due and nobody has asked, the pending status says "no Codex review of <sha> yet:
 # comment @codex review"; agents request re-reviews after a fix push, and the post-hoc
 # review after a `hotfix` merge, themselves. Event data and dispatch inputs reach shell only
@@ -81,11 +84,12 @@ jobs:
           PR: ${{ steps.which.outputs.pr }}
           DRILL: ${{ inputs.drill }}
         run: |
-          case "$DRILL" in p1-open|clean) ;; *) echo "::error::unknown drill (want p1-open or clean)"; exit 1 ;; esac
+          case "$DRILL" in p1-open) ;; *) echo "::error::unknown drill (only p1-open: a drill may only post failure)"; exit 1 ;; esac
           sha="$(gh pr view "$PR" -R "$GITHUB_REPOSITORY" --json headRefOid -q .headRefOid)"
           v="$(python3 scripts/review_verdict.py compute "scripts/drills/$DRILL.json")"
           echo "$v"
           state="$(jq -r .state <<<"$v")"
+          [ "$state" = failure ] || { echo "::error::a drill may only post failure"; exit 1; }  # R39: never a passing status
           desc="DRILL $DRILL: $(jq -r .description <<<"$v")"
           gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$sha" -f state="$state" -f context=review-verdict -f description="${desc:0:140}"
       - name: Compute + post the verdict

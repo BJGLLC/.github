@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       pr:    { description: "PR number", required: true, type: number }
-      drill: { description: "p1-open | clean | (empty = real)", required: false, type: string, default: "" }
+      drill: { description: "p1-open (posts failure) | (empty = real)", required: false, type: string, default: "" }
 permissions:
   contents: read
   checks: read
