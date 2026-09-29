@@ -61,6 +61,7 @@ jobs:
             base="https://${DB}.${PROJ}.pages.dev"
             { echo "version_url=$base/version.json"; echo "health_url=$base/"; echo "cf_branch=$DB"; echo "lenv=drill"; } >> "$GITHUB_OUTPUT"
           else
+            [ "$LE" != drill ] || { echo "::error::ledger_env drill requires env: drill"; exit 1; }
             { echo "version_url=$VU"; echo "health_url=$HU"; echo "cf_branch=main"; echo "lenv=$LE"; } >> "$GITHUB_OUTPUT"
           fi
       - id: d
@@ -81,7 +82,12 @@ jobs:
           # decide() only lets force through when env == drill; the ledger env for a drill is "drill".
           python3 .deploylib/scripts/deploy_guard.py "${args[@]}" | tee guard.json
           jq -r 'to_entries[] | "\(.key)=\(.value // "" | tostring)"' guard.json >> "$GITHUB_OUTPUT"
-          echo "### deploy guard: $(jq -r .message guard.json)" >> "$GITHUB_STEP_SUMMARY"
+          msg="$(jq -r .message guard.json)"
+          echo "### deploy guard: $msg" >> "$GITHUB_STEP_SUMMARY"
+          case "$msg" in
+            refused:*) echo "::error::$msg"; exit 1 ;;
+            skip:*) echo "::notice::$msg" ;;
+          esac
 
   ship:
     needs: guard
@@ -117,6 +123,7 @@ jobs:
           HU: ${{ needs.guard.outputs.health_url }}
           ACCESS: ${{ inputs.access }}
           FORCE: ${{ inputs.force_smoke_fail }}
+          ENVN: ${{ inputs.env }}
           CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
           CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
         run: |
@@ -124,7 +131,7 @@ jobs:
           args=(--version-url "$VU" --sha "$SHA" --timeout 180)
           if [ -n "$HU" ]; then args+=(--health-url "$HU"); fi
           if [ "$ACCESS" = true ]; then args+=(--access); fi
-          if [ "$FORCE" = true ]; then args+=(--force-fail); fi
+          if [ "$FORCE" = true ] && [ "$ENVN" = drill ]; then args+=(--force-fail); fi
           python3 .deploylib/scripts/deploy_smoke.py "${args[@]}" | tee smoke.json || true
           ok="$(jq -r 'if .ok == true then "true" else "false" end' smoke.json 2>/dev/null)"; echo "ok=${ok:-false}" >> "$GITHUB_OUTPUT"
       - name: Record in the deployment ledger
@@ -148,7 +155,7 @@ jobs:
 
   rollback-ship:
     needs: [guard, verify]
-    if: needs.verify.outputs.ok == 'false' && inputs.reason == 'deploy' && needs.guard.outputs.prev_sha != ''
+    if: ${{ !cancelled() && needs.guard.result == 'success' && (needs.verify.outputs.ok == 'false' || needs.verify.result == 'failure') && inputs.reason == 'deploy' && needs.guard.outputs.prev_sha != '' }}
     permissions: { contents: read }
     uses: BJGLLC/.github/.github/workflows/cf-ship.yml@main
     with:
@@ -222,7 +229,9 @@ jobs:
         with: { repository: BJGLLC/.github, ref: main, path: .deploylib, persist-credentials: false }
       - id: st
         env: { REASON: "${{ inputs.reason }}", SHIP: "${{ needs.ship.result }}", OK: "${{ needs.verify.outputs.ok }}", RBS: "${{ needs.rollback-ship.result }}", RBOK: "${{ needs.rollback-verify.outputs.ok }}" }
-        run: echo "state=$(python3 .deploylib/scripts/deploy_notify.py state --reason "$REASON" --ship "$SHIP" --smoke-ok "$OK" --rb-ship "$RBS" --rb-smoke-ok "$RBOK")" >> "$GITHUB_OUTPUT"
+        run: |
+          s="$(python3 .deploylib/scripts/deploy_notify.py state --reason "$REASON" --ship "$SHIP" --smoke-ok "$OK" --rb-ship "$RBS" --rb-smoke-ok "$RBOK")"
+          echo "state=$s" >> "$GITHUB_OUTPUT"
       - id: fz
         name: Freeze or unfreeze forward deploys (live environments only)
         if: inputs.env == 'production'
@@ -236,6 +245,7 @@ jobs:
               python3 .deploylib/scripts/deploy_guard.py freeze-close --repo "$GITHUB_REPOSITORY" --env "$LENV" --sha "$SHA" --pr "$PR" --decided-at "$DECIDED" ;;
           esac
       - name: PR comment + Linear
+        if: ${{ !cancelled() && steps.st.outputs.state != '' }}
         env:
           LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
           STATE: ${{ steps.st.outputs.state }}
@@ -247,8 +257,9 @@ jobs:
                 --live-before "$FROM" --run-url "$RUN_URL" --env "$ENVN")
           if [ -n "$PR" ]; then args+=(--pr "$PR"); fi
           if [ -n "$FREEZE" ]; then args+=(--freeze "$FREEZE"); fi
-          python3 .deploylib/scripts/deploy_notify.py "${args[@]}" || true
+          python3 .deploylib/scripts/deploy_notify.py "${args[@]}" || echo "::warning::deploy notify failed (PR comment / Linear)"
       - name: The run is red unless it ended where it meant to
+        if: ${{ !cancelled() }}
         env: { STATE: "${{ steps.st.outputs.state }}" }
         run: |
           case "$STATE" in

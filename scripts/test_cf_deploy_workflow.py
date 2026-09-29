@@ -70,6 +70,47 @@ class CfDeploy(unittest.TestCase):
                 self.assertFalse(line.lstrip().startswith("echo"), line)
                 self.assertNotIn("echo", line.split("freeze-open")[0].replace('f="$(', ""), line)
 
+    # --- fix round 1 ---
+    def _step(self, job, key, val):
+        return next(s for s in self.j[job]["steps"] if s.get(key) == val)
+
+    def test_drill_ledger_env_requires_drill_env(self):
+        run = self._step("guard", "id", "u")["run"]
+        self.assertIn('[ "$LE" != drill ] || { echo "::error::ledger_env drill requires env: drill"; exit 1; }', run)
+        smoke = self._step("verify", "id", "s")
+        self.assertIn("ENVN: ${{ inputs.env }}", "\n".join(f"{k}: {v}" for k, v in smoke["env"].items()))
+        self.assertIn('[ "$FORCE" = true ] && [ "$ENVN" = drill ]', smoke["run"])
+
+    def test_guard_refusals_fail_the_run(self):
+        run = self._step("guard", "id", "d")["run"]
+        self.assertIn("refused:*)", run)
+        refuse = run.split("refused:*)", 1)[1].split(";;", 1)[0]
+        self.assertIn("exit 1", refuse)
+        self.assertIn("skip:*)", run)
+        self.assertIn("::notice::", run)
+
+    def test_outcome_is_posted_even_if_freeze_step_failed(self):
+        steps = self.j["report"]["steps"]
+        notify = next(s for s in steps if s.get("name") == "PR comment + Linear")
+        final = steps[-1]
+        self.assertEqual(notify["if"], "${{ !cancelled() && steps.st.outputs.state != '' }}")
+        self.assertEqual(final["if"], "${{ !cancelled() }}")
+        self.assertNotIn("|| true", notify["run"])
+        self.assertIn("::warning::deploy notify failed", notify["run"])
+
+    def test_state_failure_is_not_swallowed(self):
+        run = self._step("report", "id", "st")["run"]
+        self.assertIn('s="$(python3 .deploylib/scripts/deploy_notify.py state', run)
+        self.assertIn('echo "state=$s" >> "$GITHUB_OUTPUT"', run)
+
+    def test_rollback_fires_when_verify_itself_failed(self):
+        cond = self.j["rollback-ship"]["if"]
+        for s in ("!cancelled()", "needs.guard.result == 'success'",
+                  "needs.verify.result == 'failure'"):
+            self.assertIn(s, cond)
+        # ship is not a direct need (test_pipeline_order pins it); verify only runs after ship succeeded.
+        self.assertNotIn("needs.ship", cond)
+
 
 class CfShip(unittest.TestCase):
     def setUp(self):
@@ -81,6 +122,15 @@ class CfShip(unittest.TestCase):
 
     def test_refuses_git_integrated_pages_projects(self):
         self.assertTrue(any(".result.source.type" in s.get("run", "") for s in self.steps))
+
+    def test_cloudflare_creds_only_on_cloudflare_steps(self):
+        self.assertFalse([k for k in (self.job.get("env") or {}) if k.startswith("CLOUDFLARE_")])
+        for s in self.steps:
+            has = any(k.startswith("CLOUDFLARE_") for k in (s.get("env") or {}))
+            if s.get("name") in ("Install + build", "Stamp version.json (pages)") or "uses" in s:
+                self.assertFalse(has, s.get("name"))
+            if s.get("name", "").startswith(("Refuse", "Upload")):
+                self.assertTrue(has, s.get("name"))
 
     def test_ship_job_is_time_bounded(self):
         self.assertEqual(self.job["timeout-minutes"], 15)
