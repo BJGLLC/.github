@@ -1368,7 +1368,7 @@ class QueueDedupe(unittest.TestCase):
         seen = []
         def fake_gh(*args, **kw):
             seen.append(args)
-            return json.dumps({"data": {"node": {"comments": {"nodes": [{"body": "x"}, {"body": rv.QUEUE_REPLY}]}}}})
+            return json.dumps({"data": {"node": {"comments": {"nodes": [{"body": "x", "author": {"login": "u"}}, {"body": rv.QUEUE_REPLY, "author": {"login": "github-actions"}}]}}}})
         orig = rv.gh; rv.gh = fake_gh; self.addCleanup(setattr, rv, "gh", orig)
         self.assertTrue(rv.thread_is_queued("T9"))
         self.assertIn("id=T9", seen[0]); self.assertIn("graphql", seen[0])
@@ -1381,6 +1381,71 @@ class QueueDedupe(unittest.TestCase):
             self.assertIn(key, c["group"])
         self.assertIs(c["cancel-in-progress"], False)  # queue behind, never kill a half-done queue
         self.assertNotEqual(c["group"], workflow()["jobs"]["poll"]["concurrency"]["group"])
+
+
+class MarkerAuthorship(unittest.TestCase):  # SSSF-38: only the gate's own reply hands a thread to the janitor
+    NOW = T0 + timedelta(minutes=4)
+
+    def marked(self, author, body=None, p=1):
+        t = thread("T1", p, 3)
+        t["comments"].append({"author": author, "body": rv.QUEUE_REPLY if body is None else body,
+                              "created_at": iso(T0 + timedelta(minutes=3)), "commit_sha": "new"})
+        return compute(pr(reviews=[review(3)], threads=[t]), self.NOW)
+
+    def test_a_human_reply_with_the_marker_does_not_unblock_a_p1(self):
+        v = self.marked("blakejgruber")
+        self.assertEqual(v["state"], "failure"); self.assertIn("T1", v["description"])
+
+    def test_an_agent_reply_with_the_marker_does_not_unblock_a_p0(self):
+        self.assertEqual(self.marked("some-agent[bot]", p=0)["state"], "failure")
+
+    def test_the_gate_marker_is_honored(self):
+        self.assertEqual(self.marked("github-actions")["state"], "success")
+
+    def test_the_gate_marker_is_honored_with_the_bot_suffix(self):
+        self.assertEqual(self.marked("github-actions[bot]")["state"], "success")
+
+    def test_the_cutover_identity_is_honored(self):
+        self.assertEqual(self.marked("bjg-gate")["state"], "success")
+
+    def test_a_gate_comment_that_only_mentions_the_marker_is_not_honored(self):
+        v = self.marked("github-actions", body=f"note: this was {rv.QUEUE_MARK} earlier")
+        self.assertEqual(v["state"], "failure")
+
+    def test_leading_whitespace_before_the_reply_is_tolerated(self):
+        self.assertEqual(self.marked("github-actions", body="\n  " + rv.QUEUE_REPLY)["state"], "success")
+
+    def test_a_p3_thread_with_a_human_marker_is_queued_not_skipped(self):
+        v = self.marked("blakejgruber", p=3)
+        self.assertEqual(v["queue"], ["T1"])
+
+    def _fresh(self, nodes):
+        orig = rv.gh; self.addCleanup(setattr, rv, "gh", orig)
+        rv.gh = lambda *a, **k: json.dumps({"data": {"node": {"comments": {"nodes": nodes}}}})
+        return rv.thread_is_queued("T9")
+
+    def test_fresh_check_sees_a_gate_marker(self):
+        self.assertTrue(self._fresh([{"body": rv.QUEUE_REPLY, "author": {"login": "github-actions"}}]))
+
+    def test_fresh_check_ignores_a_non_gate_marker(self):
+        self.assertFalse(self._fresh([{"body": rv.QUEUE_REPLY, "author": {"login": "blakejgruber"}}]))
+
+    def test_fresh_check_tolerates_a_deleted_author(self):
+        self.assertFalse(self._fresh([{"body": rv.QUEUE_REPLY, "author": None}]))
+
+    def test_fresh_query_asks_for_the_author(self):
+        self.assertIn("author", rv.THREAD_COMMENTS)
+
+    def test_a_forged_marker_does_not_stop_the_gate_replying(self):
+        # the real fresh check reads a non-gate marker as absent, so queue_threads still replies
+        real_check = rv.thread_is_queued
+        g = FakeGitHub(pr(reviews=[review(3)], threads=[thread("T2", 2, 3)])).install(self)
+        rv.thread_is_queued = real_check  # install() addCleanup restores the original
+        rv.gh = lambda *a, **k: json.dumps({"data": {"node": {"comments": {"nodes": [
+            {"body": rv.QUEUE_REPLY, "author": {"login": "blakejgruber"}}]}}}})
+        result, out = run_once_capturing(g, self.NOW)
+        self.assertIn(("reply", "T2"), g.calls, out)
+
 
 
 if __name__ == "__main__":

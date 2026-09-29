@@ -46,6 +46,10 @@ REVIEWED_COMMIT = re.compile(r"reviewed\s+commit\W*?([0-9a-f]+)(?![0-9a-z])", re
 # wrong. Try again later by commenting "@codex review"'. The older phrasings stay as fallbacks.
 ERROR = re.compile(r"codex review:\s*something went wrong|codex (encountered an error|was unable|could not|failed)", re.I)
 QUEUE_MARK = "queued-for-janitor"
+# The gate replies through addPullRequestReviewThreadReply with the Actions token (GraphQL login
+# `github-actions`); `bjg-gate` is the SSSF-29 bot identity. Compared after _normalize_login.
+GATE_LOGINS = {"github-actions", "bjg-gate"}
+QUEUE_REPLY = f"{QUEUE_MARK}: advisory finding, handed to the weekly janitor (review v4 §7)."
 CODEX_UNAVAILABLE_DESC = "codex-unavailable: Codex errored. Retry `@codex review`, or label `hotfix` if urgent."
 SUMMARY_MARKER = "<!-- codex-pull-request-review-summary -->"
 
@@ -68,6 +72,16 @@ def _normalize_login(name):
 
 def is_codex(name):
     return _normalize_login(name) == CODEX
+
+
+def is_gate_marker(comment):
+    """SSSF-38: the janitor marker counts only when the gate wrote it. Anyone can reply on a
+    review thread, so a marker from any other author (or one that merely mentions the text)
+    must not take a P0/P1 out of `blocking`. Both hold: the author is a gate login, and the
+    body STARTS with the exact QUEUE_REPLY the gate posts."""
+    if _normalize_login(comment.get("author")) not in GATE_LOGINS:
+        return False
+    return (comment.get("body") or "").lstrip().startswith(QUEUE_REPLY)
 
 
 def priority(thread):
@@ -218,8 +232,8 @@ def compute(pr, now):
     for t in pr["threads"]:
         if not t["comments"] or not is_codex(t["comments"][0]["author"]):
             continue
-        if any(QUEUE_MARK in c["body"] for c in t["comments"]):
-            continue  # already handed to the janitor
+        if any(is_gate_marker(c) for c in t["comments"]):
+            continue  # already handed to the janitor (by the gate itself: SSSF-38)
         p = priority(t)
         cleared = t["is_resolved"] and ts(t["comments"][0]["created_at"]) < pushed
         if p <= blocking_max:
@@ -415,8 +429,6 @@ def run_nudge(repo, number):
     return post
 
 
-QUEUE_REPLY = f"{QUEUE_MARK}: advisory finding, handed to the weekly janitor (review v4 §7)."
-
 
 class QueueError(Exception):
     """Some queued threads did not get their `queued-for-janitor` marker reply, so nothing
@@ -437,16 +449,17 @@ def reply_thread(thread_id, body):
     gh("api", "graphql", "-f", "query=mutation($id:ID!,$b:String!){ addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$id, body:$b}){ comment{id} } }", "-F", f"id={thread_id}", "-F", f"b={body}")
 
 
-THREAD_COMMENTS = "query($id:ID!){ node(id:$id){ ... on PullRequestReviewThread{ comments(last:100){ nodes{ body } } } } }"
+THREAD_COMMENTS = "query($id:ID!){ node(id:$id){ ... on PullRequestReviewThread{ comments(last:100){ nodes{ body author{ login } } } } } }"
 
 
 def thread_is_queued(thread_id):
-    """Fresh read, right before replying: does the thread already carry the queued-for-janitor
-    marker? Another run may have replied after this run's fetch (cd-marketing #165: the poller
+    """Fresh read, right before replying: does the thread already carry a gate-authored
+    queued-for-janitor marker (SSSF-38: a marker from anyone else is absent)? Another run may have replied after this run's fetch (cd-marketing #165: the poller
     and a pull_request_review run replied 1 s apart)."""
     d = json.loads(gh("api", "graphql", "-f", f"query={THREAD_COMMENTS}", "-F", f"id={thread_id}"))
     nodes = ((d.get("data") or {}).get("node") or {}).get("comments", {}).get("nodes", [])
-    return any(QUEUE_MARK in c["body"] for c in nodes)
+    return any(is_gate_marker({"author": (c.get("author") or {}).get("login"), "body": c.get("body")})
+               for c in nodes)
 
 
 def queue_threads(queue):
