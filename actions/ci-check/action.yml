@@ -1,0 +1,103 @@
+# actions/ci-check/action.yml — composite: the whole body of every gated repo's `ci` job (Review v4
+# spec §5, P3-A; decision 01M3N14TGN Q2: single-job ci, no reusable workflow, no fan-in). Each repo's
+# .github/workflows/ci.yml is one job `ci`: checkout (fetch-depth 0), then this action. A composite
+# cannot own runs-on or timeout, so the caller does; everything else the repos share lives here.
+# Scripts come from this action's own ref ($GITHUB_ACTION_PATH/../..), so callers @main run main's
+# scripts and BJGLLC/.github's own PRs (uses: ./actions/ci-check) run the PR's. Inputs reach shell
+# only through env (house rule). Order: cheap hygiene first, so a red PR stops before npm/pip install.
+name: ci-check
+description: "Review v4 ci: pinned actionlint, error-level shellcheck, gitleaks on this change, the ci.yml shape check, then `make check` (one retry)."
+inputs:
+  node-version:          { description: "actions/setup-node version; empty = no node setup", required: false, default: "" }
+  node-cache:            { description: "\"npm\" when package-lock.json exists", required: false, default: "" }
+  python-version:        { description: "actions/setup-python version; empty = the runner's python3", required: false, default: "" }
+  python-cache:          { description: "\"pip\"", required: false, default: "" }
+  cache-dependency-path: { description: "lock/requirements file for the pip cache key", required: false, default: "" }
+  install:               { description: "dependency install command, e.g. npm ci", required: false, default: "" }
+  ci-setup:              { description: "CI-only fixtures; never in the Makefile", required: false, default: "" }
+outputs:
+  failing_step:
+    description: "tools | shape | actionlint | shellcheck | gitleaks | check | setup (read by ci-red-notify)"
+    value: ${{ steps.record.outputs.failing_step }}
+runs:
+  using: composite
+  steps:
+    - name: tools
+      id: tools
+      shell: bash
+      run: |
+        ci="$(cd "$GITHUB_ACTION_PATH/../.." && pwd)"
+        echo "BJG_CI=$ci" >> "$GITHUB_ENV"
+        bash "$ci/scripts/ci-tools.sh" "$RUNNER_TEMP/bjg-bin" >> "$GITHUB_PATH"
+    - name: shape
+      id: shape
+      shell: bash
+      run: |
+        py=/usr/bin/python3
+        "$py" -c 'import yaml' 2>/dev/null || { py=python3; "$py" -c 'import yaml' 2>/dev/null || "$py" -m pip install --quiet pyyaml; }
+        "$py" "$BJG_CI/scripts/ci_shape.py" --repo "$GITHUB_REPOSITORY" .github/workflows
+    - name: actionlint
+      id: actionlint
+      shell: bash
+      run: actionlint -color
+    - name: shellcheck
+      id: shellcheck
+      shell: bash
+      run: bash "$BJG_CI/scripts/shellcheck-tracked.sh"
+    - name: gitleaks
+      id: gitleaks
+      shell: bash
+      env:
+        EVENT: ${{ github.event_name }}
+        BASE: ${{ github.event.pull_request.base.sha }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        BEFORE: ${{ github.event.before }}
+      run: bash "$BJG_CI/scripts/gitleaks-range.sh" "$BJG_CI/scripts/gitleaks.toml"
+    - if: inputs.node-version != ''
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node-version }}
+        cache: ${{ inputs.node-cache }}
+    - if: inputs.python-version != ''
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+        cache: ${{ inputs.python-cache }}
+        cache-dependency-path: ${{ inputs.cache-dependency-path }}
+    - name: install
+      if: inputs.install != ''
+      shell: bash
+      env:
+        CMD: ${{ inputs.install }}
+      run: bash -c "$CMD"
+    - name: ci-setup
+      if: inputs.ci-setup != ''
+      shell: bash
+      env:
+        CMD: ${{ inputs.ci-setup }}
+      run: bash -c "$CMD"
+    - name: check
+      id: check
+      shell: bash
+      run: bash "$BJG_CI/scripts/make-check.sh"
+    # failure() inside a composite reads this action's own steps (actions/runner ADR 1438). The
+    # runner maps outputs after the steps finish, pass or fail (CompositeActionHandler: RunStepsAsync
+    # never throws, then ProcessOutputs), so a failure notifier sees failing_step.
+    - name: record failing step
+      id: record
+      if: failure()
+      shell: bash
+      env:
+        S_TOOLS: ${{ steps.tools.outcome }}
+        S_SHAPE: ${{ steps.shape.outcome }}
+        S_ACTIONLINT: ${{ steps.actionlint.outcome }}
+        S_SHELLCHECK: ${{ steps.shellcheck.outcome }}
+        S_GITLEAKS: ${{ steps.gitleaks.outcome }}
+        S_CHECK: ${{ steps.check.outcome }}
+      run: |
+        failing=setup
+        for pair in "tools:$S_TOOLS" "shape:$S_SHAPE" "actionlint:$S_ACTIONLINT" "shellcheck:$S_SHELLCHECK" "gitleaks:$S_GITLEAKS" "check:$S_CHECK"; do
+          if [ "${pair#*:}" = failure ]; then failing="${pair%%:*}"; break; fi
+        done
+        echo "failing_step=$failing" >> "$GITHUB_OUTPUT"
+        echo "::error title=ci::failing step: $failing"

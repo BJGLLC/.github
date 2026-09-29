@@ -173,7 +173,7 @@ def check_ci(wf, repo):
 def check_reserved(wdir):
     """Nothing but ci.yml's job `ci` may emit a check named ci or review-verdict (any case, any expression)."""
     v = []
-    for f in sorted(x for x in wdir.iterdir() if x.suffix.lower() in (".yml", ".yaml")):
+    for f in sorted(x for x in wdir.iterdir() if x.name.lower().endswith((".yml", ".yaml"))):
         if f.name == "ci.yml" or not f.is_file():
             continue
         wf, err = load(f)

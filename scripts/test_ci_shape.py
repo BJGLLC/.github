@@ -347,6 +347,12 @@ class Reserved(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("Other.YML", out)
 
+    def test_bare_dot_yml_name_scanned(self):
+        # Path('.yml').suffix == '' so a suffix match skipped a file named exactly `.yml`.
+        rc, out = self.run_dir({".yml": {"on": {"pull_request": {}}, "jobs": {"ci": {"runs-on": "ubuntu-latest"}}}})
+        self.assertEqual(rc, 1)
+        self.assertIn(".yml", out)
+
     def test_clean_dir_ok(self):
         rc, out = self.run_dir({"deploy.yml": {"on": {"push": {}}, "jobs": {"deploy": {"runs-on": "ubuntu-latest"}}},
                                 "bash-3-compat.yml": {"on": {"schedule": [{"cron": "17 9 * * 1"}]},

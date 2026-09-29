@@ -1,0 +1,38 @@
+# scripts/gitleaks.toml — the rules ci scans with (ci-check action step gitleaks, P3-A).
+# Public mirror of claude-dotfiles git/gitleaks.toml (the pre-push hook's rules), comments dropped.
+# Edit both together; `bin/repo-parity.sh gitleaks-parity` (claude-dotfiles) flags drift.
+title = "BJGLLC ci secret rules"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "google-oauth-refresh-token"
+description = "Google OAuth refresh token (grants long-lived API access until revoked)"
+regex = '''\b1//0[A-Za-z0-9_-]{90,}'''
+keywords = ["1//0"]
+
+[[rules]]
+id = "google-oauth-access-token"
+description = "Google OAuth access token (short-lived, but its presence means a leak path)"
+regex = '''\bya29\.[A-Za-z0-9_\-]{20,}'''
+keywords = ["ya29."]
+
+[[rules]]
+id = "onepassword-service-account-token"
+description = "1Password service-account token"
+regex = '''\bops_[A-Za-z0-9+/=_-]{40,}'''
+keywords = ["ops_"]
+
+[[allowlists]]
+description = "GitHub presigned asset URL (jwt= / X-Amz-Signature=): short-lived signed GET, not a secret"
+regexTarget = "line"
+regexes = [
+  '''https://(?:private-user-images|objects|raw)\.githubusercontent\.com/\S*(?:\?jwt=eyJ|X-Amz-Signature=)''',
+  '''https://github-production-[a-z0-9-]+\.s3\.amazonaws\.com/\S*X-Amz-Signature=''',
+]
+
+[[allowlists]]
+description = "Obsidian plugin bundle (.obsidian/plugins/*/main.js): minified identifiers, not keys"
+targetRules = ["generic-api-key"]
+paths = ['''(?:^|/)\.obsidian/plugins/[^/]+/main\.js$''']

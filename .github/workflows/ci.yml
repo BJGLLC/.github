@@ -1,12 +1,23 @@
+# .github/workflows/ci.yml — Review v4 single-job `ci` (spec §5, P3-A; decision 01M3N14TGN Q2). This
+# repo runs its OWN ./actions/ci-check from this checkout, so a PR that fixes the shared ci is tested
+# by the fix itself (review-verdict-self is the opposite on purpose: a PR must not rewrite its judge).
+# Every other gated repo calls BJGLLC/.github/actions/ci-check@main. Job `ci` is the required context:
+# no needs/if, so it can never be skipped; red if any step failed. Shape: scripts/ci_shape.py.
 name: ci
-on: { push: { branches: [main] }, pull_request: {} }
+on:
+  push: { branches: [main] }
+  pull_request: {}
+  workflow_dispatch: {}
 permissions: { contents: read }
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
 jobs:
   ci:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-        with: { persist-credentials: false }
-      - run: cd scripts && python3 -m unittest -v
-      - name: actionlint
-        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -color
+        with: { fetch-depth: 0, persist-credentials: false }   # gitleaks scans this change's commits
+      - id: check
+        uses: ./actions/ci-check
