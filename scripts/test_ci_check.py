@@ -168,6 +168,19 @@ class ShellcheckTracked(unittest.TestCase):
         d = repo(); commit(d, "--version.sh", "#!/usr/bin/env bash\nif true; then echo x\n")
         self.assertNotEqual(self.rc(d), 0)
 
+    def test_tracked_dash_file_cannot_swallow_the_list(self):
+        # a file named `-` made `head -n 1 -- -` read the ls-files stream, emptying the list: rc 0.
+        need("shellcheck"); d = repo()
+        commit(d, "bad.sh", "#!/usr/bin/env bash\nif true; then echo x\n")
+        commit(d, "-", "plain\n")
+        self.assertNotEqual(self.rc(d), 0)
+
+    def test_tracked_dash_file_next_to_broken_extensionless_script(self):
+        need("shellcheck"); d = repo()
+        commit(d, "-", "plain\n")
+        commit(d, "bin/deploy", "#!/usr/bin/env bash\nif true; then echo x\n", 0o755)
+        self.assertNotEqual(self.rc(d), 0)
+
     def test_zsh_script_is_skipped(self):
         need("shellcheck"); d = repo()
         commit(d, "z", "#!/usr/bin/env zsh\nif [[ -o interactive ]] { echo i }\n", 0o755)
