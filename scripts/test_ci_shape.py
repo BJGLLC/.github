@@ -276,6 +276,39 @@ class Loader(unittest.TestCase):
         self.assertIn("ci_shape: ci.yml:", out)
         self.assertNotIn("Traceback", err)
 
+    def crashless(self, text, extra=None, ci_extra=None):
+        rc, out, err = self.run_text(text, extra)
+        self.assertNotIn("Traceback", err)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("ci_shape:", out)
+
+    def test_bad_scalars_do_not_traceback(self):
+        for bad in ("!!int abc", "!!bool maybe", "2026-13-45"):
+            with self.subTest(bad=bad):
+                self.crashless(self.base().replace("timeout-minutes: 20", f"timeout-minutes: {bad}"))
+                self.crashless(self.base(), {"o.yml": f"x: {bad}\n"})
+
+    def test_complex_key_does_not_traceback(self):
+        self.crashless(self.base() + "? [a]\n: 1\n")
+
+    def test_mixed_type_keys_do_not_traceback(self):
+        wf = good(); wf["jobs"]["ci"]["steps"][1]["with"][1] = "x"; wf["jobs"]["ci"]["steps"][1]["with"]["node-version"] = "20"
+        wf["jobs"]["ci"][True] = "a"; wf["jobs"]["ci"]["if"] = "b"
+        self.crashless(yaml.safe_dump(wf, sort_keys=False))
+        self.crashless(self.base().replace("jobs:", "yes: 1\nif: 2\njobs:", 1))
+
+    def test_push_as_list_does_not_traceback(self):
+        wf = good(); wf["on"]["push"] = ["main"]
+        self.crashless(yaml.safe_dump(wf, sort_keys=False))
+
+    def test_directory_named_yml_does_not_traceback(self):
+        with tempfile.TemporaryDirectory() as d:
+            pathlib.Path(d, "ci.yml").write_text(self.base())
+            pathlib.Path(d, "z.yml").mkdir()
+            out = subprocess.run([sys.executable, cs.__file__, "--repo", "BJGLLC/cd-home", d], capture_output=True, text=True)
+            self.assertNotIn("Traceback", out.stderr)
+            self.assertEqual(out.returncode, 0, out.stdout)
+
     def test_top_level_list_workflow_does_not_traceback(self):
         rc, out, err = self.run_text(self.base(), {"weird.yml": "- a\n"})
         self.assertNotIn("Traceback", err)
@@ -292,6 +325,27 @@ class Reserved(unittest.TestCase):
                 (p / name).write_text(yaml.safe_dump(body))
             out = subprocess.run([sys.executable, cs.__file__, "--repo", repo, d], capture_output=True, text=True)
             return out.returncode, out.stdout
+
+    def test_workflow_named_review_verdict_is_fine(self):
+        # review-verdict is a commit status posted via the API; a workflow's name emits nothing by that name.
+        rc, out = self.run_dir({"x.yml": {"name": "review-verdict", "on": {"push": {}}, "jobs": {"verdict": {"runs-on": "ubuntu-latest"}}}})
+        self.assertEqual(rc, 0, out)
+
+    def test_real_review_verdict_caller_passes(self):
+        # The byte-identical caller every gated repo carries (job `verdict`, name: review-verdict).
+        real = (pathlib.Path(__file__).parent / "fixtures" / "caller-review-verdict.yml").read_text()
+        with tempfile.TemporaryDirectory() as d:
+            p = pathlib.Path(d)
+            (p / "ci.yml").write_text(yaml.safe_dump(good(), sort_keys=False))
+            (p / "review-verdict.yml").write_text(real)
+            out = subprocess.run([sys.executable, cs.__file__, "--repo", "BJGLLC/cd-home", d], capture_output=True, text=True)
+            self.assertEqual(out.returncode, 0, out.stdout)
+            self.assertIn("ci_shape: ok", out.stdout)
+
+    def test_uppercase_suffix_scanned(self):
+        rc, out = self.run_dir({"Other.YML": {"on": {"pull_request": {}}, "jobs": {"ci": {"runs-on": "ubuntu-latest"}}}})
+        self.assertEqual(rc, 1)
+        self.assertIn("Other.YML", out)
 
     def test_clean_dir_ok(self):
         rc, out = self.run_dir({"deploy.yml": {"on": {"push": {}}, "jobs": {"deploy": {"runs-on": "ubuntu-latest"}}},
@@ -325,7 +379,7 @@ class Reserved(unittest.TestCase):
         self.assertEqual(rc, 1)
 
     def test_other_workflow_named_ci_rejected(self):
-        for n in ("ci", "CI", "review-verdict"):
+        for n in ("ci", "CI", " ci "):
             with self.subTest(name=n):
                 rc, out = self.run_dir({"x.yml": {"name": n, "on": {"push": {}}, "jobs": {"build": {"runs-on": "ubuntu-latest"}}}})
                 self.assertEqual(rc, 1)

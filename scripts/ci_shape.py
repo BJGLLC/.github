@@ -57,7 +57,11 @@ def _mapping(loader, node, deep=False):
         if k.tag == "tag:yaml.org,2002:merge":
             raise yaml.YAMLError("merge keys (<<) are not supported by GitHub Actions")
         key = loader.construct_object(k, deep=True)
-        if key in seen:
+        try:
+            dup = key in seen
+        except TypeError:
+            raise yaml.YAMLError(f"unsupported mapping key {key!r} (GitHub needs string keys)")
+        if dup:
             raise yaml.YAMLError(f"duplicate key {key!r} (GitHub rejects the workflow)")
         seen.add(key)
     return yaml.SafeLoader.construct_mapping(loader, node, deep)
@@ -70,8 +74,8 @@ def load(path):
     """-> (data, None) or (None, reason); never raises on bad YAML."""
     try:
         return yaml.load(path.read_text(), Loader=GHLoader), None
-    except (yaml.YAMLError, UnicodeDecodeError) as e:
-        return None, " ".join(str(e).split())
+    except Exception as e:   # bad tags/dates raise ValueError etc.; a validator must report, never crash
+        return None, " ".join(f"{type(e).__name__}: {e}".split())
 
 
 def _on(wf):
@@ -102,7 +106,11 @@ def check_ci(wf, repo):
     on = _on(wf)
     if set(map(str, on)) != {"push", "pull_request", "workflow_dispatch"}:
         v.append(f"on: must be exactly push, pull_request, workflow_dispatch (got {sorted(map(str, on))})")
-    push = dict(on.get("push") or {})
+    push = on.get("push") or {}
+    if not isinstance(push, dict):
+        v.append("on.push must be a mapping ({branches: [main]})")
+        push = {}
+    push = dict(push)
     ignore = push.pop("paths-ignore", None)   # SSSF-25: push-only, machine-lane paths; the push run gates nothing
     if push != {"branches": ["main"]}:
         v.append("on.push must be {branches: [main]} plus at most paths-ignore: no `paths` allowlist on a required check")
@@ -127,7 +135,7 @@ def check_ci(wf, repo):
     if not isinstance(ci, dict):
         v.append("jobs.ci (the one job the ruleset requires) is missing")
         return v
-    for key in sorted(set(ci) - CI_JOB_KEYS):
+    for key in sorted(set(ci) - CI_JOB_KEYS, key=str):
         v.append(f"jobs.ci.{key} is not allowed: {BANNED.get(key, 'not part of the uniform shape')}")
     if ci.get("runs-on") != RUNS_ON:
         v.append(f"jobs.ci.runs-on must be {RUNS_ON}")
@@ -148,15 +156,15 @@ def check_ci(wf, repo):
         v.append(f"jobs.ci.steps[1].uses must be {want}")
     if step.get("id") != "check":
         v.append("jobs.ci.steps[1].id must be `check` (the outputs and failure notifiers read steps.check)")
-    for key in sorted(set(step) - {"id", "uses", "with"}):
+    for key in sorted(set(step) - {"id", "uses", "with"}, key=str):
         v.append(f"jobs.ci.steps[1].{key} is not allowed (continue-on-error or if would let a red check pass)")
     given = step.get("with") or {}
     if not isinstance(given, dict):
         v.append("jobs.ci.steps[1].with must be a mapping")
         given = {}
-    for key in sorted(set(given) - INPUTS):
+    for key in sorted(set(given) - INPUTS, key=str):
         v.append(f"jobs.ci.steps[1].with.{key} is not an input of the ci-check action ({sorted(INPUTS)})")
-    for key, val in sorted(given.items()):
+    for key, val in sorted(given.items(), key=lambda kv: str(kv[0])):
         if not isinstance(val, str):
             v.append(f"jobs.ci.steps[1].with.{key} must be a quoted string")
     return v
@@ -165,8 +173,8 @@ def check_ci(wf, repo):
 def check_reserved(wdir):
     """Nothing but ci.yml's job `ci` may emit a check named ci or review-verdict (any case, any expression)."""
     v = []
-    for f in sorted(list(wdir.glob("*.yml")) + list(wdir.glob("*.yaml"))):
-        if f.name == "ci.yml":
+    for f in sorted(x for x in wdir.iterdir() if x.suffix.lower() in (".yml", ".yaml")):
+        if f.name == "ci.yml" or not f.is_file():
             continue
         wf, err = load(f)
         if err:
@@ -174,8 +182,10 @@ def check_reserved(wdir):
             continue
         if not isinstance(wf, dict):
             continue
-        if str(wf.get("name", "")).strip().lower() in RESERVED:
-            v.append(f"{f.name}: workflow name {wf['name']!r} is reserved (a required-check name); only ci.yml may be `ci`")
+        # Only `ci`: review-verdict is a commit status posted via the API, and every gated repo carries a
+        # `name: review-verdict` caller workflow, which emits nothing by that name.
+        if str(wf.get("name", "")).strip().lower() == "ci":
+            v.append(f"{f.name}: workflow name {wf['name']!r} is reserved; only ci.yml may be named `ci`")
         jobs = wf.get("jobs")
         for key, job in (jobs.items() if isinstance(jobs, dict) else ()):
             name = str(job.get("name", "")) if isinstance(job, dict) else ""
