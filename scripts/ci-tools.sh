@@ -8,7 +8,7 @@ dest="$1"; mkdir -p "$dest"
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 get() { # URL SHA256 → prints the verified local path
   local f="$tmp/${1##*/}"
-  curl -fsSL --retry 3 -o "$f" "$1" || return 1
+  curl -fsSL --retry 3 --connect-timeout 10 --max-time 120 -o "$f" "$1" || return 1
   echo "$2  $f" | sha256sum -c --quiet - >&2 || return 1
   echo "$f"
 }

@@ -90,6 +90,37 @@ class Action(unittest.TestCase):
         for gate in ("shape", "actionlint", "shellcheck", "gitleaks"):
             self.assertLess(ids.index(gate), min(repo_controlled), f"{gate} must precede install/ci-setup/check")
 
+    def step_run(self, sid):
+        return next(s for s in self.a["runs"]["steps"] if s.get("id") == sid)["run"]
+
+    def test_every_python_invocation_is_isolated(self):
+        # -I keeps the PR checkout (cwd) off sys.path: a root yaml.py must never run in the shape step.
+        import re
+        n = 0
+        for s in self.a["runs"]["steps"]:
+            for line in s.get("run", "").splitlines():
+                for m in re.finditer(r'("\$py"|python3?)\s+(\S+)', line):
+                    n += 1
+                    self.assertEqual(m.group(2), "-I", f"python call without -I: {line.strip()}")
+        self.assertGreaterEqual(n, 3)
+
+    def test_hostile_root_yaml_py_does_not_run(self):
+        with tempfile.TemporaryDirectory() as d:
+            marker = pathlib.Path(d, "pwned")
+            pathlib.Path(d, "yaml.py").write_text(f"import pathlib; pathlib.Path({str(marker)!r}).write_text('x')\n")
+            env = {**os.environ, "BJG_CI": str(HERE.parent), "GITHUB_REPOSITORY": "BJGLLC/x"}
+            subprocess.run(["bash", "-c", self.step_run("shape")], cwd=d, env=env, capture_output=True, text=True)
+            self.assertFalse(marker.exists(), "the PR's own yaml.py ran inside the shape step")
+
+    def test_actionlint_ignores_the_prs_own_config(self):
+        need("actionlint", "-version")
+        d = repo()
+        commit(d, ".github/workflows/x.yml", "on: push\njobs:\n  a:\n    steps:\n      - run: echo\n")
+        commit(d, ".github/actionlint.yaml", 'paths:\n  ".github/workflows/**/*.{yml,yaml}":\n    ignore: [".*"]\nself-hosted-runner:\n  labels: []\n')
+        env = {**os.environ, "BJG_CI": str(HERE.parent)}
+        rc = subprocess.run(["bash", "-c", self.step_run("actionlint")], cwd=d, env=env, capture_output=True, text=True).returncode
+        self.assertNotEqual(rc, 0, "a PR's .github/actionlint.yaml suppressed actionlint")
+
     def test_every_run_step_declares_bash(self):
         for s in self.a["runs"]["steps"]:
             if "run" in s:
@@ -117,6 +148,12 @@ class ShellcheckTracked(unittest.TestCase):
         commit(d, "bin/symlink_backup.sh", "/home/x/projects/y/backup.sh\n")
         commit(d, "dot_x/run.sh.tmpl", "{{ if .x }}\nif then\n{{ end }}\n")
         self.assertEqual(self.rc(d), 0)
+
+    def test_prs_shellcheckrc_cannot_disable_checks(self):
+        need("shellcheck"); d = repo()
+        commit(d, ".shellcheckrc", "disable=all\n")
+        commit(d, "bad.sh", "#!/usr/bin/env bash\nif true; then echo x\n")
+        self.assertNotEqual(self.rc(d), 0)
 
     def test_zsh_script_is_skipped(self):
         need("shellcheck"); d = repo()
@@ -150,6 +187,22 @@ class GitleaksRange(unittest.TestCase):
 
     def test_unreachable_before_still_scans_the_head(self):
         self.assertNotEqual(self.rc(EVENT="push", BEFORE="deadbeef" * 5, HEAD_SHA=self.b), 0)
+
+    def test_gitleaksignore_fingerprint_does_not_suppress(self):
+        # find the real fingerprint from a report, then plant it in the PR's own .gitleaksignore
+        rep = pathlib.Path(self.d, "..", "rep.json").resolve()
+        subprocess.run(["gitleaks", "git", "--no-banner", "--redact", "--config", str(HERE / "gitleaks.toml"),
+                        "--log-opts", f"{self.a}..{self.b}", "-r", str(rep), "-f", "json", self.d], capture_output=True)
+        import json
+        fps = [f["Fingerprint"] for f in json.loads(rep.read_text())]
+        self.assertTrue(fps, "planted token was not detected at all")
+        commit(self.d, ".gitleaksignore", "\n".join(fps) + "\n")
+        self.assertNotEqual(self.rc(EVENT="push", BEFORE=self.a, HEAD_SHA=git(self.d, "rev-parse", "HEAD")), 0)
+
+    def test_inline_gitleaks_allow_still_honoured(self):
+        line = pathlib.Path(self.d, "cfg.py").read_text().rstrip("\n") + "  # gitleaks:allow\n"
+        c = commit(self.d, "cfg.py", line)
+        self.assertEqual(self.rc(EVENT="push", BEFORE=self.b, HEAD_SHA=c), 0)
 
     def test_dispatch_without_origin_scans_the_head(self):
         self.assertNotEqual(self.rc(EVENT="workflow_dispatch"), 0)

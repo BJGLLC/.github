@@ -2,7 +2,7 @@
 # spec §5, P3-A; decision 01M3N14TGN Q2: single-job ci, no reusable workflow, no fan-in). Each repo's
 # .github/workflows/ci.yml is one job `ci`: checkout (fetch-depth 0), then this action. A composite
 # cannot own runs-on or timeout, so the caller does; everything else the repos share lives here.
-# Scripts come from this action's own ref ($GITHUB_ACTION_PATH/../..), so callers @main run main's
+# python runs with -I (the PR checkout is cwd; it must never reach sys.path). Scripts come from this action's own ref ($GITHUB_ACTION_PATH/../..), so callers @main run main's
 # scripts and BJGLLC/.github's own PRs (uses: ./actions/ci-check) run the PR's. Inputs reach shell
 # only through env (house rule). Order: cheap hygiene first, so a red PR stops before npm/pip install.
 name: ci-check
@@ -34,12 +34,13 @@ runs:
       shell: bash
       run: |
         py=/usr/bin/python3
-        "$py" -c 'import yaml' 2>/dev/null || { py=python3; "$py" -c 'import yaml' 2>/dev/null || "$py" -m pip install --quiet pyyaml; }
-        "$py" "$BJG_CI/scripts/ci_shape.py" --repo "$GITHUB_REPOSITORY" .github/workflows
+        "$py" -I -c 'import yaml' 2>/dev/null || { py=python3; "$py" -I -c 'import yaml' 2>/dev/null || "$py" -I -m pip install --quiet pyyaml; }
+        "$py" -I "$BJG_CI/scripts/ci_shape.py" --repo "$GITHUB_REPOSITORY" .github/workflows
     - name: actionlint
       id: actionlint
       shell: bash
-      run: actionlint -color
+      # -config-file: the shared empty config, so a PR's own .github/actionlint.yaml cannot ignore rules.
+      run: actionlint -color -config-file "$BJG_CI/actions/ci-check/actionlint.yaml"
     - name: shellcheck
       id: shellcheck
       shell: bash

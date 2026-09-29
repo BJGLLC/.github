@@ -1,0 +1,3 @@
+# Intentionally empty: ci-check runs actionlint with this config so a PR's own
+# .github/actionlint.yaml (ignore rules) is never honoured.
+{}

@@ -16,4 +16,4 @@ while IFS= read -r -d '' f; do
 done < <(git ls-files -z)
 if [ "${#files[@]}" -eq 0 ]; then echo "shellcheck: no shell files"; exit 0; fi
 echo "shellcheck -S error over ${#files[@]} files"
-shellcheck -S error "${files[@]}"
+shellcheck --norc -S error "${files[@]}"
