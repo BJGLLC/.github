@@ -1,0 +1,257 @@
+# .github/workflows/cf-deploy.yml — reusable Cloudflare deploy pipeline (Review v4 phase 4, spec §8).
+# guard -> ship -> verify -> [rollback-ship -> rollback-verify] -> report. The auto-rollback runs
+# inline, inside the caller's concurrency slot, so a newer queued run can never cancel it.
+name: cf-deploy
+on:
+  workflow_call:
+    inputs:
+      sha:              { type: string,  required: true }
+      reason:           { type: string,  required: true }       # deploy | rollback
+      env:              { type: string,  default: production }  # production | drill
+      ledger_env:       { type: string,  default: production }  # production | production-worker
+      force_smoke_fail: { type: boolean, default: false }
+      surface:          { type: string,  required: true }
+      kind:             { type: string,  required: true }       # pages | worker
+      node:             { type: string,  default: "22" }
+      install:          { type: string,  default: "npm ci" }
+      build:            { type: string,  default: "" }
+      out_dir:          { type: string,  default: "" }
+      cf_project:       { type: string,  default: "" }
+      drill_branch:     { type: string,  default: drill-rollback }
+      version_url:      { type: string,  required: true }
+      health_url:       { type: string,  default: "" }
+      access:           { type: boolean, default: false }
+    secrets:
+      CLOUDFLARE_API_TOKEN:    { required: false }
+      CLOUDFLARE_API_KEY:      { required: false }
+      CLOUDFLARE_EMAIL:        { required: false }
+      CLOUDFLARE_ACCOUNT_ID:   { required: true }
+      LINEAR_API_KEY:          { required: false }
+      CF_ACCESS_CLIENT_ID:     { required: false }
+      CF_ACCESS_CLIENT_SECRET: { required: false }
+    outputs:
+      state: { value: "${{ jobs.report.outputs.state }}" }
+permissions: {}
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: { contents: read, checks: read, deployments: read, issues: read, pull-requests: read }
+    outputs:
+      go: ${{ steps.d.outputs.go }}
+      sha: ${{ steps.d.outputs.sha }}
+      prev_sha: ${{ steps.d.outputs.prev_sha }}
+      from_sha: ${{ steps.d.outputs.from_sha }}
+      pr: ${{ steps.d.outputs.pr }}
+      decided_at: ${{ steps.d.outputs.decided_at }}
+      version_url: ${{ steps.u.outputs.version_url }}
+      health_url: ${{ steps.u.outputs.health_url }}
+      cf_branch: ${{ steps.u.outputs.cf_branch }}
+      lenv: ${{ steps.u.outputs.lenv }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: BJGLLC/.github, ref: main, path: .deploylib, persist-credentials: false }
+      - id: u
+        name: Resolve URLs + ledger env for this environment
+        env: { ENVN: "${{ inputs.env }}", PROJ: "${{ inputs.cf_project }}", DB: "${{ inputs.drill_branch }}", VU: "${{ inputs.version_url }}", HU: "${{ inputs.health_url }}", LE: "${{ inputs.ledger_env }}" }
+        run: |
+          set -euo pipefail
+          if [ "$ENVN" = drill ]; then
+            [ "$DB" != main ] || { echo "::error::drill_branch must not be main"; exit 1; }
+            base="https://${DB}.${PROJ}.pages.dev"
+            { echo "version_url=$base/version.json"; echo "health_url=$base/"; echo "cf_branch=$DB"; echo "lenv=drill"; } >> "$GITHUB_OUTPUT"
+          else
+            { echo "version_url=$VU"; echo "health_url=$HU"; echo "cf_branch=main"; echo "lenv=$LE"; } >> "$GITHUB_OUTPUT"
+          fi
+      - id: d
+        name: Decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ inputs.sha }}
+          REASON: ${{ inputs.reason }}
+          LENV: ${{ steps.u.outputs.lenv }}
+          ENVN: ${{ inputs.env }}
+          KIND: ${{ inputs.kind }}
+          FORCE: ${{ inputs.force_smoke_fail }}
+        run: |
+          set -euo pipefail
+          args=(decide --repo "$GITHUB_REPOSITORY" --sha "$SHA" --reason "$REASON" --env "$LENV")
+          if [ "$FORCE" = true ]; then args+=(--force-smoke-fail); fi
+          if [ "$KIND" = worker ] && [ "$ENVN" = drill ]; then args+=(--no-drill-alias); fi
+          # decide() only lets force through when env == drill; the ledger env for a drill is "drill".
+          python3 .deploylib/scripts/deploy_guard.py "${args[@]}" | tee guard.json
+          jq -r 'to_entries[] | "\(.key)=\(.value // "" | tostring)"' guard.json >> "$GITHUB_OUTPUT"
+          echo "### deploy guard: $(jq -r .message guard.json)" >> "$GITHUB_STEP_SUMMARY"
+
+  ship:
+    needs: guard
+    if: needs.guard.outputs.go == 'true'
+    permissions: { contents: read }
+    uses: BJGLLC/.github/.github/workflows/cf-ship.yml@main
+    with:
+      sha: ${{ needs.guard.outputs.sha }}
+      kind: ${{ inputs.kind }}
+      node: ${{ inputs.node }}
+      install: ${{ inputs.install }}
+      build: ${{ inputs.build }}
+      out_dir: ${{ inputs.out_dir }}
+      cf_project: ${{ inputs.cf_project }}
+      cf_branch: ${{ needs.guard.outputs.cf_branch }}
+    secrets: inherit
+
+  verify:
+    needs: [guard, ship]
+    if: needs.guard.outputs.go == 'true' && needs.ship.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    permissions: { contents: read, deployments: write }
+    outputs: { ok: "${{ steps.s.outputs.ok }}" }
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: BJGLLC/.github, ref: main, path: .deploylib, persist-credentials: false }
+      - id: s
+        name: Smoke (SHA within 3 min, then health)
+        env:
+          SHA: ${{ needs.guard.outputs.sha }}
+          VU: ${{ needs.guard.outputs.version_url }}
+          HU: ${{ needs.guard.outputs.health_url }}
+          ACCESS: ${{ inputs.access }}
+          FORCE: ${{ inputs.force_smoke_fail }}
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+        run: |
+          set -uo pipefail
+          args=(--version-url "$VU" --sha "$SHA" --timeout 180)
+          if [ -n "$HU" ]; then args+=(--health-url "$HU"); fi
+          if [ "$ACCESS" = true ]; then args+=(--access); fi
+          if [ "$FORCE" = true ]; then args+=(--force-fail); fi
+          python3 .deploylib/scripts/deploy_smoke.py "${args[@]}" | tee smoke.json || true
+          ok="$(jq -r 'if .ok == true then "true" else "false" end' smoke.json 2>/dev/null)"; echo "ok=${ok:-false}" >> "$GITHUB_OUTPUT"
+      - name: Record in the deployment ledger
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.guard.outputs.sha }}
+          FROM: ${{ needs.guard.outputs.from_sha }}
+          LENV: ${{ needs.guard.outputs.lenv }}
+          OK: ${{ steps.s.outputs.ok }}
+          REASON: ${{ inputs.reason }}
+          URL: ${{ needs.guard.outputs.health_url || needs.guard.outputs.version_url }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # Non-fatal, like eos-deploy's "WARN ledger write failed": a red verify would make the
+          # implicit success() skip rollback-ship and leave a failed smoke live.
+          state=failure; [ "$OK" = true ] && state=success
+          from=""; [ "$REASON" = rollback ] && from="$FROM"
+          python3 .deploylib/scripts/deploy_guard.py record --repo "$GITHUB_REPOSITORY" --sha "$SHA" --env "$LENV" \
+            --state "$state" --reason "$REASON" --url "$URL" --run-url "$RUN_URL" --from "$from" \
+            || echo "::warning::ledger write failed; the smoke verdict still drives the rollback"
+
+  rollback-ship:
+    needs: [guard, verify]
+    if: needs.verify.outputs.ok == 'false' && inputs.reason == 'deploy' && needs.guard.outputs.prev_sha != ''
+    permissions: { contents: read }
+    uses: BJGLLC/.github/.github/workflows/cf-ship.yml@main
+    with:
+      sha: ${{ needs.guard.outputs.prev_sha }}
+      kind: ${{ inputs.kind }}
+      node: ${{ inputs.node }}
+      install: ${{ inputs.install }}
+      build: ${{ inputs.build }}
+      out_dir: ${{ inputs.out_dir }}
+      cf_project: ${{ inputs.cf_project }}
+      cf_branch: ${{ needs.guard.outputs.cf_branch }}
+    secrets: inherit
+
+  rollback-verify:
+    needs: [guard, rollback-ship]
+    if: needs.rollback-ship.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    permissions: { contents: read, deployments: write }
+    outputs: { ok: "${{ steps.s.outputs.ok }}" }
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: BJGLLC/.github, ref: main, path: .deploylib, persist-credentials: false }
+      - id: s
+        name: Smoke the rollback target
+        env:
+          SHA: ${{ needs.guard.outputs.prev_sha }}
+          VU: ${{ needs.guard.outputs.version_url }}
+          HU: ${{ needs.guard.outputs.health_url }}
+          ACCESS: ${{ inputs.access }}
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+        run: |
+          set -uo pipefail
+          args=(--version-url "$VU" --sha "$SHA" --timeout 180)
+          if [ -n "$HU" ]; then args+=(--health-url "$HU"); fi
+          if [ "$ACCESS" = true ]; then args+=(--access); fi
+          python3 .deploylib/scripts/deploy_smoke.py "${args[@]}" | tee smoke.json || true
+          ok="$(jq -r 'if .ok == true then "true" else "false" end' smoke.json 2>/dev/null)"; echo "ok=${ok:-false}" >> "$GITHUB_OUTPUT"
+      - name: Record the auto-rollback
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.guard.outputs.prev_sha }}
+          BAD: ${{ needs.guard.outputs.sha }}
+          LENV: ${{ needs.guard.outputs.lenv }}
+          OK: ${{ steps.s.outputs.ok }}
+          URL: ${{ needs.guard.outputs.health_url || needs.guard.outputs.version_url }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          state=failure; [ "$OK" = true ] && state=success
+          python3 .deploylib/scripts/deploy_guard.py record --repo "$GITHUB_REPOSITORY" --sha "$SHA" --env "$LENV" \
+            --state "$state" --reason auto-rollback --url "$URL" --run-url "$RUN_URL" --from "$BAD"
+
+  report:
+    needs: [guard, ship, verify, rollback-ship, rollback-verify]
+    if: always() && needs.guard.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: { contents: read, issues: write, pull-requests: write }
+    outputs: { state: "${{ steps.st.outputs.state }}" }
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SHA: ${{ needs.guard.outputs.sha }}
+      PREV: ${{ needs.guard.outputs.prev_sha }}
+      FROM: ${{ needs.guard.outputs.from_sha }}
+      PR: ${{ needs.guard.outputs.pr }}
+      LENV: ${{ needs.guard.outputs.lenv }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: BJGLLC/.github, ref: main, path: .deploylib, persist-credentials: false }
+      - id: st
+        env: { REASON: "${{ inputs.reason }}", SHIP: "${{ needs.ship.result }}", OK: "${{ needs.verify.outputs.ok }}", RBS: "${{ needs.rollback-ship.result }}", RBOK: "${{ needs.rollback-verify.outputs.ok }}" }
+        run: echo "state=$(python3 .deploylib/scripts/deploy_notify.py state --reason "$REASON" --ship "$SHIP" --smoke-ok "$OK" --rb-ship "$RBS" --rb-smoke-ok "$RBOK")" >> "$GITHUB_OUTPUT"
+      - id: fz
+        name: Freeze or unfreeze forward deploys (live environments only)
+        if: inputs.env == 'production'
+        env: { STATE: "${{ steps.st.outputs.state }}", DECIDED: "${{ needs.guard.outputs.decided_at }}" }
+        run: |
+          case "$STATE" in
+            auto-rolled-back|rollback-failed|smoke-failed-no-target)
+              f="$(python3 .deploylib/scripts/deploy_guard.py freeze-open --repo "$GITHUB_REPOSITORY" --env "$LENV" --from "$SHA" --to "${PREV:-$FROM}" --run-url "$RUN_URL")"
+              echo "freeze=$f" >> "$GITHUB_OUTPUT" ;;
+            deployed)
+              python3 .deploylib/scripts/deploy_guard.py freeze-close --repo "$GITHUB_REPOSITORY" --env "$LENV" --sha "$SHA" --pr "$PR" --decided-at "$DECIDED" ;;
+          esac
+      - name: PR comment + Linear
+        env:
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+          STATE: ${{ steps.st.outputs.state }}
+          SURFACE: ${{ inputs.surface }}
+          ENVN: ${{ inputs.env }}
+          FREEZE: ${{ steps.fz.outputs.freeze }}
+        run: |
+          args=(notify --repo "$GITHUB_REPOSITORY" --state "$STATE" --surface "$SURFACE" --attempted "$SHA" \
+                --live-before "$FROM" --run-url "$RUN_URL" --env "$ENVN")
+          if [ -n "$PR" ]; then args+=(--pr "$PR"); fi
+          if [ -n "$FREEZE" ]; then args+=(--freeze "$FREEZE"); fi
+          python3 .deploylib/scripts/deploy_notify.py "${args[@]}" || true
+      - name: The run is red unless it ended where it meant to
+        env: { STATE: "${{ steps.st.outputs.state }}" }
+        run: |
+          case "$STATE" in
+            deployed|rolled-back) echo "deploy state: $STATE" ;;
+            *) echo "::error::deploy state: $STATE"; exit 1 ;;
+          esac
