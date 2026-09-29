@@ -160,6 +160,12 @@ class CfShip(unittest.TestCase):
     def test_cred_isolation_is_documented_as_best_effort(self):
         self.assertIn("best-effort", (WF / "cf-ship.yml").read_text())
 
+    def test_caller_commands_run_with_errexit(self):
+        run = next(s["run"] for s in self.steps if s.get("name") == "Install + build")
+        self.assertIn('bash -ec "$INSTALL"', run)
+        self.assertIn('bash -ec "$BUILD"', run)
+        self.assertNotIn('bash -c "', run)
+
     def test_ship_job_is_time_bounded(self):
         self.assertEqual(self.job["timeout-minutes"], 15)
 

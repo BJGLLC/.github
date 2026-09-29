@@ -32,8 +32,8 @@ jobs:
         env: { INSTALL: "${{ inputs.install }}", BUILD: "${{ inputs.build }}" }
         run: |
           set -euo pipefail
-          if [ -n "$INSTALL" ]; then bash -c "$INSTALL"; fi
-          if [ -n "$BUILD" ]; then bash -c "$BUILD"; fi
+          if [ -n "$INSTALL" ]; then bash -ec "$INSTALL"; fi
+          if [ -n "$BUILD" ]; then bash -ec "$BUILD"; fi
       - name: Stamp version.json (pages)
         if: inputs.kind == 'pages'
         env: { OUT: "${{ inputs.out_dir }}", SHA: "${{ inputs.sha }}" }
