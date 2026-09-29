@@ -133,7 +133,7 @@ jobs:
           if [ "$ACCESS" = true ]; then args+=(--access); fi
           if [ "$FORCE" = true ] && [ "$ENVN" = drill ]; then args+=(--force-fail); fi
           python3 .deploylib/scripts/deploy_smoke.py "${args[@]}" | tee smoke.json || true
-          ok="$(jq -r 'if .ok == true then "true" else "false" end' smoke.json 2>/dev/null)"; echo "ok=${ok:-false}" >> "$GITHUB_OUTPUT"
+          ok="$(jq -r 'if .ok == true then "true" else "false" end' smoke.json 2>/dev/null || echo false)"; echo "ok=${ok:-false}" >> "$GITHUB_OUTPUT"
       - name: Record in the deployment ledger
         env:
           GH_TOKEN: ${{ github.token }}
@@ -155,7 +155,7 @@ jobs:
 
   rollback-ship:
     needs: [guard, verify]
-    if: ${{ !cancelled() && needs.guard.result == 'success' && (needs.verify.outputs.ok == 'false' || needs.verify.result == 'failure') && inputs.reason == 'deploy' && needs.guard.outputs.prev_sha != '' }}
+    if: ${{ !cancelled() && needs.guard.result == 'success' && (needs.verify.outputs.ok == 'false' || (needs.verify.result == 'failure' && needs.verify.outputs.ok != 'true')) && inputs.reason == 'deploy' && needs.guard.outputs.prev_sha != '' }}
     permissions: { contents: read }
     uses: BJGLLC/.github/.github/workflows/cf-ship.yml@main
     with:
@@ -171,7 +171,7 @@ jobs:
 
   rollback-verify:
     needs: [guard, rollback-ship]
-    if: needs.rollback-ship.result == 'success'
+    if: ${{ !cancelled() && needs.rollback-ship.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 8
     permissions: { contents: read, deployments: write }
@@ -194,7 +194,7 @@ jobs:
           if [ -n "$HU" ]; then args+=(--health-url "$HU"); fi
           if [ "$ACCESS" = true ]; then args+=(--access); fi
           python3 .deploylib/scripts/deploy_smoke.py "${args[@]}" | tee smoke.json || true
-          ok="$(jq -r 'if .ok == true then "true" else "false" end' smoke.json 2>/dev/null)"; echo "ok=${ok:-false}" >> "$GITHUB_OUTPUT"
+          ok="$(jq -r 'if .ok == true then "true" else "false" end' smoke.json 2>/dev/null || echo false)"; echo "ok=${ok:-false}" >> "$GITHUB_OUTPUT"
       - name: Record the auto-rollback
         env:
           GH_TOKEN: ${{ github.token }}

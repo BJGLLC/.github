@@ -111,6 +111,23 @@ class CfDeploy(unittest.TestCase):
         # ship is not a direct need (test_pipeline_order pins it); verify only runs after ship succeeded.
         self.assertNotIn("needs.ship", cond)
 
+    def test_rollback_verify_runs_after_a_crashed_verify(self):
+        # No status function = implicit success() over the whole chain, which a failed verify breaks.
+        self.assertEqual(self.j["rollback-verify"]["if"],
+                         "${{ !cancelled() && needs.rollback-ship.result == 'success' }}")
+
+    def test_passed_smoke_never_triggers_rollback(self):
+        cond = self.j["rollback-ship"]["if"]
+        self.assertIn("(needs.verify.outputs.ok == 'false' || (needs.verify.result == 'failure' && needs.verify.outputs.ok != 'true'))", cond)
+
+    def test_smoke_jq_failure_falls_back_to_false(self):
+        for name in ("verify", "rollback-verify"):
+            run = next(s["run"] for s in self.j[name]["steps"] if s.get("id") == "s")
+            self.assertIn('smoke.json 2>/dev/null || echo false)"', run, name)
+
+    def test_report_keeps_always(self):
+        self.assertIn("always()", self.j["report"]["if"])
+
 
 class CfShip(unittest.TestCase):
     def setUp(self):
