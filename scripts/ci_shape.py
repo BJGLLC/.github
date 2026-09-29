@@ -40,26 +40,63 @@ BANNED = {
     "name": "a job name renames the check",
     "uses": "a reusable-workflow job reports as `ci / <job>`, so `ci` never reports",
 }
+TOP_KEYS = {"name", "on", True, "permissions", "concurrency", "jobs"}   # env/defaults/run-name reach every step
+NOTIFY_USES = "./.github/workflows/ci-red-notify.yml"
+NOTIFIER_KEYS = {"needs", "if", "uses", "with", "secrets"}
 CI_JOB_KEYS = {"runs-on", "timeout-minutes", "outputs", "steps"}
 RESERVED = {"ci", "review-verdict"}
 
 
+class GHLoader(yaml.SafeLoader):
+    """Parse like GitHub does: duplicate mapping keys and `<<` merge keys are load errors there."""
+
+
+def _mapping(loader, node, deep=False):
+    seen = set()
+    for k, _ in node.value:
+        if k.tag == "tag:yaml.org,2002:merge":
+            raise yaml.YAMLError("merge keys (<<) are not supported by GitHub Actions")
+        key = loader.construct_object(k, deep=True)
+        if key in seen:
+            raise yaml.YAMLError(f"duplicate key {key!r} (GitHub rejects the workflow)")
+        seen.add(key)
+    return yaml.SafeLoader.construct_mapping(loader, node, deep)
+
+
+GHLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _mapping)
+
+
+def load(path):
+    """-> (data, None) or (None, reason); never raises on bad YAML."""
+    try:
+        return yaml.load(path.read_text(), Loader=GHLoader), None
+    except (yaml.YAMLError, UnicodeDecodeError) as e:
+        return None, " ".join(str(e).split())
+
+
 def _on(wf):
     """PyYAML (YAML 1.1) reads a bare `on:` key as boolean True."""
-    return wf.get("on", wf.get(True)) or {}
+    on = wf.get("on", wf.get(True)) or {}
+    return on if isinstance(on, dict) else {}
 
 
 def _needs(job):
     n = job.get("needs") or []
-    return [n] if isinstance(n, str) else list(n)
+    return [n] if isinstance(n, str) else list(n) if isinstance(n, list) else [n]
 
 
 def is_notifier(job):
-    return isinstance(job, dict) and _needs(job) == ["ci"] and job.get("if") == "failure()"
+    """A failure notifier is only a call to the notify workflow: no name, permissions, steps, runs-on."""
+    return (isinstance(job, dict) and set(job) <= NOTIFIER_KEYS and _needs(job) == ["ci"]
+            and job.get("if") == "failure()" and job.get("uses") == NOTIFY_USES)
 
 
 def check_ci(wf, repo):
     v = []
+    if not isinstance(wf, dict):
+        return ["workflow must be a YAML mapping"]
+    for key in sorted(set(wf) - TOP_KEYS, key=str):
+        v.append(f"{key} is not allowed at the top level (env, defaults and run-name reach every step of the action)")
     if wf.get("name") != "ci":
         v.append("name must be 'ci'")
     on = _on(wf)
@@ -80,6 +117,8 @@ def check_ci(wf, repo):
     if wf.get("concurrency") != CONCURRENCY:
         v.append(f"concurrency must be {CONCURRENCY}")
     jobs = wf.get("jobs") or {}
+    if not isinstance(jobs, dict):
+        return v + ["jobs must be a mapping"]
     for name, job in jobs.items():
         if name != "ci" and not is_notifier(job):
             v.append(f"jobs.{name}: ci.yml holds only job `ci` plus failure notifiers (needs: ci, if: failure()); "
@@ -98,7 +137,7 @@ def check_ci(wf, repo):
     if ci.get("outputs") not in (None, OUTPUTS):
         v.append(f"jobs.ci.outputs must be absent or exactly {OUTPUTS} (for a failure notifier)")
     steps = ci.get("steps") or []
-    if len(steps) != 2:
+    if not isinstance(steps, list) or len(steps) != 2:
         v.append("jobs.ci.steps must be exactly two: actions/checkout, then the ci-check action")
         return v
     if steps[0] != CHECKOUT:
@@ -112,6 +151,9 @@ def check_ci(wf, repo):
     for key in sorted(set(step) - {"id", "uses", "with"}):
         v.append(f"jobs.ci.steps[1].{key} is not allowed (continue-on-error or if would let a red check pass)")
     given = step.get("with") or {}
+    if not isinstance(given, dict):
+        v.append("jobs.ci.steps[1].with must be a mapping")
+        given = {}
     for key in sorted(set(given) - INPUTS):
         v.append(f"jobs.ci.steps[1].with.{key} is not an input of the ci-check action ({sorted(INPUTS)})")
     for key, val in sorted(given.items()):
@@ -121,14 +163,25 @@ def check_ci(wf, repo):
 
 
 def check_reserved(wdir):
+    """Nothing but ci.yml's job `ci` may emit a check named ci or review-verdict (any case, any expression)."""
     v = []
     for f in sorted(list(wdir.glob("*.yml")) + list(wdir.glob("*.yaml"))):
         if f.name == "ci.yml":
             continue
-        wf = yaml.safe_load(f.read_text()) or {}
-        for key, job in (wf.get("jobs") or {}).items():
-            names = {str(key), str((job or {}).get("name", ""))}
-            hit = sorted(names & RESERVED)
+        wf, err = load(f)
+        if err:
+            v.append(f"{f.name}: {err}")
+            continue
+        if not isinstance(wf, dict):
+            continue
+        if str(wf.get("name", "")).strip().lower() in RESERVED:
+            v.append(f"{f.name}: workflow name {wf['name']!r} is reserved (a required-check name); only ci.yml may be `ci`")
+        jobs = wf.get("jobs")
+        for key, job in (jobs.items() if isinstance(jobs, dict) else ()):
+            name = str(job.get("name", "")) if isinstance(job, dict) else ""
+            if "${{" in name:
+                v.append(f"{f.name}: job {key!r} has an expression name {name!r} that could evaluate to a reserved check name")
+            hit = sorted({str(key).strip().lower(), name.strip().lower()} & RESERVED)
             if hit:
                 v.append(f"{f.name}: job {key!r} would emit a check named {hit[0]!r}; only ci.yml's job ci may")
     return v
@@ -144,7 +197,9 @@ def main(argv=None):
     if not ci.is_file():
         print(f"ci_shape: {ci} missing")
         return 1
-    v = check_ci(yaml.safe_load(ci.read_text()) or {}, a.repo) + check_reserved(wdir)
+    wf, err = load(ci)
+    v = [f"ci.yml: {err}"] if err else check_ci(wf or {}, a.repo)
+    v += check_reserved(wdir)
     for line in v:
         print(f"ci_shape: {line}")
     print("ci_shape: ok" if not v else f"ci_shape: {len(v)} violation(s)")

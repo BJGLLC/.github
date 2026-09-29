@@ -4,6 +4,7 @@ has a passing and a failing case; a validator that cannot return false is theate
 import copy
 import pathlib
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -194,6 +195,91 @@ class Shape(unittest.TestCase):
         wf = good(); wf["jobs"]["ci"]["steps"][1]["with"]["python-version"] = 3.1   # YAML read 3.10 as 3.1
         self.hit(wf, "quoted string")
 
+    # --- fix round 1 (SSSF-30 review)
+    def test_name_must_be_ci(self):
+        wf = good(); wf["name"] = "CI"
+        self.hit(wf, "name must be 'ci'")
+
+    def test_dispatch_inputs_rejected(self):
+        wf = good(); wf["on"]["workflow_dispatch"] = {"inputs": {"x": {}}}
+        self.hit(wf, "workflow_dispatch must take no inputs")
+
+    def test_top_level_keys_allowlisted(self):
+        # workflow-level env (BASH_ENV, NODE_OPTIONS, ...) is inherited by every step of the action
+        for key, val in (("env", {"BASH_ENV": "${{ github.workspace }}/.neuter.sh"}),
+                         ("defaults", {"run": {"shell": "bash {0} || true"}}), ("run-name", "x")):
+            with self.subTest(key=key):
+                wf = good(); wf[key] = val
+                self.hit(wf, f"{key} is not allowed")
+
+    def test_notifier_with_secrets_allowed(self):
+        wf = good(); n = notifier(); n["secrets"] = {"LINEAR_API_KEY": "${{ secrets.LINEAR_API_KEY }}"}
+        n["needs"] = ["ci"]; wf["jobs"]["notify-linear"] = n
+        self.assertEqual(self.v(wf), [])
+
+    def test_notifier_is_only_a_call_to_the_notify_workflow(self):
+        for extra in ({"name": "review-verdict"}, {"permissions": {"statuses": "write"}},
+                      {"runs-on": "ubuntu-latest", "steps": [{"run": "true"}]},
+                      {"strategy": {"matrix": {"a": [1]}}}, {"uses": "./.github/workflows/other.yml"}):
+            with self.subTest(extra=sorted(extra)):
+                wf = good(); n = notifier(); n.update(extra); wf["jobs"]["notify-linear"] = n
+                self.hit(wf, "jobs.notify-linear")
+
+    def test_malformed_shapes_do_not_traceback(self):
+        for wf in ({"name": "ci", "on": ["push", "pull_request"], "jobs": {}},
+                   {"name": "ci", "on": {}, "jobs": ["ci"]}, ["a"], None):
+            with self.subTest(wf=wf):
+                self.assertTrue(self.v(wf))
+        wf = good(); wf["jobs"]["ci"]["steps"][1]["with"] = ["a"]
+        self.assertTrue(self.v(wf))
+        wf = good(); wf["jobs"]["ci"]["steps"] = {"0": "a", "1": "b"}
+        self.assertTrue(self.v(wf))
+
+
+class Loader(unittest.TestCase):
+    def run_text(self, text, extra=None):
+        with tempfile.TemporaryDirectory() as d:
+            p = pathlib.Path(d)
+            (p / "ci.yml").write_text(text)
+            for n, t in (extra or {}).items():
+                (p / n).write_text(t)
+            out = subprocess.run([sys.executable, cs.__file__, "--repo", "BJGLLC/cd-home", d], capture_output=True, text=True)
+            return out.returncode, out.stdout, out.stderr
+
+    def base(self):
+        return yaml.safe_dump(good(), sort_keys=False)
+
+    def test_duplicate_key_rejected(self):
+        text = self.base().replace("jobs:\n", "jobs:\n  ci:\n    if: false\n", 1)
+        rc, out, err = self.run_text(text)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("duplicate", out)
+        self.assertNotIn("Traceback", err)
+
+    def test_merge_key_rejected(self):
+        text = ("name: ci\non: {push: {branches: [main]}, pull_request: {}, workflow_dispatch: {}}\n"
+                "x: &b {runs-on: ubuntu-latest}\njobs:\n  ci:\n    <<: *b\n")
+        rc, out, err = self.run_text(text)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("merge", out)
+        self.assertNotIn("Traceback", err)
+
+    def test_unparseable_unrelated_workflow_is_one_line(self):
+        rc, out, err = self.run_text(self.base(), {"broken.yml": "on: {push: [\n"})
+        self.assertEqual(rc, 1)
+        self.assertIn("ci_shape: broken.yml:", out)
+        self.assertNotIn("Traceback", err)
+
+    def test_unparseable_ci_yml_is_one_line(self):
+        rc, out, err = self.run_text("name: ci\njobs: {ci: [\n")
+        self.assertEqual(rc, 1)
+        self.assertIn("ci_shape: ci.yml:", out)
+        self.assertNotIn("Traceback", err)
+
+    def test_top_level_list_workflow_does_not_traceback(self):
+        rc, out, err = self.run_text(self.base(), {"weird.yml": "- a\n"})
+        self.assertNotIn("Traceback", err)
+
 
 class Reserved(unittest.TestCase):
     """SSSF-27 scope note: any other job named ci / review-verdict emits a context that satisfies the ruleset."""
@@ -204,7 +290,7 @@ class Reserved(unittest.TestCase):
             (p / "ci.yml").write_text(yaml.safe_dump(good(repo), sort_keys=False))
             for name, body in extra.items():
                 (p / name).write_text(yaml.safe_dump(body))
-            out = subprocess.run(["python3", cs.__file__, "--repo", repo, d], capture_output=True, text=True)
+            out = subprocess.run([sys.executable, cs.__file__, "--repo", repo, d], capture_output=True, text=True)
             return out.returncode, out.stdout
 
     def test_clean_dir_ok(self):
@@ -224,9 +310,37 @@ class Reserved(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("review-verdict", out)
 
+    def test_expression_job_names_rejected(self):
+        for job in ({"name": "${{ 'ci' }}", "runs-on": "ubuntu-latest"},
+                    {"strategy": {"matrix": {"n": ["ci"]}}, "name": "${{ matrix.n }}", "runs-on": "ubuntu-latest"}):
+            with self.subTest(job=job):
+                rc, out = self.run_dir({"x.yml": {"on": {"pull_request": {}}, "jobs": {"x": job}}})
+                self.assertEqual(rc, 1)
+                self.assertIn("x.yml", out)
+
+    def test_case_variants_rejected(self):
+        rc, out = self.run_dir({"x.yml": {"on": {"pull_request": {}}, "jobs": {"CI": {"runs-on": "ubuntu-latest"}}}})
+        self.assertEqual(rc, 1)
+        rc, out = self.run_dir({"y.yml": {"on": {"pull_request": {}}, "jobs": {"v": {"name": "Review-Verdict"}}}})
+        self.assertEqual(rc, 1)
+
+    def test_other_workflow_named_ci_rejected(self):
+        for n in ("ci", "CI", "review-verdict"):
+            with self.subTest(name=n):
+                rc, out = self.run_dir({"x.yml": {"name": n, "on": {"push": {}}, "jobs": {"build": {"runs-on": "ubuntu-latest"}}}})
+                self.assertEqual(rc, 1)
+                self.assertIn("x.yml", out)
+
+    def test_notifier_named_ci_in_ci_yml_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            wf = good(); n = notifier(); n["name"] = "ci"; wf["jobs"]["notify"] = n
+            pathlib.Path(d, "ci.yml").write_text(yaml.safe_dump(wf, sort_keys=False))
+            out = subprocess.run([sys.executable, cs.__file__, "--repo", "BJGLLC/cd-home", d], capture_output=True, text=True)
+            self.assertEqual(out.returncode, 1)
+
     def test_missing_ci_yml_is_red(self):
         with tempfile.TemporaryDirectory() as d:
-            out = subprocess.run(["python3", cs.__file__, "--repo", "BJGLLC/x", d], capture_output=True, text=True)
+            out = subprocess.run([sys.executable, cs.__file__, "--repo", "BJGLLC/x", d], capture_output=True, text=True)
             self.assertEqual(out.returncode, 1)
             self.assertIn("missing", out.stdout)
 
