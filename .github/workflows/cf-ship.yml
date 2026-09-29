@@ -41,6 +41,8 @@ jobs:
           set -euo pipefail
           test -d "$OUT" || { echo "::error::out_dir '$OUT' missing after build"; exit 1; }
           printf '{"sha":"%s","repo":"%s","built_at":"%s"}\n' "$SHA" "${GITHUB_REPOSITORY#*/}" "$(date -u +%FT%TZ)" > "$OUT/version.json"
+      # Cloudflare creds are scoped to the preflight + upload steps only. best-effort isolation: a hostile
+      # dependency could still write $GITHUB_ENV / $GITHUB_PATH; full isolation would need a separate job.
       - name: Refuse a Git-integrated Pages project or a drill aimed at production
         if: inputs.kind == 'pages'
         env:

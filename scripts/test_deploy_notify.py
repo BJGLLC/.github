@@ -1,7 +1,12 @@
 # scripts/test_deploy_notify.py
+import contextlib
+import io
+import subprocess
 import unittest
+from unittest import mock
 
-from deploy_notify import TEAM_KEYS, body, final_state, tickets
+import deploy_notify
+from deploy_notify import STATES, TEAM_KEYS, body, final_state, tickets
 
 A, B = "1234567" + "0" * 33, "abcdef0" + "0" * 33
 
@@ -49,10 +54,10 @@ class State(unittest.TestCase):
 
 class Body(unittest.TestCase):
     def test_deployed_names_sha_and_rollback_command(self):
-        t = body("deployed", "crawldaddyrepairs.com (CF Pages)", "BJGLLC/cd-pages", A, B, "https://run/1")
+        t = body("deployed", "example.pages.dev (CF Pages)", "BJGLLC/example-pages", A, B, "https://run/1")
         self.assertIn("`1234567`", t)
         self.assertIn("(was `abcdef0`)", t)
-        self.assertIn("Rollback: `bin/rollback cd-pages abcdef0`", t)
+        self.assertIn("Rollback: `bin/rollback example-pages abcdef0`", t)
         self.assertIn("[run](https://run/1)", t)
 
     def test_first_deploy_says_no_target(self):
@@ -74,6 +79,34 @@ class Body(unittest.TestCase):
         self.assertTrue(t.startswith("[drill] "))
         self.assertIn("log: `journalctl", t)
         self.assertNotIn("[run](journalctl", t)
+
+
+class Hardening(unittest.TestCase):
+    def test_every_state_final_state_can_return_is_in_the_vocabulary(self):
+        outs = {final_state(r, sh, sm, rs, rsm) for r in ("deploy", "rollback")
+                for sh in ("success", "failure", "") for sm in ("true", "false", "")
+                for rs in ("success", "failure", "skipped", "") for rsm in ("true", "false", "")}
+        self.assertEqual(outs, set(STATES))
+
+    def test_unknown_state_is_rejected_by_argparse(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as cm:
+            deploy_notify.main(["notify", "--repo", "o/r", "--state", "bogus", "--surface", "s", "--attempted", A, "--dry-run"])
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_all_zero_live_before_is_treated_as_no_prior_deploy(self):
+        seen = []
+        with mock.patch.object(deploy_notify, "range_messages", lambda repo, o, n: seen.append((o, n)) or []), \
+                contextlib.redirect_stdout(io.StringIO()):
+            deploy_notify.main(["notify", "--repo", "o/r", "--state", "deployed", "--surface", "s",
+                                "--attempted", A, "--live-before", "0" * 40, "--dry-run"])
+        self.assertEqual(seen, [("", A)])
+
+    def test_gh_failure_prints_stderr_and_reraises(self):
+        err = subprocess.CalledProcessError(1, ["gh"], output="", stderr="HTTP 403: nope")
+        with mock.patch.object(deploy_notify.subprocess, "run", side_effect=err), \
+                contextlib.redirect_stderr(io.StringIO()) as se, self.assertRaises(subprocess.CalledProcessError):
+            deploy_notify.gh("api", "x")
+        self.assertIn("HTTP 403: nope", se.getvalue())
 
 
 if __name__ == "__main__":

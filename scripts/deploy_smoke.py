@@ -3,8 +3,7 @@
 
 Polls VERSION_URL until its JSON `sha` equals the expected full SHA or TIMEOUT (180 s) passes,
 then GETs HEALTH_URL once. A 200 that is not JSON is a mismatch, never a pass: Cloudflare
-Pages serves index.html for unknown paths, which is what crawldaddyrepairs.com/version.json
-returns today. Redirects are not followed. A 302 to a Cloudflare Access login means the smoke
+Pages serves index.html for unknown paths (a site with no 404.html answers /version.json that way). Redirects are not followed. A 302 to a Cloudflare Access login means the smoke
 is unauthenticated; that is a failure to report, not a page to parse.
 """
 import argparse
@@ -51,6 +50,8 @@ def read_sha(status, ctype, body):
 
 def run(version_url, health_url, expected, timeout=180, interval=10, headers=None,
         fetch=fetch, sleep=time.sleep, clock=time.monotonic):
+    if not expected:  # None == None (a missing sha field) must never read as a pass
+        raise ValueError("expected sha is required")
     headers = headers or {}
     start = clock()
 

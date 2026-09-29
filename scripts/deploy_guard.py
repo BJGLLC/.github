@@ -96,7 +96,11 @@ def freezes_to_close(freezes, decided_at):
 # ---- I/O (thin; exercised by the Task 7 live run and the drills) -----------------------------
 
 def gh(*args, stdin=None):
-    return subprocess.run(["gh", *args], input=stdin, capture_output=True, text=True, check=True).stdout.strip()
+    try:
+        return subprocess.run(["gh", *args], input=stdin, capture_output=True, text=True, check=True).stdout.strip()
+    except subprocess.CalledProcessError as e:
+        print(e.stderr, file=sys.stderr)
+        raise
 
 
 def gh_json(path):

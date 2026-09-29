@@ -46,7 +46,7 @@ class Smoke(unittest.TestCase):
         self.assertEqual(r["observed"], SHA)
 
     def test_html_200_fallback_never_passes(self):
-        r = self.go([HTML])  # crawldaddyrepairs.com/version.json today
+        r = self.go([HTML])  # a Pages site with no 404.html serves index.html for /version.json
         self.assertFalse(r["ok"])
         self.assertIn("not json", r["reason"])
         self.assertGreaterEqual(r["elapsed"], 180)
@@ -79,6 +79,14 @@ class Smoke(unittest.TestCase):
 
     def test_access_without_token_fails_fast(self):
         self.assertEqual(main(["--version-url", "https://x/v", "--sha", SHA, "--access"], env={}), 1)
+
+
+class ExpectedRequired(unittest.TestCase):
+    def test_none_or_empty_expected_is_refused(self):
+        for bad in (None, ""):
+            with self.assertRaises(ValueError):
+                run("https://x/version.json", "", bad, fetch=lambda *a, **k: (200, "application/json", "{}"),
+                    sleep=lambda s: None)
 
 
 if __name__ == "__main__":

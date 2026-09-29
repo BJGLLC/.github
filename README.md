@@ -18,5 +18,6 @@ With no Codex response by then, the recompute posts the `codex-unavailable` fail
 
 `workflow_dispatch -f drill=p1-open` is the red-proof drill: it posts a `failure` status on the PR head. A drill can only ever post failure; there is no passing drill (R39).
 
+## Deploy library
 
-This repo also hosts the shared deploy library (SSSF-31, Review v4 phase 4): `scripts/deploy_*.py`, `.github/workflows/linear-deploy-notify.yml`, and later `cf-deploy.yml` / `cf-ship.yml`. Callers pin `BJGLLC/.github@main`; team keys live in `scripts/deploy_notify.py` only.
+This repo also hosts the shared deploy library (SSSF-31, Review v4 phase 4): `scripts/deploy_*.py`, `.github/workflows/linear-deploy-notify.yml`, `cf-deploy.yml` and `cf-ship.yml`. Callers pin `BJGLLC/.github@main`; team keys live in `scripts/deploy_notify.py` only.

@@ -22,6 +22,10 @@ TEAM_KEYS = ("cd", "tool", "auto", "sssf", "data", "ops", "rnd", "bjg")  # every
 TICKET_RE = re.compile(r"\b(" + "|".join(TEAM_KEYS) + r")-([0-9]+)\b", re.IGNORECASE)
 CAP = 5
 LINEAR = "https://api.linear.app/graphql"
+# Every state final_state() returns; body() has a branch for each. An unknown state would render as a
+# false "UNKNOWN" alarm, so `notify --state` rejects anything else.
+STATES = ("deployed", "rolled-back", "auto-rolled-back", "ship-failed", "rollback-failed", "smoke-failed-no-target")
+ZERO_SHA = "0" * 40  # github.event.before on a branch's first push
 
 
 def tickets(messages, cap=CAP):
@@ -80,7 +84,11 @@ def body(state, surface, repo, attempted, live_before="", run_url="", freeze=Non
 
 
 def gh(*args):
-    return subprocess.run(["gh", *args], capture_output=True, text=True, check=True).stdout
+    try:
+        return subprocess.run(["gh", *args], capture_output=True, text=True, check=True).stdout
+    except subprocess.CalledProcessError as e:
+        print(e.stderr, file=sys.stderr)
+        raise
 
 
 def range_messages(repo, older, newer):
@@ -108,6 +116,8 @@ def post_linear(key, ticket, text):
 
 
 def cmd_notify(a):
+    if a.live_before == ZERO_SHA:
+        a.live_before = ""
     # A manual rollback reports the range it undid (target..was-live); everything else, was-live..attempted.
     older, newer = (a.attempted, a.live_before) if a.state == "rolled-back" else (a.live_before, a.attempted)
     try:
@@ -148,7 +158,7 @@ def main(argv=None):
         s.add_argument(f, default="")
     n = sub.add_parser("notify")
     n.add_argument("--repo", required=True)
-    n.add_argument("--state", required=True)
+    n.add_argument("--state", required=True, choices=STATES)
     n.add_argument("--surface", required=True)
     n.add_argument("--attempted", required=True)
     n.add_argument("--live-before", default="")

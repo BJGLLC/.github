@@ -53,9 +53,11 @@ jobs:
         with: { repository: BJGLLC/.github, ref: main, path: .deploylib, persist-credentials: false }
       - id: u
         name: Resolve URLs + ledger env for this environment
-        env: { ENVN: "${{ inputs.env }}", PROJ: "${{ inputs.cf_project }}", DB: "${{ inputs.drill_branch }}", VU: "${{ inputs.version_url }}", HU: "${{ inputs.health_url }}", LE: "${{ inputs.ledger_env }}" }
+        env: { ENVN: "${{ inputs.env }}", KIND: "${{ inputs.kind }}", PROJ: "${{ inputs.cf_project }}", DB: "${{ inputs.drill_branch }}", VU: "${{ inputs.version_url }}", HU: "${{ inputs.health_url }}", LE: "${{ inputs.ledger_env }}" }
         run: |
           set -euo pipefail
+          case "$ENVN" in production|drill) ;; *) echo "::error::env must be production or drill"; exit 1 ;; esac
+          case "$KIND" in pages|worker) ;; *) echo "::error::kind must be pages or worker"; exit 1 ;; esac
           if [ "$ENVN" = drill ]; then
             [ "$DB" != main ] || { echo "::error::drill_branch must not be main"; exit 1; }
             base="https://${DB}.${PROJ}.pages.dev"

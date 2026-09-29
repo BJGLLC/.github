@@ -1,5 +1,8 @@
 # scripts/test_deploy_guard.py
+import contextlib
+import io
 import json
+import subprocess
 import types
 import unittest
 from unittest import mock
@@ -124,6 +127,32 @@ class FreezeOpen(unittest.TestCase):
             self.assertEqual(deploy_guard.freeze_open(a), 8)
         self.assertTrue(any(c[:2] == ("issue", "create") for c in calls))
         self.assertFalse(any(c[:2] == ("issue", "comment") for c in calls))
+
+
+class Gather(unittest.TestCase):
+    def test_decision_time_is_taken_before_the_freezes_are_read(self):
+        order = []
+        fakes = {
+            "gh": lambda *a, **k: order.append("gh") or "f" * 40,
+            "now": lambda: order.append("now") or "2026-10-01T00:00:00Z",
+            "ledger": lambda *a: order.append("ledger") or [],
+            "pr_of": lambda *a: order.append("pr_of") or (None, []),
+            "ancestor_or_equal": lambda *a: order.append("ancestor") or True,
+            "ci_state": lambda *a: order.append("ci") or "success",
+            "open_freezes": lambda *a: order.append("open_freezes") or [],
+        }
+        with contextlib.ExitStack() as st:
+            for k, v in fakes.items():
+                st.enter_context(mock.patch.object(deploy_guard, k, v))
+            deploy_guard.gather("o/r", "f" * 40, "deploy", "production", False, True)
+        self.assertLess(order.index("now"), order.index("open_freezes"))
+
+    def test_gh_failure_prints_stderr_and_reraises(self):
+        err = subprocess.CalledProcessError(1, ["gh"], output="", stderr="HTTP 403: nope")
+        with mock.patch.object(deploy_guard.subprocess, "run", side_effect=err), \
+                contextlib.redirect_stderr(io.StringIO()) as se, self.assertRaises(subprocess.CalledProcessError):
+            deploy_guard.gh("api", "x")
+        self.assertIn("HTTP 403: nope", se.getvalue())
 
 
 if __name__ == "__main__":

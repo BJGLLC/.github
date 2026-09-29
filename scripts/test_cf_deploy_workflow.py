@@ -129,6 +129,14 @@ class CfDeploy(unittest.TestCase):
         self.assertIn("always()", self.j["report"]["if"])
 
 
+    def test_env_and_kind_are_validated(self):
+        run = next(s["run"] for s in self.j["guard"]["steps"] if s.get("id") == "u")
+        self.assertIn('case "$ENVN" in production|drill) ;; *) echo "::error::env must be production or drill"; exit 1 ;; esac', run)
+        self.assertIn('case "$KIND" in pages|worker) ;; *) echo "::error::kind must be pages or worker"; exit 1 ;; esac', run)
+        env = next(s["env"] for s in self.j["guard"]["steps"] if s.get("id") == "u")
+        self.assertEqual(env["KIND"], "${{ inputs.kind }}")
+
+
 class CfShip(unittest.TestCase):
     def setUp(self):
         self.job = load("cf-ship.yml")["jobs"]["ship"]
@@ -148,6 +156,9 @@ class CfShip(unittest.TestCase):
                 self.assertFalse(has, s.get("name"))
             if s.get("name", "").startswith(("Refuse", "Upload")):
                 self.assertTrue(has, s.get("name"))
+
+    def test_cred_isolation_is_documented_as_best_effort(self):
+        self.assertIn("best-effort", (WF / "cf-ship.yml").read_text())
 
     def test_ship_job_is_time_bounded(self):
         self.assertEqual(self.job["timeout-minutes"], 15)
