@@ -47,8 +47,9 @@ REVIEWED_COMMIT = re.compile(r"reviewed\s+commit\W*?([0-9a-f]+)(?![0-9a-z])", re
 ERROR = re.compile(r"codex review:\s*something went wrong|codex (encountered an error|was unable|could not|failed)", re.I)
 QUEUE_MARK = "queued-for-janitor"
 # The gate replies through addPullRequestReviewThreadReply with the Actions token (GraphQL login
-# `github-actions`); `bjg-gate` is the SSSF-29 bot identity. Compared after _normalize_login.
-GATE_LOGINS = {"github-actions", "bjg-gate"}
+# `github-actions`, __typename Bot). Compared after _normalize_login. SSSF-29's cutover adds its
+# bot login here once that account exists: an unowned login must never be honoured (SSSF-38).
+GATE_LOGINS = {"github-actions"}
 QUEUE_REPLY = f"{QUEUE_MARK}: advisory finding, handed to the weekly janitor (review v4 §7)."
 CODEX_UNAVAILABLE_DESC = "codex-unavailable: Codex errored. Retry `@codex review`, or label `hotfix` if urgent."
 SUMMARY_MARKER = "<!-- codex-pull-request-review-summary -->"
@@ -77,14 +78,26 @@ def is_codex(name):
 def is_gate_marker(comment):
     """SSSF-38: the janitor marker counts only when the gate wrote it. Anyone can reply on a
     review thread, so a marker from any other author (or one that merely mentions the text)
-    must not take a P0/P1 out of `blocking`. Both hold: the author is a gate login, and the
-    body STARTS with the exact QUEUE_REPLY the gate posts."""
+    is ignored. All hold: the author is a gate login, that author is a Bot (a User can own a
+    look-alike login), and the body STARTS with the exact QUEUE_REPLY the gate posts.
+    It only ever de-duplicates the P2/P3 queue; it never unblocks a P0/P1 (see compute)."""
     if _normalize_login(comment.get("author")) not in GATE_LOGINS:
+        return False
+    if comment.get("author_type") != "Bot":
         return False
     return (comment.get("body") or "").lstrip().startswith(QUEUE_REPLY)
 
 
+def tampered(thread):
+    """SSSF-38: the first (Codex) comment was edited by someone other than Codex, so its badge
+    cannot be trusted (P1 -> P3 downgrade)."""
+    ed = thread["comments"][0].get("editor")
+    return bool(ed) and not is_codex(ed)
+
+
 def priority(thread):
+    if tampered(thread):
+        return 0
     first = thread["comments"][0]["body"]
     m = BADGE.search(first)
     return int(m.group(1)) if m else 2
@@ -232,16 +245,16 @@ def compute(pr, now):
     for t in pr["threads"]:
         if not t["comments"] or not is_codex(t["comments"][0]["author"]):
             continue
-        if any(is_gate_marker(c) for c in t["comments"]):
-            continue  # already handed to the janitor (by the gate itself: SSSF-38)
         p = priority(t)
         cleared = t["is_resolved"] and ts(t["comments"][0]["created_at"]) < pushed
         if p <= blocking_max:
             if not cleared:
                 blocking.append(t["id"])
-        else:
-            if not t["is_resolved"]:
-                queue.append(t["id"])
+        elif not t["is_resolved"] and not any(is_gate_marker(c) for c in t["comments"]):
+            # already handed to the janitor -> skipped. The marker is honoured only here: the gate
+            # replies only to queued (non-blocking) threads, so a marker never unblocks a P0/P1
+            # (a PR-added workflow can post as github-actions: SSSF-38).
+            queue.append(t["id"])
     if blocking:
         return {"state": "failure", "description": f"{label}: {len(blocking)} unresolved P0/P1 (push a fix): {', '.join(blocking)}"[:140], "queue": queue}
     return {"state": "success", "description": f"{label}: no blocking findings" + (f"; {len(queue)} queued for janitor" if queue else ""), "queue": queue}
@@ -341,7 +354,7 @@ query($owner:String!,$name:String!,$n:Int!){ repository(owner:$owner,name:$name)
   commits(last:1){nodes{commit{committedDate checkSuites(first:20){nodes{createdAt app{slug}}}}}}
   reviews(first:100){nodes{author{login} submittedAt commit{oid}}}
   comments(last:100){totalCount nodes{author{login} body createdAt}}
-  reviewThreads(first:100){nodes{id isResolved comments(first:20){nodes{author{login} body createdAt commit{oid}}}}}
+  reviewThreads(first:100){nodes{id isResolved comments(first:20){nodes{author{login __typename} editor{login __typename} lastEditedAt body createdAt commit{oid}}}}}
 }}}"""
 
 
@@ -392,7 +405,9 @@ def fetch(repo, number):
         "reviews": [{"author": login(r["author"]), "submitted_at": r["submittedAt"], "commit_sha": (r["commit"] or {}).get("oid", "")} for r in p["reviews"]["nodes"]],
         "comments": comments,
         "threads": [{"id": t["id"], "is_resolved": t["isResolved"], "comments": [
-            {"author": login(c["author"]), "body": c["body"], "created_at": c["createdAt"], "commit_sha": (c["commit"] or {}).get("oid", "")} for c in t["comments"]["nodes"]]} for t in p["reviewThreads"]["nodes"]],
+            {"author": login(c["author"]), "author_type": (c["author"] or {}).get("__typename", ""),
+             "editor": login(c.get("editor")) or None, "body": c["body"], "created_at": c["createdAt"],
+             "commit_sha": (c["commit"] or {}).get("oid", "")} for c in t["comments"]["nodes"]]} for t in p["reviewThreads"]["nodes"]],
         "nudged": is_nudged(comments, head_pushed_at),
         "asked_at": derive_asked_at(head_pushed_at, [p["createdAt"], *(e["createdAt"] for e in p["timelineItems"]["nodes"] if e.get("createdAt"))]),
         "summary": _newest_summary(summary_sources),
@@ -449,7 +464,7 @@ def reply_thread(thread_id, body):
     gh("api", "graphql", "-f", "query=mutation($id:ID!,$b:String!){ addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$id, body:$b}){ comment{id} } }", "-F", f"id={thread_id}", "-F", f"b={body}")
 
 
-THREAD_COMMENTS = "query($id:ID!){ node(id:$id){ ... on PullRequestReviewThread{ comments(last:100){ nodes{ body author{ login } } } } } }"
+THREAD_COMMENTS = "query($id:ID!){ node(id:$id){ ... on PullRequestReviewThread{ comments(last:100){ nodes{ body author{ login __typename } } } } } }"
 
 
 def thread_is_queued(thread_id):
@@ -458,7 +473,8 @@ def thread_is_queued(thread_id):
     and a pull_request_review run replied 1 s apart)."""
     d = json.loads(gh("api", "graphql", "-f", f"query={THREAD_COMMENTS}", "-F", f"id={thread_id}"))
     nodes = ((d.get("data") or {}).get("node") or {}).get("comments", {}).get("nodes", [])
-    return any(is_gate_marker({"author": (c.get("author") or {}).get("login"), "body": c.get("body")})
+    return any(is_gate_marker({"author": (c.get("author") or {}).get("login"),
+                           "author_type": (c.get("author") or {}).get("__typename"), "body": c.get("body")})
                for c in nodes)
 
 

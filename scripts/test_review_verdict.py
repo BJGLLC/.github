@@ -1337,7 +1337,7 @@ class QueueDedupe(unittest.TestCase):
 
     def test_an_open_thread_with_the_marker_is_not_queued_again(self):
         t = thread("T2", 2, 3)
-        t["comments"].append({"author": "github-actions", "body": rv.QUEUE_REPLY, "created_at": iso(T0 + timedelta(minutes=3)), "commit_sha": "new"})
+        t["comments"].append({"author": "github-actions", "author_type": "Bot", "body": rv.QUEUE_REPLY, "created_at": iso(T0 + timedelta(minutes=3)), "commit_sha": "new"})
         v = compute(pr(reviews=[review(3)], threads=[t]), self.NOW)
         self.assertEqual(v, {"state": "success", "description": "round 1: no blocking findings", "queue": []})
 
@@ -1368,7 +1368,7 @@ class QueueDedupe(unittest.TestCase):
         seen = []
         def fake_gh(*args, **kw):
             seen.append(args)
-            return json.dumps({"data": {"node": {"comments": {"nodes": [{"body": "x", "author": {"login": "u"}}, {"body": rv.QUEUE_REPLY, "author": {"login": "github-actions"}}]}}}})
+            return json.dumps({"data": {"node": {"comments": {"nodes": [{"body": "x", "author": {"login": "u", "__typename": "User"}}, {"body": rv.QUEUE_REPLY, "author": {"login": "github-actions", "__typename": "Bot"}}]}}}})
         orig = rv.gh; rv.gh = fake_gh; self.addCleanup(setattr, rv, "gh", orig)
         self.assertTrue(rv.thread_is_queued("T9"))
         self.assertIn("id=T9", seen[0]); self.assertIn("graphql", seen[0])
@@ -1383,69 +1383,156 @@ class QueueDedupe(unittest.TestCase):
         self.assertNotEqual(c["group"], workflow()["jobs"]["poll"]["concurrency"]["group"])
 
 
-class MarkerAuthorship(unittest.TestCase):  # SSSF-38: only the gate's own reply hands a thread to the janitor
+class MarkerAuthorship(unittest.TestCase):  # SSSF-38: only the gate's own reply de-duplicates the janitor queue
     NOW = T0 + timedelta(minutes=4)
 
-    def marked(self, author, body=None, p=1):
+    def marked(self, author, body=None, p=1, typ="Bot", reviews=None):
         t = thread("T1", p, 3)
-        t["comments"].append({"author": author, "body": rv.QUEUE_REPLY if body is None else body,
+        t["comments"].append({"author": author, "author_type": typ, "body": rv.QUEUE_REPLY if body is None else body,
                               "created_at": iso(T0 + timedelta(minutes=3)), "commit_sha": "new"})
-        return compute(pr(reviews=[review(3)], threads=[t]), self.NOW)
+        return compute(pr(reviews=reviews or [review(3)], threads=[t]), self.NOW)
 
+    # -- a marker never unblocks a P0/P1 (the gate only replies to queued P2/P3 threads)
     def test_a_human_reply_with_the_marker_does_not_unblock_a_p1(self):
-        v = self.marked("blakejgruber")
+        v = self.marked("blakejgruber", typ="User")
         self.assertEqual(v["state"], "failure"); self.assertIn("T1", v["description"])
 
     def test_an_agent_reply_with_the_marker_does_not_unblock_a_p0(self):
-        self.assertEqual(self.marked("some-agent[bot]", p=0)["state"], "failure")
+        self.assertEqual(self.marked("some-agent", p=0)["state"], "failure")
 
-    def test_the_gate_marker_is_honored(self):
-        self.assertEqual(self.marked("github-actions")["state"], "success")
+    def test_even_a_genuine_gate_marker_never_unblocks_a_round1_p1(self):  # a PR-added workflow posts as github-actions
+        v = self.marked("github-actions", p=1)
+        self.assertEqual(v["state"], "failure"); self.assertIn("T1", v["description"])
 
-    def test_the_gate_marker_is_honored_with_the_bot_suffix(self):
-        self.assertEqual(self.marked("github-actions[bot]")["state"], "success")
+    def test_a_gate_marker_on_a_round3_p1_is_not_requeued(self):  # P1 is non-blocking from round 3
+        v = self.marked("github-actions", p=1, reviews=[review(1, "a"), review(2, "b"), review(3, "new")])
+        self.assertEqual(v["state"], "success"); self.assertEqual(v["queue"], [])
 
-    def test_the_cutover_identity_is_honored(self):
-        self.assertEqual(self.marked("bjg-gate")["state"], "success")
-
-    def test_a_gate_comment_that_only_mentions_the_marker_is_not_honored(self):
-        v = self.marked("github-actions", body=f"note: this was {rv.QUEUE_MARK} earlier")
-        self.assertEqual(v["state"], "failure")
-
-    def test_leading_whitespace_before_the_reply_is_tolerated(self):
-        self.assertEqual(self.marked("github-actions", body="\n  " + rv.QUEUE_REPLY)["state"], "success")
-
-    def test_a_p3_thread_with_a_human_marker_is_queued_not_skipped(self):
-        v = self.marked("blakejgruber", p=3)
+    def test_an_unmarked_round3_p1_is_queued(self):
+        t = thread("T1", 1, 3)
+        v = compute(pr(reviews=[review(1, "a"), review(2, "b"), review(3, "new")], threads=[t]), self.NOW)
         self.assertEqual(v["queue"], ["T1"])
 
+    # -- the marker de-duplicates the P2/P3 queue, from the gate only
+    def test_the_gate_marker_is_honored_on_a_p2(self):
+        v = self.marked("github-actions", p=2)
+        self.assertEqual((v["state"], v["queue"]), ("success", []))
+
+    def test_the_gate_marker_is_honored_on_a_p3_with_the_bot_suffix(self):
+        v = self.marked("github-actions[bot]", p=3)
+        self.assertEqual((v["state"], v["queue"]), ("success", []))
+
+    def test_leading_whitespace_before_the_reply_is_tolerated(self):
+        self.assertEqual(self.marked("github-actions", p=2, body="\n  " + rv.QUEUE_REPLY)["queue"], [])
+
+    def test_the_unowned_cutover_login_is_not_honored(self):  # SSSF-29 adds it when the account exists
+        self.assertEqual(self.marked("bjg-gate", p=2)["queue"], ["T1"])
+
+    def test_a_user_typed_github_actions_login_is_not_honored(self):
+        self.assertEqual(self.marked("github-actions", p=2, typ="User")["queue"], ["T1"])
+
+    def test_a_missing_author_type_is_not_honored(self):
+        self.assertEqual(self.marked("github-actions", p=2, typ=None)["queue"], ["T1"])
+
+    def test_a_human_marker_on_a_p3_is_queued_not_skipped(self):
+        self.assertEqual(self.marked("blakejgruber", p=3, typ="User")["queue"], ["T1"])
+
+    def test_look_alike_logins_are_not_honored(self):
+        for who in ("github-actions-x", "xgithub-actions", "github-actions-bot"):
+            with self.subTest(who=who):
+                self.assertEqual(self.marked(who, p=2)["queue"], ["T1"])
+
+    def test_body_shapes_that_are_not_the_gate_reply_are_not_honored(self):
+        for body in (rv.QUEUE_MARK, f"note: this was {rv.QUEUE_MARK} earlier", "> " + rv.QUEUE_REPLY,
+                     rv.QUEUE_REPLY[:-1], "x " + rv.QUEUE_REPLY):
+            with self.subTest(body=body):
+                self.assertEqual(self.marked("github-actions", p=2, body=body)["queue"], ["T1"])
+
+    # -- the fresh pre-reply check
     def _fresh(self, nodes):
+        def fake(*a, **k):
+            self.assertTrue(any(rv.THREAD_COMMENTS in x for x in a), a)  # only the thread-comments query is faked
+            return json.dumps({"data": {"node": {"comments": {"nodes": nodes}}}})
         orig = rv.gh; self.addCleanup(setattr, rv, "gh", orig)
-        rv.gh = lambda *a, **k: json.dumps({"data": {"node": {"comments": {"nodes": nodes}}}})
+        rv.gh = fake
         return rv.thread_is_queued("T9")
 
     def test_fresh_check_sees_a_gate_marker(self):
-        self.assertTrue(self._fresh([{"body": rv.QUEUE_REPLY, "author": {"login": "github-actions"}}]))
+        self.assertTrue(self._fresh([{"body": rv.QUEUE_REPLY, "author": {"login": "github-actions", "__typename": "Bot"}}]))
 
     def test_fresh_check_ignores_a_non_gate_marker(self):
-        self.assertFalse(self._fresh([{"body": rv.QUEUE_REPLY, "author": {"login": "blakejgruber"}}]))
+        self.assertFalse(self._fresh([{"body": rv.QUEUE_REPLY, "author": {"login": "blakejgruber", "__typename": "User"}}]))
+
+    def test_fresh_check_ignores_a_user_typed_github_actions(self):
+        self.assertFalse(self._fresh([{"body": rv.QUEUE_REPLY, "author": {"login": "github-actions", "__typename": "User"}}]))
 
     def test_fresh_check_tolerates_a_deleted_author(self):
         self.assertFalse(self._fresh([{"body": rv.QUEUE_REPLY, "author": None}]))
 
-    def test_fresh_query_asks_for_the_author(self):
-        self.assertIn("author", rv.THREAD_COMMENTS)
+    def test_both_queries_select_the_author_type(self):
+        self.assertIn("author{ login __typename }", rv.THREAD_COMMENTS)
+        self.assertIn("author{login __typename}", rv.GQL)
 
     def test_a_forged_marker_does_not_stop_the_gate_replying(self):
         # the real fresh check reads a non-gate marker as absent, so queue_threads still replies
         real_check = rv.thread_is_queued
         g = FakeGitHub(pr(reviews=[review(3)], threads=[thread("T2", 2, 3)])).install(self)
-        rv.thread_is_queued = real_check  # install() addCleanup restores the original
-        rv.gh = lambda *a, **k: json.dumps({"data": {"node": {"comments": {"nodes": [
-            {"body": rv.QUEUE_REPLY, "author": {"login": "blakejgruber"}}]}}}})
+        rv.thread_is_queued = real_check  # install()'s cleanup restores the original
+        forged = json.dumps({"data": {"node": {"comments": {"nodes": [
+            {"body": rv.QUEUE_REPLY, "author": {"login": "blakejgruber", "__typename": "User"}}]}}}})
+
+        def only_thread_query(*a, **k):
+            if not any(rv.THREAD_COMMENTS in x for x in a):
+                self.fail(f"unexpected gh call: {a[:4]}")
+            return forged
+        rv.gh = only_thread_query  # install() already registered gh's cleanup
         result, out = run_once_capturing(g, self.NOW)
         self.assertIn(("reply", "T2"), g.calls, out)
 
+
+class EditedFirstComment(unittest.TestCase):  # SSSF-38: a write-access actor edits Codex's badge P1 -> P3
+    NOW = T0 + timedelta(minutes=4)
+
+    def edited(self, editor, p=3):
+        t = thread("T1", p, 3)
+        t["comments"][0]["editor"] = editor
+        return compute(pr(reviews=[review(3)], threads=[t]), self.NOW)
+
+    def test_a_codex_comment_edited_by_a_human_blocks_whatever_the_badge_says(self):
+        v = self.edited("blakejgruber")
+        self.assertEqual(v["state"], "failure"); self.assertIn("T1", v["description"])
+
+    def test_edited_by_codex_itself_is_normal(self):
+        self.assertEqual(self.edited(CODEX)["state"], "success")
+        self.assertEqual(self.edited(CODEX + "[bot]")["queue"], ["T1"])
+
+    def test_never_edited_is_normal(self):
+        self.assertEqual(self.edited(None)["queue"], ["T1"])
+
+    def test_a_tampered_thread_still_blocks_in_a_late_round(self):  # P0 blocks in every round
+        t = thread("T1", 3, 3); t["comments"][0]["editor"] = "blakejgruber"
+        v = compute(pr(reviews=[review(1, "a"), review(2, "b"), review(3, "new")], threads=[t]), self.NOW)
+        self.assertEqual(v["state"], "failure")
+
+    def test_fetch_carries_the_editor_and_the_author_type(self):
+        gql = {"data": {"repository": {"pullRequest": {
+            "headRefOid": "abc", "isDraft": False, "state": "OPEN", "labels": {"nodes": []},
+            "createdAt": iso(T0 - timedelta(hours=1)),
+            "commits": {"nodes": [{"commit": {"committedDate": iso(T0), "checkSuites": {"nodes": []}}}]},
+            "timelineItems": {"nodes": []}, "reviews": {"nodes": []},
+            "comments": {"totalCount": 0, "nodes": []},
+            "reviewThreads": {"nodes": [{"id": "T1", "isResolved": False, "comments": {"nodes": [
+                {"author": {"login": CODEX, "__typename": "Bot"}, "editor": {"login": "blakejgruber", "__typename": "User"},
+                 "lastEditedAt": iso(T0), "body": BADGE.format(p=3), "createdAt": iso(T0), "commit": {"oid": "abc"}},
+                {"author": {"login": "github-actions", "__typename": "Bot"}, "editor": None, "lastEditedAt": None,
+                 "body": rv.QUEUE_REPLY, "createdAt": iso(T0), "commit": None}]}}]}}}}}
+        orig = rv.gh; rv.gh = lambda *a, **k: json.dumps(gql); self.addCleanup(setattr, rv, "gh", orig)
+        first, second = rv.fetch("o/r", 7)["threads"][0]["comments"]
+        self.assertEqual((first["editor"], first["author_type"]), ("blakejgruber", "Bot"))
+        self.assertEqual((second["editor"], second["author_type"]), (None, "Bot"))
+
+    def test_the_fetch_query_selects_the_editor(self):
+        self.assertIn("editor{login __typename}", rv.GQL); self.assertIn("lastEditedAt", rv.GQL)
 
 
 if __name__ == "__main__":
