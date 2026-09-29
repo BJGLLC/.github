@@ -17,3 +17,6 @@ With no Codex response by then, the recompute posts the `codex-unavailable` fail
 **Janitor queue.** P2/P3 findings get a `queued-for-janitor` thread reply, and that reply is the queue entry. The gate no longer resolves those threads, because `resolveReviewThread` needs `contents: write` and the callers grant `read` (drill #5), so the threads stay open. A thread that already has the reply is never queued twice: the gate checks the thread again right before replying, and one-shot runs for a PR are serialized (cd-marketing #165 got two replies 1 s apart from racing runs). If a reply fails, the run posts `failure` with the re-run remedy instead of success.
 
 `workflow_dispatch -f drill=p1-open` is the red-proof drill: it posts a `failure` status on the PR head. A drill can only ever post failure; there is no passing drill (R39).
+
+
+This repo also hosts the shared deploy library (SSSF-31, Review v4 phase 4): `scripts/deploy_*.py`, `.github/workflows/linear-deploy-notify.yml`, and later `cf-deploy.yml` / `cf-ship.yml`. Callers pin `BJGLLC/.github@main`; team keys live in `scripts/deploy_notify.py` only.
