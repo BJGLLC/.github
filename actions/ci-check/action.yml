@@ -70,13 +70,13 @@ runs:
       shell: bash
       env:
         CMD: ${{ inputs.install }}
-      run: bash -c "$CMD"
+      run: bash -ec "$CMD"
     - name: ci-setup
       if: inputs.ci-setup != ''
       shell: bash
       env:
         CMD: ${{ inputs.ci-setup }}
-      run: bash -c "$CMD"
+      run: bash -ec "$CMD"
     - name: check
       id: check
       shell: bash

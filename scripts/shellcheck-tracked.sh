@@ -11,9 +11,9 @@ while IFS= read -r -d '' f; do
   [ -f "$f" ] || continue
   case "$f" in
     *.sh|*.bash) files+=("$f") ;;
-    *) if head -n 1 "$f" 2>/dev/null | grep -qE '^#!.*\b(ba)?sh\b'; then files+=("$f"); fi ;;
+    *) if head -n 1 -- "$f" 2>/dev/null | grep -qE '^#!.*\b(ba)?sh\b'; then files+=("$f"); fi ;;
   esac
 done < <(git ls-files -z)
 if [ "${#files[@]}" -eq 0 ]; then echo "shellcheck: no shell files"; exit 0; fi
 echo "shellcheck -S error over ${#files[@]} files"
-shellcheck --norc -S error "${files[@]}"
+shellcheck --norc -S error -- "${files[@]}"

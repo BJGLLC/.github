@@ -47,7 +47,7 @@ def commit(d, path, text, mode=None):
     p.write_text(text)
     if mode:
         p.chmod(mode)
-    git(d, "add", path)
+    git(d, "add", "--", path)
     git(d, "commit", "-qm", path)
     return git(d, "rev-parse", "HEAD")
 
@@ -92,6 +92,12 @@ class Action(unittest.TestCase):
 
     def step_run(self, sid):
         return next(s for s in self.a["runs"]["steps"] if s.get("id") == sid)["run"]
+
+    def test_repo_commands_run_with_errexit(self):
+        for sid in ("install", "ci-setup"):
+            step = next(s for s in self.a["runs"]["steps"] if s.get("name") == sid)
+            rc = subprocess.run(["bash", "-c", step["run"]], env={**os.environ, "CMD": "false; true"}).returncode
+            self.assertNotEqual(rc, 0, f"{sid}: `false; true` must fail the step")
 
     def test_every_python_invocation_is_isolated(self):
         # -I keeps the PR checkout (cwd) off sys.path: a root yaml.py must never run in the shape step.
@@ -155,6 +161,13 @@ class ShellcheckTracked(unittest.TestCase):
         commit(d, "bad.sh", "#!/usr/bin/env bash\nif true; then echo x\n")
         self.assertNotEqual(self.rc(d), 0)
 
+    def test_option_shaped_filenames_are_files_not_options(self):
+        need("shellcheck"); d = repo()
+        commit(d, "--version.sh", "#!/usr/bin/env bash\necho ok\n")
+        self.assertEqual(self.rc(d), 0)
+        d = repo(); commit(d, "--version.sh", "#!/usr/bin/env bash\nif true; then echo x\n")
+        self.assertNotEqual(self.rc(d), 0)
+
     def test_zsh_script_is_skipped(self):
         need("shellcheck"); d = repo()
         commit(d, "z", "#!/usr/bin/env zsh\nif [[ -o interactive ]] { echo i }\n", 0o755)
@@ -190,11 +203,12 @@ class GitleaksRange(unittest.TestCase):
 
     def test_gitleaksignore_fingerprint_does_not_suppress(self):
         # find the real fingerprint from a report, then plant it in the PR's own .gitleaksignore
-        rep = pathlib.Path(self.d, "..", "rep.json").resolve()
-        subprocess.run(["gitleaks", "git", "--no-banner", "--redact", "--config", str(HERE / "gitleaks.toml"),
-                        "--log-opts", f"{self.a}..{self.b}", "-r", str(rep), "-f", "json", self.d], capture_output=True)
         import json
-        fps = [f["Fingerprint"] for f in json.loads(rep.read_text())]
+        with tempfile.TemporaryDirectory() as rd:
+            rep = pathlib.Path(rd, "rep.json")
+            subprocess.run(["gitleaks", "git", "--no-banner", "--redact", "--config", str(HERE / "gitleaks.toml"),
+                            "--log-opts", f"{self.a}..{self.b}", "-r", str(rep), "-f", "json", self.d], capture_output=True)
+            fps = [f["Fingerprint"] for f in json.loads(rep.read_text())]
         self.assertTrue(fps, "planted token was not detected at all")
         commit(self.d, ".gitleaksignore", "\n".join(fps) + "\n")
         self.assertNotEqual(self.rc(EVENT="push", BEFORE=self.a, HEAD_SHA=git(self.d, "rev-parse", "HEAD")), 0)
@@ -203,6 +217,40 @@ class GitleaksRange(unittest.TestCase):
         line = pathlib.Path(self.d, "cfg.py").read_text().rstrip("\n") + "  # gitleaks:allow\n"
         c = commit(self.d, "cfg.py", line)
         self.assertEqual(self.rc(EVENT="push", BEFORE=self.b, HEAD_SHA=c), 0)
+
+    @staticmethod
+    def token():
+        return "ghp_" + "".join(random.choices(string.ascii_letters + string.digits, k=36))
+
+    def test_secret_added_only_in_a_merge_commit_is_red(self):
+        d = repo(); base = commit(d, "f.txt", "base\n")
+        git(d, "checkout", "-qb", "feat"); commit(d, "feat.txt", "feature\n")
+        git(d, "checkout", "-q", "-"); commit(d, "main.txt", "main\n")
+        git(d, "merge", "--no-ff", "--no-commit", "feat")
+        pathlib.Path(d, "cfg.py").write_text(f'token = "{self.token()}"\n'); git(d, "add", "cfg.py")
+        git(d, "commit", "-qm", "evil merge")
+        self.d = d
+        self.assertNotEqual(self.rc(EVENT="push", BEFORE=base, HEAD_SHA=git(d, "rev-parse", "HEAD")), 0)
+
+    def test_conflict_resolution_keeping_an_existing_secret_is_green(self):
+        d = repo(); line = f'token = "{self.token()}"\n'
+        base = commit(d, "cfg.py", line)   # the secret is already in history, before the range
+        git(d, "checkout", "-qb", "feat"); commit(d, "cfg.py", line + "y = 2\n")
+        git(d, "checkout", "-q", "-"); commit(d, "cfg.py", line + "x = 1\n")
+        merge = subprocess.run(["git", "-C", d, "merge", "--no-ff", "feat"], capture_output=True)
+        self.assertNotEqual(merge.returncode, 0, "expected a conflict")
+        pathlib.Path(d, "cfg.py").write_text(line + "x = 1\ny = 2\n"); git(d, "add", "cfg.py")
+        git(d, "commit", "-qm", "resolve")
+        self.d = d
+        self.assertEqual(self.rc(EVENT="push", BEFORE=base, HEAD_SHA=git(d, "rev-parse", "HEAD")), 0)
+
+    def test_gitattributes_cannot_hide_a_diff(self):
+        for attrs in ("* -diff\n", "*.py binary\n"):
+            d = repo(); a = commit(d, "readme.md", "clean\n")
+            commit(d, ".gitattributes", attrs)
+            head = commit(d, "cfg.py", f'token = "{self.token()}"\n')
+            self.d = d
+            self.assertNotEqual(self.rc(EVENT="push", BEFORE=a, HEAD_SHA=head), 0, attrs)
 
     def test_dispatch_without_origin_scans_the_head(self):
         self.assertNotEqual(self.rc(EVENT="workflow_dispatch"), 0)

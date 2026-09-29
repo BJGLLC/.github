@@ -16,5 +16,7 @@ esac
 # A PR's own .gitleaksignore is never honoured: gitleaks also reads one from the scan source, so the
 # source is the git dir (no such file there) and -i points at an empty dir. Inline gitleaks:allow still works.
 noignore="$(mktemp -d)"; trap 'rm -rf "$noignore"' EXIT
+# --diff-merges=remerge: `git log -p` prints no patch for merges, so a secret added only by a merge
+# commit (an evil merge or conflict resolution) would go unscanned; remerge diffs against the auto-merge.
 echo "gitleaks range: $range"
-gitleaks git --no-banner --redact --config "$cfg" --gitleaks-ignore-path "$noignore" --log-opts "$range" "$(git rev-parse --absolute-git-dir)"
+gitleaks git --no-banner --redact --config "$cfg" --gitleaks-ignore-path "$noignore" --log-opts "--diff-merges=remerge $range" "$(git rev-parse --absolute-git-dir)"
