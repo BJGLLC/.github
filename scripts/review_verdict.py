@@ -91,8 +91,10 @@ def is_gate_marker(comment):
 def tampered(thread):
     """SSSF-38: the first (Codex) comment was edited by someone other than Codex, so its badge
     cannot be trusted (P1 -> P3 downgrade)."""
-    ed = thread["comments"][0].get("editor")
-    return bool(ed) and not is_codex(ed)
+    first = thread["comments"][0]
+    ed = first.get("editor")
+    # a null editor with an edit time is a deleted account: fail closed
+    return bool(first.get("last_edited_at") or ed) and not is_codex(ed)
 
 
 def priority(thread):
@@ -406,7 +408,7 @@ def fetch(repo, number):
         "comments": comments,
         "threads": [{"id": t["id"], "is_resolved": t["isResolved"], "comments": [
             {"author": login(c["author"]), "author_type": (c["author"] or {}).get("__typename", ""),
-             "editor": login(c.get("editor")) or None, "body": c["body"], "created_at": c["createdAt"],
+             "editor": login(c.get("editor")) or None, "last_edited_at": c.get("lastEditedAt"), "body": c["body"], "created_at": c["createdAt"],
              "commit_sha": (c["commit"] or {}).get("oid", "")} for c in t["comments"]["nodes"]]} for t in p["reviewThreads"]["nodes"]],
         "nudged": is_nudged(comments, head_pushed_at),
         "asked_at": derive_asked_at(head_pushed_at, [p["createdAt"], *(e["createdAt"] for e in p["timelineItems"]["nodes"] if e.get("createdAt"))]),

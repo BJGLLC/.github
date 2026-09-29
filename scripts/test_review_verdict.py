@@ -1506,6 +1506,19 @@ class EditedFirstComment(unittest.TestCase):  # SSSF-38: a write-access actor ed
         self.assertEqual(self.edited(CODEX)["state"], "success")
         self.assertEqual(self.edited(CODEX + "[bot]")["queue"], ["T1"])
 
+    def test_an_edit_by_a_deleted_account_fails_closed(self):  # GitHub reports a null editor
+        t = thread("T1", 3, 3); t["comments"][0]["editor"] = None; t["comments"][0]["last_edited_at"] = iso(T0)
+        v = compute(pr(reviews=[review(3)], threads=[t]), self.NOW)
+        self.assertEqual(v["state"], "failure"); self.assertIn("T1", v["description"])
+
+    def test_no_editor_and_no_edit_time_is_normal(self):
+        t = thread("T1", 3, 3); t["comments"][0]["editor"] = None; t["comments"][0]["last_edited_at"] = None
+        self.assertEqual(compute(pr(reviews=[review(3)], threads=[t]), self.NOW)["queue"], ["T1"])
+
+    def test_codex_as_editor_with_an_edit_time_is_normal(self):
+        t = thread("T1", 3, 3); t["comments"][0]["editor"] = CODEX; t["comments"][0]["last_edited_at"] = iso(T0)
+        self.assertEqual(compute(pr(reviews=[review(3)], threads=[t]), self.NOW)["queue"], ["T1"])
+
     def test_never_edited_is_normal(self):
         self.assertEqual(self.edited(None)["queue"], ["T1"])
 
@@ -1529,7 +1542,9 @@ class EditedFirstComment(unittest.TestCase):  # SSSF-38: a write-access actor ed
         orig = rv.gh; rv.gh = lambda *a, **k: json.dumps(gql); self.addCleanup(setattr, rv, "gh", orig)
         first, second = rv.fetch("o/r", 7)["threads"][0]["comments"]
         self.assertEqual((first["editor"], first["author_type"]), ("blakejgruber", "Bot"))
+        self.assertEqual(first["last_edited_at"], iso(T0))
         self.assertEqual((second["editor"], second["author_type"]), (None, "Bot"))
+        self.assertIsNone(second["last_edited_at"])
 
     def test_the_fetch_query_selects_the_editor(self):
         self.assertIn("editor{login __typename}", rv.GQL); self.assertIn("lastEditedAt", rv.GQL)
