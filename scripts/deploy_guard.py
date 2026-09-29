@@ -89,8 +89,8 @@ def deployment_request(sha, env, reason, run_url, rolled_back_from=""):
 
 def freezes_to_close(freezes, decided_at):
     """Close only freezes that existed when the guard said go, so a freeze opened meanwhile by a
-    concurrent bin/rollback survives this deploy."""
-    return [f["number"] for f in freezes if f["created_at"] <= decided_at]
+    concurrent bin/rollback survives this deploy. Strict <: a freeze from the same second stays open."""
+    return [f["number"] for f in freezes if f["created_at"] < decided_at]
 
 
 # ---- I/O (thin; exercised by the Task 7 live run and the drills) -----------------------------
@@ -146,6 +146,7 @@ def now():
 def gather(repo, sha, reason, env, force, has_alias):
     full = gh("api", f"repos/{repo}/commits/{sha}", "--jq", ".sha")  # expands a short SHA; unknown SHA -> error
     tip = gh("api", f"repos/{repo}/commits/main", "--jq", ".sha")
+    decided_at = now()  # before the freezes are read, so a freeze opened later is never older than this
     deps = ledger(repo, env)
     live = pick_live(deps)
     pr, labels = pr_of(repo, full)
@@ -153,7 +154,7 @@ def gather(repo, sha, reason, env, force, has_alias):
             "on_main": ancestor_or_equal(repo, full, tip), "ci": ci_state(repo, full), "live_sha": live,
             "newer_than_live": bool(live) and live != full and ancestor_or_equal(repo, live, full),
             "ledger_success_shas": [d["sha"] for d in deps if d["state"] == "success"],
-            "freezes": [f["number"] for f in open_freezes(repo, env)], "pr": pr, "pr_labels": labels, "now": now()}
+            "freezes": [f["number"] for f in open_freezes(repo, env)], "pr": pr, "pr_labels": labels, "now": decided_at}
 
 
 def record(a):
@@ -170,11 +171,8 @@ def record(a):
 
 
 def freeze_open(a):
-    existing = open_freezes(a.repo, a.env)
-    if existing:
-        n = existing[0]["number"]
-        gh("issue", "comment", str(n), "-R", a.repo, "--body", f"Rolled back again: `{a.frm[:7]}` -> `{a.to[:7]}` ({a.run_url}).")
-        return n
+    # One issue per rollback event, never reused: a hotfix deploy closes only the freezes that existed
+    # when it decided, so a rollback that lands mid-deploy keeps its own freeze.
     gh("label", "create", FREEZE_LABEL, "-R", a.repo, "--color", "B60205",
        "--description", "Review v4: forward deploys held after a rollback", "--force")
     url = gh("issue", "create", "-R", a.repo, "--label", FREEZE_LABEL,

@@ -1,6 +1,10 @@
 # scripts/test_deploy_guard.py
+import json
+import types
 import unittest
+from unittest import mock
 
+import deploy_guard
 from deploy_guard import decide, deployment_request, freezes_to_close, pick_live, pick_previous
 
 A, B, C = "a" * 40, "b" * 40, "c" * 40
@@ -93,6 +97,33 @@ class Ledger(unittest.TestCase):
     def test_freezes_to_close_ignores_freezes_newer_than_the_decision(self):
         fz = [{"number": 1, "created_at": "2026-10-01T00:00:00Z"}, {"number": 2, "created_at": "2026-10-01T00:05:00Z"}]
         self.assertEqual(freezes_to_close(fz, "2026-10-01T00:01:00Z"), [1])
+
+    def test_freeze_opened_after_the_decision_survives(self):
+        fz = [{"number": 1, "created_at": "2026-10-01T00:00:00Z"}, {"number": 2, "created_at": "2026-10-01T00:00:30Z"}]
+        self.assertEqual(freezes_to_close(fz, "2026-10-01T00:00:10Z"), [1])
+
+    def test_freeze_created_in_the_same_second_as_the_decision_survives(self):
+        fz = [{"number": 1, "created_at": "2026-10-01T00:01:00Z"}]
+        self.assertEqual(freezes_to_close(fz, "2026-10-01T00:01:00Z"), [])
+
+
+class FreezeOpen(unittest.TestCase):
+    def test_creates_a_new_issue_even_when_a_freeze_is_already_open(self):
+        calls = []
+
+        def fake_gh(*args, stdin=None):
+            calls.append(args)
+            if args[0] == "api":
+                return json.dumps([{"number": 7, "created_at": "2026-10-01T00:00:00Z", "title": "deploy-freeze [production]: x"}])
+            if args[:2] == ("issue", "create"):
+                return "https://github.com/BJGLLC/r/issues/8"
+            return ""
+
+        a = types.SimpleNamespace(repo="BJGLLC/r", env="production", frm=A, to=B, run_url="https://run")
+        with mock.patch.object(deploy_guard, "gh", fake_gh):
+            self.assertEqual(deploy_guard.freeze_open(a), 8)
+        self.assertTrue(any(c[:2] == ("issue", "create") for c in calls))
+        self.assertFalse(any(c[:2] == ("issue", "comment") for c in calls))
 
 
 if __name__ == "__main__":
