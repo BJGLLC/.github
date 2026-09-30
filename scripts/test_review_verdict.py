@@ -294,6 +294,11 @@ class PushedAtHelper(unittest.TestCase):
         ]}}}
         self.assertEqual(pushed_at(node), "2026-09-27T02:39:58Z")
 
+    def test_fetch_query_asks_only_for_github_actions_suites(self):
+        # A private App's suite makes `app{slug}` unresolvable for the Actions token and 403s the
+        # whole query, so the suites are filtered server-side to GitHub Actions (app id 15368).
+        self.assertIn("checkSuites(first:20, filterBy:{appId:15368})", rv.GQL)
+
     def test_falls_back_to_committed_date_without_matching_suites(self):
         node = {"commit": {"committedDate": "2026-09-27T02:37:02Z", "checkSuites": {"nodes": [
             {"createdAt": "2026-09-27T02:38:00Z", "app": {"slug": "some-other-app"}},
