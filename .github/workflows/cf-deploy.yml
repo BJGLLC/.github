@@ -108,7 +108,7 @@ jobs:
 
   ship:
     needs: guard
-    if: needs.guard.outputs.go == 'true'
+    if: needs.guard.outputs.go == 'true' && needs.guard.outputs.ship_build != ''
     permissions: { contents: read }
     uses: BJGLLC/.github/.github/workflows/cf-ship.yml@main
     with:

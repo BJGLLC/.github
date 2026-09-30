@@ -37,7 +37,7 @@ BUILD_KEYS = ("kind", "node", "install", "build", "out_dir", "cf_project")
 TRUSTED_CREATOR = "github-actions[bot]"
 # setup-node version specs (20, 20.x, 20.11.1, lts/*, lts/iron, >=20, ^20, ~20.1, node, latest). Only ever fed
 # to `with: node-version`, never a run: block, so the charset just has to be inert.
-NODE_RE = re.compile(r"^[A-Za-z0-9^~<>=*][A-Za-z0-9._*/<>=^~ -]{0,31}$")
+NODE_RE = re.compile(r"^(?!.*\.\.)[A-Za-z0-9^~<>=*][A-Za-z0-9._*/<>=^~ -]{0,31}$")
 OUT_DIR_RE = re.compile(r"^[A-Za-z0-9._/-]*$")
 FREEZE_BODY = ("{env} was rolled back from `{frm}` to `{to}` ({run}).\n\n"
                "Forward deploys are held: the deploy guard skips every SHA whose PR is not labelled `hotfix` "
@@ -74,6 +74,11 @@ def decide(c):
         if cur is None:  # a caller with no CF build params (eos-deploy): the params rule does not apply
             return {**base, "go": True, "message": f"go: rollback to {s7}{noop}"}
         tb = c.get("target_build")
+        if not tb and c["sha"] == live and not c.get("seedable"):
+            # After a failed smoke the ledger still names the previous SHA live while the failed deploy serves,
+            # and this run's inputs are the failed deploy's: re-shipping would bring the original defect back.
+            return no(f"refused: cannot seed {s7}: the newest deploy record is not its success; "
+                      "use `bin/rollback <name> --revert`")
         if not tb and c["sha"] == live:
             # Seeding: re-ship the live SHA with this run's inputs (attended, and exactly what is live); the
             # green verify then writes the first trusted record. Every other no-record case refuses.
@@ -260,6 +265,7 @@ def gather(repo, sha, reason, env, force, has_alias, current_build=None):
     return {"sha": full, "reason": reason, "env": env, "force_smoke_fail": force, "has_drill_alias": has_alias,
             "on_main": ancestor_or_equal(repo, full, tip), "ci": ci_state(repo, full), "live_sha": live, "live_build": recorded_build(deps, live) if live else None,
             "current_build": current_build, "target_build": target,
+            "seedable": bool(deps) and deps[0]["state"] == "success" and deps[0]["sha"] == live,
             "newer_than_live": bool(live) and live != full and ancestor_or_equal(repo, live, full),
             "ledger_success_shas": [d["sha"] for d in deps if d["state"] == "success"],
             "freezes": [f["number"] for f in open_freezes(repo, env)], "pr": pr, "pr_labels": labels, "now": decided_at}
@@ -310,7 +316,7 @@ def main(argv=None):
     d.add_argument("--env", required=True)
     d.add_argument("--force-smoke-fail", action="store_true")
     d.add_argument("--no-drill-alias", action="store_true")
-    d.add_argument("--current-build", default="", help="JSON of this run's kind/node/install/build/out_dir/cf_project")
+    d.add_argument("--current-build", default=None, help="JSON of this run's kind/node/install/build/out_dir/cf_project")
     r = sub.add_parser("record")
     for f in ("--repo", "--sha", "--env", "--reason", "--url", "--run-url"):
         r.add_argument(f, required=True)
@@ -331,16 +337,14 @@ def main(argv=None):
         fc.add_argument(f, required=True)
     fc.add_argument("--pr", default="")
     a = p.parse_args(argv)
-    if a.cmd == "decide" and a.current_build:
+    if a.cmd == "decide" and a.current_build is not None:
         try:
-            cur = json.loads(a.current_build)
+            cur = json.loads(a.current_build)  # "" is an error: absent means eos mode, never empty
         except ValueError:
             cur = None
         if not valid_build(cur):
             p.error("--current-build must be a JSON object of strings with keys " + ", ".join(BUILD_KEYS))
         a.current_build = cur
-    elif a.cmd == "decide":
-        a.current_build = None
     if a.cmd == "record" and a.build_json:
         try:
             ok = valid_build(json.loads(a.build_json))

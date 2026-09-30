@@ -152,6 +152,9 @@ class CfDeploy(unittest.TestCase):
             self.assertNotIn("inputs.", w[k])
         self.assertEqual(self.j["guard"]["outputs"]["ship_build"], "${{ steps.d.outputs.ship_build }}")
 
+    def test_ship_never_runs_without_a_resolved_ship_build(self):
+        self.assertEqual(self.j["ship"]["if"], "needs.guard.outputs.go == 'true' && needs.guard.outputs.ship_build != ''")
+
     def test_decide_receives_this_runs_params_through_env(self):
         step = self._step("guard", "id", "d")
         for k in ("KIND", "NODE", "INSTALL", "BUILD", "OUT_DIR", "PROJ"):

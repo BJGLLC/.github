@@ -19,7 +19,7 @@ def ctx(**kw):
     c = {"sha": B, "reason": "deploy", "env": "production", "on_main": True, "ci": "success",
          "live_sha": A, "newer_than_live": True, "ledger_success_shas": [A], "freezes": [],
          "pr": 12, "pr_labels": [], "now": "2026-10-01T00:00:00Z", "has_drill_alias": True,
-         "current_build": BUILD_B, "live_build": BUILD_A, "target_build": BUILD_A}
+         "current_build": BUILD_B, "live_build": BUILD_A, "target_build": BUILD_A, "seedable": True}
     c.update(kw)
     return c
 
@@ -313,6 +313,66 @@ class RecordedBuild(unittest.TestCase):
         tb = recorded_build([forged], A)
         d = decide(ctx(reason="rollback", sha=A, live_sha=A, target_build=tb, current_build=BUILD_B))
         self.assertEqual(json.loads(d["ship_build"]), BUILD_B)
+
+    def test_seeding_needs_the_newest_record_to_be_the_live_shas_success(self):
+        r = decide(ctx(reason="rollback", sha=A, live_sha=A, target_build=None, seedable=False))
+        self.assertFalse(r["go"])
+        self.assertEqual(r["ship_build"], "")
+        self.assertIn("cannot seed aaaaaaa: the newest deploy record is not its success", r["message"])
+        self.assertIn("bin/rollback <name> --revert", r["message"])
+
+    def _gather(self, deps):
+        fakes = {"gh": lambda *a, **k: A, "now": lambda: "t", "ledger": lambda *a: deps, "pr_of": lambda *a: (None, []),
+                 "ancestor_or_equal": lambda *a: True, "ci_state": lambda *a: "success", "open_freezes": lambda *a: []}
+        with contextlib.ExitStack() as st:
+            for k, v in fakes.items():
+                st.enter_context(mock.patch.object(deploy_guard, k, v))
+            return deploy_guard.gather("o/r", A, "rollback", "production", False, True, BUILD_B)
+
+    def test_failed_smoke_then_rollback_of_the_previous_sha_refuses(self):
+        # A was live without params; B deployed, failed smoke (its failure record is newest); B still serves.
+        deps = [self.dep(B, "failure", {}), self.dep(A, "success", {})]
+        c = self._gather(deps)
+        self.assertEqual(c["live_sha"], A)
+        self.assertFalse(c["seedable"])
+        d = decide(c)
+        self.assertFalse(d["go"])
+        self.assertIn("cannot seed", d["message"])
+
+    def test_a_clean_live_sha_seed_still_ships(self):
+        c = self._gather([self.dep(A, "success", {}), self.dep(C, "success", {"build": BUILD_A})])
+        self.assertTrue(c["seedable"])
+        d = decide(c)
+        self.assertTrue(d["go"])
+        self.assertEqual(json.loads(d["ship_build"]), BUILD_B)
+
+    def test_a_ship_failed_run_writes_no_record_so_it_cannot_make_seeding_pass(self):
+        # ship failed -> verify/record never ran: the ledger's newest record is still the old success, which
+        # is the truth (the old build is still serving), so seeding is allowed only for that SHA.
+        c = self._gather([self.dep(A, "success", {})])
+        self.assertTrue(c["seedable"])
+        self.assertFalse(self._gather([]).get("seedable"))
+        self.assertFalse(self._gather([self.dep(A, "pending", {})]).get("seedable"))
+
+    def test_an_empty_current_build_is_an_error_not_eos_mode(self):
+        for val in ("", "{}", "null"):
+            with self.subTest(val=val), contextlib.redirect_stderr(io.StringIO()), \
+                    mock.patch.object(deploy_guard, "gather", side_effect=AssertionError("must fail before gather")), \
+                    self.assertRaises(SystemExit):
+                deploy_guard.main(["decide", "--repo", "o/r", "--sha", B, "--reason", "deploy", "--env", "production",
+                                   "--current-build", val])
+
+    def test_an_absent_current_build_is_eos_mode(self):
+        seen = []
+        with mock.patch.object(deploy_guard, "gather", lambda *a: seen.append(a) or ctx(current_build=None, live_build=None)), \
+                contextlib.redirect_stdout(io.StringIO()):
+            deploy_guard.main(["decide", "--repo", "o/r", "--sha", B, "--reason", "deploy", "--env", "production"])
+        self.assertIsNone(seen[0][-1])
+
+    def test_node_specs_with_dot_dot_are_rejected(self):
+        for v in ("..", "20..1", "lts/../x", "../20"):
+            with self.subTest(v=v):
+                self.assertNotEqual(deploy_guard.build_problem({**BUILD_A, "node": v}, BUILD_A), "")
 
     def test_setup_node_version_specs(self):
         ok = ("20", "20.x", "20.11.1", "lts/*", "lts/iron", ">=20", "^20", "~20.1", "node", "latest", ">=20 <23", "22")
