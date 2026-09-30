@@ -137,15 +137,34 @@ class CfDeploy(unittest.TestCase):
         derived = {"sha", "cf_branch"}  # the rollback target / the environment, not a build param
         self.assertEqual(set(ship) - derived, set(self.BUILD_KEYS))
 
-    def test_successful_deploy_records_its_build_params(self):
+    def test_successful_deploy_records_what_actually_shipped(self):
         step = self._step("verify", "name", "Record in the deployment ledger")
         self.assertIn("--build-json", step["run"])
-        for k in ("NODE", "INSTALL", "BUILD", "OUT_DIR", "KIND", "PROJ"):
-            self.assertIn(k, step["env"])
-        self.assertIn("inputs.node", step["env"]["NODE"])
-        self.assertIn("inputs.build", step["env"]["BUILD"])
-        self.assertIn("inputs.out_dir", step["env"]["OUT_DIR"])
-        self.assertIn("jq -n", step["run"])  # built with jq --arg from env, never spliced into the JSON
+        self.assertEqual(step["env"]["SHIP_BUILD"], "${{ needs.guard.outputs.ship_build }}")
+        self.assertNotIn("inputs.", "\n".join(str(v) for k, v in step["env"].items() if k in ("SHIP_BUILD",)))
+
+    def test_every_ship_path_reads_the_guards_ship_build_unconditionally(self):
+        w = self.j["ship"]["with"]
+        for k in self.BUILD_KEYS:
+            self.assertEqual(w[k], "${{ fromJSON(needs.guard.outputs.ship_build)." + k + " }}", k)
+            self.assertNotIn("||", w[k])
+            self.assertNotIn("&&", w[k])
+        self.assertEqual(self.j["guard"]["outputs"]["ship_build"], "${{ steps.d.outputs.ship_build }}")
+
+    def test_decide_receives_this_runs_params_through_env(self):
+        step = self._step("guard", "id", "d")
+        for k in ("KIND", "NODE", "INSTALL", "BUILD", "OUT_DIR", "PROJ"):
+            self.assertIn("inputs.", step["env"][k], k)
+        self.assertIn("--current-build", step["run"])
+        self.assertIn("jq -nc", step["run"])
+        self.assertIn("::warning::", step["run"])
+
+    def test_no_params_notifications_are_truthful(self):
+        run = self._step("report", "name", "PR comment + Linear")["run"]
+        self.assertIn("--rollback-hint", run)
+        self.assertIn('[ -z "$PREV_BUILD" ]', run)
+        self.assertIn("Nothing was rolled back", run)
+        self.assertIn('--state "$STATE"', self._step("report", "id", "fz")["run"])
 
     def test_rollback_ship_uses_the_targets_recorded_params_not_inputs(self):
         w = self.j["rollback-ship"]["with"]
@@ -181,7 +200,10 @@ class CfDeploy(unittest.TestCase):
         for name, job in self.j.items():
             for s in job.get("steps", []):
                 self.assertNotIn("prev_build", s.get("run", ""), (name, s.get("name")))
-                self.assertNotRegex(s.get("run", ""), r"\$\{\{[^}]*(inputs\.(install|build|node|out_dir)|prev_build)", (name, s.get("name")))
+                self.assertNotIn("ship_build", s.get("run", ""), (name, s.get("name")))
+        # and the consumer: cf-ship's scripts take everything through env:, never an expression
+        for s in load("cf-ship.yml")["jobs"]["ship"]["steps"]:
+            self.assertNotIn("${{", s.get("run", ""), s.get("name"))
 
     def test_env_and_kind_are_validated(self):
         run = next(s["run"] for s in self.j["guard"]["steps"] if s.get("id") == "u")

@@ -71,6 +71,16 @@ class Body(unittest.TestCase):
     def test_noop_rollback_reads_as_redeploy(self):
         self.assertIn("Redeployed", body("rolled-back", "s", "BJGLLC/x", A, A))
 
+    def test_no_params_body_never_claims_a_rollback_or_an_unknown_state(self):
+        hint = "Nothing was rolled back: rollback target `abcdef0` has no trusted recorded build params."
+        text = body("smoke-failed-no-target", "site", "BJGLLC/r", A, B, "https://run", 9, rollback_hint=hint)
+        self.assertIn("NOT rolled back", text)
+        self.assertIn("still live", text)
+        self.assertIn(hint, text)
+        self.assertNotIn("UNKNOWN", text)
+        self.assertNotIn("Rolled back", text)
+        self.assertIn("UNKNOWN", body("smoke-failed-no-target", "site", "BJGLLC/r", A, B))  # no hint: unchanged
+
     def test_unknown_outcome_says_unknown(self):
         self.assertIn("UNKNOWN", body("rollback-failed", "s", "BJGLLC/x", A, B))
 
