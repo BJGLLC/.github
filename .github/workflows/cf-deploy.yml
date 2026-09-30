@@ -44,6 +44,7 @@ jobs:
       from_sha: ${{ steps.d.outputs.from_sha }}
       pr: ${{ steps.d.outputs.pr }}
       decided_at: ${{ steps.d.outputs.decided_at }}
+      prev_build: ${{ steps.d.outputs.prev_build }}
       version_url: ${{ steps.u.outputs.version_url }}
       health_url: ${{ steps.u.outputs.health_url }}
       cf_branch: ${{ steps.u.outputs.cf_branch }}
@@ -146,28 +147,44 @@ jobs:
           REASON: ${{ inputs.reason }}
           URL: ${{ needs.guard.outputs.health_url || needs.guard.outputs.version_url }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          # The params this SHA shipped with, stored in its ledger record. A later rollback to this SHA
+          # rebuilds with these, not with whatever the failed deploy's inputs are then.
+          KIND: ${{ inputs.kind }}
+          NODE: ${{ inputs.node }}
+          INSTALL: ${{ inputs.install }}
+          BUILD: ${{ inputs.build }}
+          OUT_DIR: ${{ inputs.out_dir }}
+          PROJ: ${{ inputs.cf_project }}
         run: |
           # Non-fatal, like eos-deploy's "WARN ledger write failed": a red verify would make the
           # implicit success() skip rollback-ship and leave a failed smoke live.
           state=failure; [ "$OK" = true ] && state=success
           from=""; [ "$REASON" = rollback ] && from="$FROM"
+          build=""
+          if [ "$state" = success ]; then
+            build="$(jq -nc --arg kind "$KIND" --arg node "$NODE" --arg install "$INSTALL" --arg build "$BUILD" \
+              --arg out_dir "$OUT_DIR" --arg cf_project "$PROJ" \
+              '{kind: $kind, node: $node, install: $install, build: $build, out_dir: $out_dir, cf_project: $cf_project}')"
+          fi
           python3 .deploylib/scripts/deploy_guard.py record --repo "$GITHUB_REPOSITORY" --sha "$SHA" --env "$LENV" \
-            --state "$state" --reason "$REASON" --url "$URL" --run-url "$RUN_URL" --from "$from" \
+            --state "$state" --reason "$REASON" --url "$URL" --run-url "$RUN_URL" --from "$from" --build-json "$build" \
             || echo "::warning::ledger write failed; the smoke verdict still drives the rollback"
 
   rollback-ship:
     needs: [guard, verify]
-    if: ${{ !cancelled() && needs.guard.result == 'success' && (needs.verify.outputs.ok == 'false' || (needs.verify.result == 'failure' && needs.verify.outputs.ok != 'true')) && inputs.reason == 'deploy' && needs.guard.outputs.prev_sha != '' }}
+    if: ${{ !cancelled() && needs.guard.result == 'success' && (needs.verify.outputs.ok == 'false' || (needs.verify.result == 'failure' && needs.verify.outputs.ok != 'true')) && inputs.reason == 'deploy' && needs.guard.outputs.prev_sha != '' && needs.guard.outputs.prev_build != '' }}
+    # The target is rebuilt with the params IT deployed with (recorded in the ledger), never the failed
+    # deploy's inputs: a changed node / build / out_dir must not break the way back. No record -> no ship.
     permissions: { contents: read }
     uses: BJGLLC/.github/.github/workflows/cf-ship.yml@main
     with:
       sha: ${{ needs.guard.outputs.prev_sha }}
-      kind: ${{ inputs.kind }}
-      node: ${{ inputs.node }}
-      install: ${{ inputs.install }}
-      build: ${{ inputs.build }}
-      out_dir: ${{ inputs.out_dir }}
-      cf_project: ${{ inputs.cf_project }}
+      kind: ${{ fromJSON(needs.guard.outputs.prev_build || '{}').kind }}
+      node: ${{ fromJSON(needs.guard.outputs.prev_build || '{}').node }}
+      install: ${{ fromJSON(needs.guard.outputs.prev_build || '{}').install }}
+      build: ${{ fromJSON(needs.guard.outputs.prev_build || '{}').build }}
+      out_dir: ${{ fromJSON(needs.guard.outputs.prev_build || '{}').out_dir }}
+      cf_project: ${{ fromJSON(needs.guard.outputs.prev_build || '{}').cf_project }}
       cf_branch: ${{ needs.guard.outputs.cf_branch }}
     secrets: inherit
 
@@ -206,10 +223,13 @@ jobs:
           OK: ${{ steps.s.outputs.ok }}
           URL: ${{ needs.guard.outputs.health_url || needs.guard.outputs.version_url }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          PREV_BUILD: ${{ needs.guard.outputs.prev_build }}
         run: |
           state=failure; [ "$OK" = true ] && state=success
+          # Keep the target's own params on its new record, so it stays rollback-able.
+          build=""; [ "$state" = success ] && build="$PREV_BUILD"
           python3 .deploylib/scripts/deploy_guard.py record --repo "$GITHUB_REPOSITORY" --sha "$SHA" --env "$LENV" \
-            --state "$state" --reason auto-rollback --url "$URL" --run-url "$RUN_URL" --from "$BAD"
+            --state "$state" --reason auto-rollback --url "$URL" --run-url "$RUN_URL" --from "$BAD" --build-json "$build"
 
   report:
     needs: [guard, ship, verify, rollback-ship, rollback-verify]
@@ -246,6 +266,14 @@ jobs:
             deployed)
               python3 .deploylib/scripts/deploy_guard.py freeze-close --repo "$GITHUB_REPOSITORY" --env "$LENV" --sha "$SHA" --pr "$PR" --decided-at "$DECIDED" ;;
           esac
+      - name: Rollback target has no recorded build params
+        if: ${{ !cancelled() && inputs.reason == 'deploy' && needs.ship.result == 'success' && needs.verify.outputs.ok != 'true' && needs.guard.outputs.prev_sha != '' && needs.guard.outputs.prev_build == '' }}
+        run: |
+          # rollback-ship was skipped (it never rebuilds with guessed inputs), so the state is
+          # smoke-failed-no-target and the freeze step above opened the freeze. Make the manual step loud.
+          msg="rollback target ${PREV:0:7} has no recorded build params; manual rollback needed"
+          echo "::error::$msg"
+          { echo "### $msg"; echo; echo "Run \`bin/rollback\` for this surface from a box with gh."; } >> "$GITHUB_STEP_SUMMARY"
       - name: PR comment + Linear
         if: ${{ !cancelled() && steps.st.outputs.state != '' }}
         env:

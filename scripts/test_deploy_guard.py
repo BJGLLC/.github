@@ -8,9 +8,11 @@ import unittest
 from unittest import mock
 
 import deploy_guard
-from deploy_guard import decide, deployment_request, freezes_to_close, pick_live, pick_previous
+from deploy_guard import decide, deployment_request, freezes_to_close, pick_live, pick_previous, recorded_build
 
 A, B, C = "a" * 40, "b" * 40, "c" * 40
+BUILD_A = {"kind": "pages", "node": "20", "install": "npm ci", "build": "npm run build", "out_dir": "dist", "cf_project": "site"}
+BUILD_B = {**BUILD_A, "node": "22", "out_dir": "build"}
 
 
 def ctx(**kw):
@@ -108,6 +110,84 @@ class Ledger(unittest.TestCase):
     def test_freeze_created_in_the_same_second_as_the_decision_survives(self):
         fz = [{"number": 1, "created_at": "2026-10-01T00:01:00Z"}]
         self.assertEqual(freezes_to_close(fz, "2026-10-01T00:01:00Z"), [])
+
+
+class RecordedBuild(unittest.TestCase):
+    """Rollback rebuilds the target with the params it deployed with, never the failed deploy's."""
+
+    def dep(self, sha, state, payload=None):
+        return {"sha": sha, "state": state, "created_at": "", "payload": payload or {}}
+
+    def test_deployment_request_carries_the_build_params(self):
+        r = deployment_request(A, "production", "deploy", "https://run", build=BUILD_A)
+        self.assertEqual(r["payload"]["build"], BUILD_A)
+        self.assertNotIn("build", deployment_request(A, "production", "deploy", "https://run")["payload"])
+
+    def test_recorded_build_reads_the_newest_success_of_that_sha(self):
+        deps = [self.dep(B, "success", {"build": BUILD_B}), self.dep(A, "failure", {"build": BUILD_B}),
+                self.dep(A, "success", {"build": BUILD_A})]
+        self.assertEqual(recorded_build(deps, A), BUILD_A)
+        self.assertEqual(recorded_build(deps, B), BUILD_B)
+
+    def test_no_record_or_incomplete_record_means_none(self):
+        self.assertIsNone(recorded_build([self.dep(A, "success")], A))  # deployed before params were recorded
+        self.assertIsNone(recorded_build([self.dep(A, "failure", {"build": BUILD_A})], A))
+        self.assertIsNone(recorded_build([self.dep(A, "success", {"build": {"node": "20"}})], A))
+        self.assertIsNone(recorded_build([self.dep(A, "success", {"build": "npm ci"})], A))
+        self.assertIsNone(recorded_build([], A))
+
+    def test_decide_hands_the_targets_params_to_the_rollback(self):
+        d = decide(ctx(live_build=BUILD_A))
+        self.assertEqual(json.loads(d["prev_build"]), BUILD_A)
+        self.assertNotIn("\n", d["prev_build"])  # one line: it goes through $GITHUB_OUTPUT
+
+    def test_decide_without_recorded_params_says_so(self):
+        self.assertEqual(decide(ctx())["prev_build"], "")
+        self.assertEqual(decide(ctx(live_build=None))["prev_build"], "")
+        self.assertEqual(decide(ctx(ci="failure", live_build=BUILD_A))["prev_build"], "")
+
+    def test_gather_looks_up_the_live_shas_params(self):
+        fakes = {
+            "gh": lambda *a, **k: "f" * 40, "now": lambda: "2026-10-01T00:00:00Z",
+            "ledger": lambda *a: [self.dep(A, "success", {"build": BUILD_A})],
+            "pr_of": lambda *a: (None, []), "ancestor_or_equal": lambda *a: True,
+            "ci_state": lambda *a: "success", "open_freezes": lambda *a: [],
+        }
+        with contextlib.ExitStack() as st:
+            for k, v in fakes.items():
+                st.enter_context(mock.patch.object(deploy_guard, k, v))
+            c = deploy_guard.gather("o/r", "f" * 40, "deploy", "production", False, True)
+        self.assertEqual(c["live_sha"], A)
+        self.assertEqual(c["live_build"], BUILD_A)
+
+    def test_record_stores_the_params_in_the_deployment_payload(self):
+        posted = []
+
+        def fake_gh(*args, stdin=None):
+            posted.append((args, stdin))
+            return json.dumps({"id": 5})
+
+        a = types.SimpleNamespace(repo="BJGLLC/r", sha=B, env="production", reason="deploy", url="https://x",
+                                  run_url="https://run", state="success", from_sha=A, build_json=json.dumps(BUILD_B))
+        with mock.patch.object(deploy_guard, "gh", fake_gh):
+            deploy_guard.record(a)
+        payload = json.loads(posted[0][1])["payload"]
+        self.assertEqual(payload["build"], BUILD_B)
+        self.assertEqual(payload["rolled_back_from"], A)
+
+    def test_record_without_params_writes_none(self):
+        posted = []
+        a = types.SimpleNamespace(repo="BJGLLC/r", sha=B, env="production", reason="deploy", url="",
+                                  run_url="", state="failure", from_sha="", build_json="")
+        with mock.patch.object(deploy_guard, "gh", lambda *x, stdin=None: posted.append(stdin) or json.dumps({"id": 1})):
+            deploy_guard.record(a)
+        self.assertNotIn("build", json.loads(posted[0])["payload"])
+
+    def test_record_cli_rejects_malformed_params(self):
+        for bad in ("not json", "[]", json.dumps({"node": "20"})):
+            with self.subTest(bad=bad), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                deploy_guard.main(["record", "--repo", "o/r", "--sha", B, "--env", "production", "--reason", "deploy",
+                                   "--url", "", "--run-url", "", "--state", "success", "--build-json", bad])
 
 
 class FreezeOpen(unittest.TestCase):

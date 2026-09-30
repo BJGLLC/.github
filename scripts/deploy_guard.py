@@ -12,6 +12,8 @@ decide() is pure and unit-tested. Rules, in order:
   5. reason=deploy skips while a `deploy-freeze` issue is open for the env, unless the SHA's PR
      has the `hotfix` label (spec §8: rollback first, hotfix second).
 The ledger is GitHub Deployments. A deploy's auto-rollback target is whatever was live.
+Each successful deploy records the build params it shipped with (payload.build); a rollback rebuilds
+the target with THOSE, never the failed deploy's inputs. No record -> no rollback ship, loudly.
 """
 import argparse
 import datetime
@@ -20,6 +22,8 @@ import subprocess
 import sys
 
 FREEZE_LABEL, HOTFIX_LABEL, ACTIONS_APP = "deploy-freeze", "hotfix", "github-actions"
+# Every cf-ship input that can differ per revision (sha and cf_branch are per-run, not build params).
+BUILD_KEYS = ("kind", "node", "install", "build", "out_dir", "cf_project")
 FREEZE_BODY = ("{env} was rolled back from `{frm}` to `{to}` ({run}).\n\n"
                "Forward deploys are held: the deploy guard skips every SHA whose PR is not labelled `hotfix` "
                "until one deploys green. Ship the fix, or the revert that `bin/rollback {name} --revert` opens, "
@@ -29,7 +33,7 @@ FREEZE_BODY = ("{env} was rolled back from `{frm}` to `{to}` ({run}).\n\n"
 def decide(c):
     live = c.get("live_sha") or ""
     base = {"go": False, "sha": c["sha"], "prev_sha": "", "from_sha": live, "pr": c.get("pr") or "",
-            "decided_at": c.get("now", ""), "message": ""}
+            "decided_at": c.get("now", ""), "prev_build": "", "message": ""}
     s7 = c["sha"][:7]
 
     def no(msg):
@@ -57,7 +61,9 @@ def decide(c):
     if c.get("freezes") and HOTFIX_LABEL not in c.get("pr_labels", []):
         return no(f"skip: forward deploys frozen by #{c['freezes'][0]}; ship the fix as a `hotfix` PR")
     tail = f", auto-rollback target {live[:7]}" if live else ", no rollback target on record (first v4 deploy)"
-    return {**base, "go": True, "prev_sha": live, "message": f"go: {s7}{tail}"}
+    lb = c.get("live_build")
+    return {**base, "go": True, "prev_sha": live, "prev_build": json.dumps(lb, sort_keys=True) if lb else "",
+            "message": f"go: {s7}{tail}"}
 
 
 def pick_live(deps):
@@ -78,10 +84,26 @@ def pick_previous(deps):
     return ""
 
 
-def deployment_request(sha, env, reason, run_url, rolled_back_from=""):
+def valid_build(b):
+    return isinstance(b, dict) and all(k in b and isinstance(b[k], str) for k in BUILD_KEYS)
+
+
+def recorded_build(deps, sha):
+    """The build params the newest successful deploy of `sha` shipped with, or None (deployed before
+    params were recorded, or the record is malformed). Never guessed: None means no rollback ship."""
+    for d in deps:
+        if d["sha"] == sha and d["state"] == "success":
+            b = (d.get("payload") or {}).get("build")
+            return {k: b[k] for k in BUILD_KEYS} if valid_build(b) else None
+    return None
+
+
+def deployment_request(sha, env, reason, run_url, rolled_back_from="", build=None):
     payload = {"reason": reason, "run_url": run_url}
     if rolled_back_from:
         payload["rolled_back_from"] = rolled_back_from
+    if build:
+        payload["build"] = build
     return {"ref": sha, "environment": env, "auto_merge": False, "required_contexts": [],
             "production_environment": env.startswith("production"), "transient_environment": env == "drill",
             "description": f"review-v4 {reason}"[:140], "payload": payload}
@@ -155,7 +177,7 @@ def gather(repo, sha, reason, env, force, has_alias):
     live = pick_live(deps)
     pr, labels = pr_of(repo, full)
     return {"sha": full, "reason": reason, "env": env, "force_smoke_fail": force, "has_drill_alias": has_alias,
-            "on_main": ancestor_or_equal(repo, full, tip), "ci": ci_state(repo, full), "live_sha": live,
+            "on_main": ancestor_or_equal(repo, full, tip), "ci": ci_state(repo, full), "live_sha": live, "live_build": recorded_build(deps, live) if live else None,
             "newer_than_live": bool(live) and live != full and ancestor_or_equal(repo, live, full),
             "ledger_success_shas": [d["sha"] for d in deps if d["state"] == "success"],
             "freezes": [f["number"] for f in open_freezes(repo, env)], "pr": pr, "pr_labels": labels, "now": decided_at}
@@ -163,8 +185,9 @@ def gather(repo, sha, reason, env, force, has_alias):
 
 def record(a):
     frm = a.from_sha if a.from_sha and a.from_sha != a.sha else ""
+    build = json.loads(a.build_json) if a.build_json else None
     dep = json.loads(gh("api", "-X", "POST", f"repos/{a.repo}/deployments", "--input", "-",
-                        stdin=json.dumps(deployment_request(a.sha, a.env, a.reason, a.run_url, frm))))
+                        stdin=json.dumps(deployment_request(a.sha, a.env, a.reason, a.run_url, frm, build))))
     status = {"state": a.state, "description": f"{a.reason}: {a.state}", "auto_inactive": False}
     if a.url.startswith("http"):
         status["environment_url"] = a.url
@@ -205,6 +228,7 @@ def main(argv=None):
         r.add_argument(f, required=True)
     r.add_argument("--state", required=True, choices=["success", "failure"])
     r.add_argument("--from", dest="from_sha", default="")
+    r.add_argument("--build-json", default="", help="the build params this deploy shipped with (a rollback reuses them)")
     for name in ("live", "previous"):
         q = sub.add_parser(name)
         q.add_argument("--repo", required=True)
@@ -218,6 +242,13 @@ def main(argv=None):
         fc.add_argument(f, required=True)
     fc.add_argument("--pr", default="")
     a = p.parse_args(argv)
+    if a.cmd == "record" and a.build_json:
+        try:
+            ok = valid_build(json.loads(a.build_json))
+        except ValueError:
+            ok = False
+        if not ok:
+            p.error(f"--build-json must be a JSON object of strings with keys {', '.join(BUILD_KEYS)}")
     if a.cmd == "decide":
         print(json.dumps(decide(gather(a.repo, a.sha, a.reason, a.env, a.force_smoke_fail, not a.no_drill_alias))))
     elif a.cmd == "record":

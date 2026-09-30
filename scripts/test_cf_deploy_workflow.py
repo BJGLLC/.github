@@ -128,6 +128,60 @@ class CfDeploy(unittest.TestCase):
     def test_report_keeps_always(self):
         self.assertIn("always()", self.j["report"]["if"])
 
+    # --- Codex P1: roll back with the target's own recorded build params ---
+    BUILD_KEYS = ("kind", "node", "install", "build", "out_dir", "cf_project")
+
+    def test_ship_inputs_are_all_recorded_or_derived(self):
+        # Every per-revision input cf-ship takes must be in the recorded set (or derived per run).
+        ship = load("cf-ship.yml")["on"]["workflow_call"]["inputs"]
+        derived = {"sha", "cf_branch"}  # the rollback target / the environment, not a build param
+        self.assertEqual(set(ship) - derived, set(self.BUILD_KEYS))
+
+    def test_successful_deploy_records_its_build_params(self):
+        step = self._step("verify", "name", "Record in the deployment ledger")
+        self.assertIn("--build-json", step["run"])
+        for k in ("NODE", "INSTALL", "BUILD", "OUT_DIR", "KIND", "PROJ"):
+            self.assertIn(k, step["env"])
+        self.assertIn("inputs.node", step["env"]["NODE"])
+        self.assertIn("inputs.build", step["env"]["BUILD"])
+        self.assertIn("inputs.out_dir", step["env"]["OUT_DIR"])
+        self.assertIn("jq -n", step["run"])  # built with jq --arg from env, never spliced into the JSON
+
+    def test_rollback_ship_uses_the_targets_recorded_params_not_inputs(self):
+        w = self.j["rollback-ship"]["with"]
+        for k in self.BUILD_KEYS:
+            self.assertIn("needs.guard.outputs.prev_build", str(w[k]), k)
+            self.assertNotIn("inputs.", str(w[k]), k)
+        self.assertEqual(w["cf_branch"], "${{ needs.guard.outputs.cf_branch }}")
+
+    def test_guard_exposes_prev_build(self):
+        self.assertEqual(self.j["guard"]["outputs"]["prev_build"], "${{ steps.d.outputs.prev_build }}")
+
+    def test_rollback_ship_needs_recorded_params(self):
+        self.assertIn("needs.guard.outputs.prev_build != ''", self.j["rollback-ship"]["if"])
+
+    def test_missing_params_fail_loud_and_keep_the_freeze(self):
+        step = self._step("report", "name", "Rollback target has no recorded build params")
+        self.assertIn("needs.guard.outputs.prev_sha != ''", step["if"])
+        self.assertIn("needs.guard.outputs.prev_build == ''", step["if"])
+        self.assertIn("rollback target", step["run"])
+        self.assertIn("has no recorded build params; manual rollback needed", step["run"])
+        self.assertIn("::error::", step["run"])
+        self.assertIn("GITHUB_STEP_SUMMARY", step["run"])
+        # rb-ship is skipped -> state smoke-failed-no-target -> the freeze step opens the freeze
+        self.assertNotIn("prev_build", self.j["report"]["steps"][2]["run"])
+        self.assertIn("smoke-failed-no-target", self._step("report", "id", "fz")["run"])
+
+    def test_auto_rollback_record_carries_the_targets_params(self):
+        step = self._step("rollback-verify", "name", "Record the auto-rollback")
+        self.assertIn("--build-json", step["run"])
+        self.assertIn("needs.guard.outputs.prev_build", step["env"]["PREV_BUILD"])
+
+    def test_recorded_values_never_reach_a_run_block_as_expressions(self):
+        for name, job in self.j.items():
+            for s in job.get("steps", []):
+                self.assertNotIn("prev_build", s.get("run", ""), (name, s.get("name")))
+                self.assertNotRegex(s.get("run", ""), r"\$\{\{[^}]*(inputs\.(install|build|node|out_dir)|prev_build)", (name, s.get("name")))
 
     def test_env_and_kind_are_validated(self):
         run = next(s["run"] for s in self.j["guard"]["steps"] if s.get("id") == "u")
