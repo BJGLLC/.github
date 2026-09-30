@@ -19,7 +19,7 @@ def ctx(**kw):
     c = {"sha": B, "reason": "deploy", "env": "production", "on_main": True, "ci": "success",
          "live_sha": A, "newer_than_live": True, "ledger_success_shas": [A], "freezes": [],
          "pr": 12, "pr_labels": [], "now": "2026-10-01T00:00:00Z", "has_drill_alias": True,
-         "current_build": BUILD_B, "live_build": BUILD_A, "target_build": BUILD_A, "seedable": True}
+         "current_build": BUILD_B, "live_build": BUILD_A, "target_build": BUILD_A}
     c.update(kw)
     return c
 
@@ -290,36 +290,33 @@ class RecordedBuild(unittest.TestCase):
         self.assertNotIn("DISARMED", d["message"])
         self.assertIn("no rollback target", decide(ctx(current_build=None, live_sha=""))["message"])
 
-    def test_seeding_a_live_sha_with_no_record_ships_the_current_inputs(self):
-        d = decide(ctx(reason="rollback", sha=A, live_sha=A, target_build=None, current_build=BUILD_B))
-        self.assertTrue(d["go"])
-        self.assertEqual(json.loads(d["ship_build"]), BUILD_B)
-        self.assertIn("seeding", d["warning"])
-        self.assertIn("re-shipping it with current inputs", d["warning"])
+    # --- fix round 4: no seeding; only the target's own trusted record ships a manual rollback ---
+    def assertRefusesNoRecord(self, d, s7="aaaaaaa"):
+        self.assertFalse(d["go"])
+        self.assertEqual((d["ship_build"], d["warning"]), ("", ""))
+        self.assertEqual(d["message"], f"refused: no recorded build params for {s7}; manual rollback needed — "
+                                       "see `bin/rollback <name> --revert`")
 
-    def test_only_the_live_sha_can_be_seeded(self):
-        # not live -> refuse; a trusted-but-mismatched record on the live sha -> refuse (not a seed case)
-        self.assertFalse(decide(ctx(reason="rollback", sha=B, live_sha=A, target_build=None))["go"])
+    def test_a_live_sha_rollback_with_no_record_refuses_never_seeds(self):
+        # re-shipping the live (older) SHA with main's current inputs is the P1's shape again
+        self.assertRefusesNoRecord(decide(ctx(reason="rollback", sha=A, live_sha=A, target_build=None, current_build=BUILD_B)))
+
+    def test_manual_rollback_needs_the_targets_own_trusted_record(self):
+        # not live -> refuse; a trusted-but-mismatched record on the live sha -> refuse
+        self.assertRefusesNoRecord(decide(ctx(reason="rollback", sha=B, live_sha=A, target_build=None)), "bbbbbbb")
         mism = decide(ctx(reason="rollback", sha=A, live_sha=A, target_build={**BUILD_B, "cf_project": "other"}))
         self.assertFalse(mism["go"])
         self.assertEqual(mism["ship_build"], "")
+        self.assertIn("different cf_project", mism["message"])
         # a live sha WITH a trusted record ships that record, not the current inputs
         rec = decide(ctx(reason="rollback", sha=A, live_sha=A, target_build=BUILD_A, current_build=BUILD_B))
         self.assertEqual(json.loads(rec["ship_build"]), BUILD_A)
         self.assertEqual(rec["warning"], "")
 
-    def test_a_forged_live_record_seeds_from_current_inputs_never_its_own(self):
+    def test_a_forged_live_record_refuses(self):
         forged = self.dep(A, "success", {"build": {**BUILD_A, "install": "evil"}}, {"login": "mallory", "type": "User"})
         tb = recorded_build([forged], A)
-        d = decide(ctx(reason="rollback", sha=A, live_sha=A, target_build=tb, current_build=BUILD_B))
-        self.assertEqual(json.loads(d["ship_build"]), BUILD_B)
-
-    def test_seeding_needs_the_newest_record_to_be_the_live_shas_success(self):
-        r = decide(ctx(reason="rollback", sha=A, live_sha=A, target_build=None, seedable=False))
-        self.assertFalse(r["go"])
-        self.assertEqual(r["ship_build"], "")
-        self.assertIn("cannot seed aaaaaaa: the newest deploy record is not its success", r["message"])
-        self.assertIn("bin/rollback <name> --revert", r["message"])
+        self.assertRefusesNoRecord(decide(ctx(reason="rollback", sha=A, live_sha=A, target_build=tb, current_build=BUILD_B)))
 
     def _gather(self, deps):
         fakes = {"gh": lambda *a, **k: A, "now": lambda: "t", "ledger": lambda *a: deps, "pr_of": lambda *a: (None, []),
@@ -334,25 +331,20 @@ class RecordedBuild(unittest.TestCase):
         deps = [self.dep(B, "failure", {}), self.dep(A, "success", {})]
         c = self._gather(deps)
         self.assertEqual(c["live_sha"], A)
-        self.assertFalse(c["seedable"])
-        d = decide(c)
-        self.assertFalse(d["go"])
-        self.assertIn("cannot seed", d["message"])
+        self.assertNotIn("seedable", c)
+        self.assertRefusesNoRecord(decide(c))
 
-    def test_a_clean_live_sha_seed_still_ships(self):
-        c = self._gather([self.dep(A, "success", {}), self.dep(C, "success", {"build": BUILD_A})])
-        self.assertTrue(c["seedable"])
-        d = decide(c)
-        self.assertTrue(d["go"])
-        self.assertEqual(json.loads(d["ship_build"]), BUILD_B)
+    def test_a_clean_live_sha_without_its_own_record_refuses(self):
+        # another SHA's trusted record never stands in for the target's
+        self.assertRefusesNoRecord(decide(self._gather([self.dep(A, "success", {}), self.dep(C, "success", {"build": BUILD_A})])))
 
-    def test_a_ship_failed_run_writes_no_record_so_it_cannot_make_seeding_pass(self):
-        # ship failed -> verify/record never ran: the ledger's newest record is still the old success, which
-        # is the truth (the old build is still serving), so seeding is allowed only for that SHA.
-        c = self._gather([self.dep(A, "success", {})])
-        self.assertTrue(c["seedable"])
-        self.assertFalse(self._gather([]).get("seedable"))
-        self.assertFalse(self._gather([self.dep(A, "pending", {})]).get("seedable"))
+    def test_a_ship_failed_run_then_rollback_of_the_live_sha_refuses(self):
+        # B's ship failed -> verify/record never ran, so A's success is still newest, but main HEAD (this run's
+        # inputs) is B: re-shipping A with them would pair old code with new inputs.
+        self.assertRefusesNoRecord(decide(self._gather([self.dep(A, "success", {})])))
+        for deps in ([], [self.dep(A, "pending", {})]):
+            with self.subTest(deps=deps):
+                self.assertRefusesNoRecord(decide(self._gather(deps)))
 
     def test_an_empty_current_build_is_an_error_not_eos_mode(self):
         for val in ("", "{}", "null"):

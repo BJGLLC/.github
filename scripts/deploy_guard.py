@@ -21,8 +21,11 @@ today, since such a workflow already receives the CF secrets. If the CF secrets 
 main-only Environment, the ledger becomes the bypass: bind the content then (an HMAC keyed by an
 Environment-scoped secret, or params re-derived from reviewed code).
 decide() emits one resolved `ship_build` that every ship path uses. Callers that pass no --current-build
-(eos-deploy) get the plain pre-params behaviour. A manual rollback of the LIVE sha with no trusted record
-re-ships it with the current inputs (seeding); its green verify writes the first trusted record.
+(eos-deploy) get the plain pre-params behaviour.
+With no trusted record for its target, a manual rollback refuses, the live SHA included; nothing is seeded.
+Re-shipping an older SHA with main's current inputs is the exact mismatch the params rule exists to stop.
+So each CF surface's first v4 production deploy must be a workflow-only commit, shipped after its preview
+drill: its green verify writes the first trusted record, and every later deploy is armed.
 """
 import re
 import argparse
@@ -74,21 +77,10 @@ def decide(c):
         if cur is None:  # a caller with no CF build params (eos-deploy): the params rule does not apply
             return {**base, "go": True, "message": f"go: rollback to {s7}{noop}"}
         tb = c.get("target_build")
-        if not tb and c["sha"] == live and not c.get("seedable"):
-            # After a failed smoke the ledger still names the previous SHA live while the failed deploy serves,
-            # and this run's inputs are the failed deploy's: re-shipping would bring the original defect back.
-            return no(f"refused: cannot seed {s7}: the newest deploy record is not its success; "
-                      "use `bin/rollback <name> --revert`")
-        if not tb and c["sha"] == live:
-            # Seeding: re-ship the live SHA with this run's inputs (attended, and exactly what is live); the
-            # green verify then writes the first trusted record. Every other no-record case refuses.
-            return {**base, "go": True, "ship_build": json.dumps(cur, sort_keys=True),
-                    "warning": f"seeding: no recorded params for the live SHA {s7}; re-shipping it with current inputs",
-                    "message": f"go: rollback to {s7} (no-op redeploy, seeding its build params)"}
         why = build_problem(tb, cur)
-        if why:  # never rebuild the target with the broken change's inputs
+        if why:  # only the target's own trusted record ships it; never this run's (newer) inputs, even for the live SHA
             head = f"no recorded build params for {s7}" if not tb else f"{s7} {why}"
-            return no(f"refused: {head}; manual rollback needed (bin/rollback <repo> --revert opens the revert PR)")
+            return no(f"refused: {head}; manual rollback needed — see `bin/rollback <name> --revert`")
         return {**base, "go": True, "ship_build": json.dumps(tb, sort_keys=True),
                 "message": f"go: rollback to {s7}{noop}"}
     if c["reason"] != "deploy":
@@ -265,7 +257,6 @@ def gather(repo, sha, reason, env, force, has_alias, current_build=None):
     return {"sha": full, "reason": reason, "env": env, "force_smoke_fail": force, "has_drill_alias": has_alias,
             "on_main": ancestor_or_equal(repo, full, tip), "ci": ci_state(repo, full), "live_sha": live, "live_build": recorded_build(deps, live) if live else None,
             "current_build": current_build, "target_build": target,
-            "seedable": bool(deps) and deps[0]["state"] == "success" and deps[0]["sha"] == live,
             "newer_than_live": bool(live) and live != full and ancestor_or_equal(repo, live, full),
             "ledger_success_shas": [d["sha"] for d in deps if d["state"] == "success"],
             "freezes": [f["number"] for f in open_freezes(repo, env)], "pr": pr, "pr_labels": labels, "now": decided_at}
