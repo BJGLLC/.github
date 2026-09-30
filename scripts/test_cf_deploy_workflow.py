@@ -146,9 +146,10 @@ class CfDeploy(unittest.TestCase):
     def test_every_ship_path_reads_the_guards_ship_build_unconditionally(self):
         w = self.j["ship"]["with"]
         for k in self.BUILD_KEYS:
-            self.assertEqual(w[k], "${{ fromJSON(needs.guard.outputs.ship_build)." + k + " }}", k)
-            self.assertNotIn("||", w[k])
+            # `|| '{}'` only guards an empty output; a `cond && x || inputs.y` chain would let "" fall through
+            self.assertEqual(w[k], "${{ fromJSON(needs.guard.outputs.ship_build || '{}')." + k + " }}", k)
             self.assertNotIn("&&", w[k])
+            self.assertNotIn("inputs.", w[k])
         self.assertEqual(self.j["guard"]["outputs"]["ship_build"], "${{ steps.d.outputs.ship_build }}")
 
     def test_decide_receives_this_runs_params_through_env(self):
@@ -201,6 +202,9 @@ class CfDeploy(unittest.TestCase):
             for s in job.get("steps", []):
                 self.assertNotIn("prev_build", s.get("run", ""), (name, s.get("name")))
                 self.assertNotIn("ship_build", s.get("run", ""), (name, s.get("name")))
+                # the caller's inputs and the recorded values reach scripts only via env:, never as expressions
+                self.assertNotRegex(s.get("run", ""), r"\$\{\{[^}]*(inputs\.|prev_build|ship_build|cf_project|kind|node|out_dir)",
+                                    (name, s.get("name")))
         # and the consumer: cf-ship's scripts take everything through env:, never an expression
         for s in load("cf-ship.yml")["jobs"]["ship"]["steps"]:
             self.assertNotIn("${{", s.get("run", ""), s.get("name"))

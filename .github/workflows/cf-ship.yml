@@ -2,7 +2,8 @@
 # Called twice by cf-deploy.yml (the SHA, then the rollback target if the smoke fails).
 # Trust: install/build run here as code, with the deploy secrets in reach of later steps. For a rollback they come
 # from a deployment-ledger record, so write access to the ledger is deploy-code access; cf-deploy only trusts records
-# github-actions[bot] created. Callers should keep the default GITHUB_TOKEN read-only and grant deployments: write
+# github-actions[bot] created (that stops PATs, people and Apps, not other workflow runs on the repo, which already
+# hold the secrets; if the CF secrets move behind a main-only Environment, bind the record's content, e.g. an HMAC). Callers should keep the default GITHUB_TOKEN read-only and grant deployments: write
 # per job. (Review v4 SSSF-31.)
 name: cf-ship
 on:

@@ -115,12 +115,12 @@ jobs:
       sha: ${{ needs.guard.outputs.sha }}
       # The guard's one resolved ship_build: this run's inputs for a deploy, the target's own recorded
       # params for a manual rollback. Read unconditionally (build/out_dir are legitimately "").
-      kind: ${{ fromJSON(needs.guard.outputs.ship_build).kind }}
-      node: ${{ fromJSON(needs.guard.outputs.ship_build).node }}
-      install: ${{ fromJSON(needs.guard.outputs.ship_build).install }}
-      build: ${{ fromJSON(needs.guard.outputs.ship_build).build }}
-      out_dir: ${{ fromJSON(needs.guard.outputs.ship_build).out_dir }}
-      cf_project: ${{ fromJSON(needs.guard.outputs.ship_build).cf_project }}
+      kind: ${{ fromJSON(needs.guard.outputs.ship_build || '{}').kind }}
+      node: ${{ fromJSON(needs.guard.outputs.ship_build || '{}').node }}
+      install: ${{ fromJSON(needs.guard.outputs.ship_build || '{}').install }}
+      build: ${{ fromJSON(needs.guard.outputs.ship_build || '{}').build }}
+      out_dir: ${{ fromJSON(needs.guard.outputs.ship_build || '{}').out_dir }}
+      cf_project: ${{ fromJSON(needs.guard.outputs.ship_build || '{}').cf_project }}
       cf_branch: ${{ needs.guard.outputs.cf_branch }}
     secrets: inherit
 

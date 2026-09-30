@@ -242,7 +242,7 @@ class RecordedBuild(unittest.TestCase):
 
     def test_node_and_out_dir_shapes_are_checked(self):
         for k, v in (("node", "22; curl x|sh"), ("node", ""), ("node", "$(id)"), ("out_dir", "/etc"), ("out_dir", "../x"),
-                     ("out_dir", "a/../../x"), ("out_dir", "a b"), ("out_dir", "$HOME"), ("kind", "lambda")):
+                     ("out_dir", "a/../../x"), ("out_dir", "a b"), ("out_dir", "dist\n"), ("out_dir", "$HOME"), ("kind", "lambda")):
             with self.subTest(k=k, v=v):
                 self.assertNotEqual(deploy_guard.build_problem({**BUILD_A, k: v}, BUILD_A), "")
         for k, v in (("node", "22"), ("node", "20.11.1"), ("node", "20.x"), ("node", "lts/*"), ("node", "lts/iron"),
@@ -278,6 +278,51 @@ class RecordedBuild(unittest.TestCase):
         self.assertFalse(d["go"])
         self.assertEqual(d["ship_build"], "")
         self.assertTrue(d["message"].startswith("refused: no recorded build params for bbbbbbb; manual rollback needed"))
+
+    def test_callers_without_build_params_keep_the_old_behaviour(self):
+        # eos-deploy calls decide with no --current-build and records no params
+        r = decide(ctx(reason="rollback", current_build=None, target_build=None, live_build=None))
+        self.assertTrue(r["go"])
+        self.assertEqual((r["ship_build"], r["warning"]), ("", ""))
+        d = decide(ctx(current_build=None, live_build=None))
+        self.assertEqual((d["go"], d["prev_sha"], d["prev_build"], d["warning"]), (True, A, "", ""))
+        self.assertIn("auto-rollback target", d["message"])
+        self.assertNotIn("DISARMED", d["message"])
+        self.assertIn("no rollback target", decide(ctx(current_build=None, live_sha=""))["message"])
+
+    def test_seeding_a_live_sha_with_no_record_ships_the_current_inputs(self):
+        d = decide(ctx(reason="rollback", sha=A, live_sha=A, target_build=None, current_build=BUILD_B))
+        self.assertTrue(d["go"])
+        self.assertEqual(json.loads(d["ship_build"]), BUILD_B)
+        self.assertIn("seeding", d["warning"])
+        self.assertIn("re-shipping it with current inputs", d["warning"])
+
+    def test_only_the_live_sha_can_be_seeded(self):
+        # not live -> refuse; a trusted-but-mismatched record on the live sha -> refuse (not a seed case)
+        self.assertFalse(decide(ctx(reason="rollback", sha=B, live_sha=A, target_build=None))["go"])
+        mism = decide(ctx(reason="rollback", sha=A, live_sha=A, target_build={**BUILD_B, "cf_project": "other"}))
+        self.assertFalse(mism["go"])
+        self.assertEqual(mism["ship_build"], "")
+        # a live sha WITH a trusted record ships that record, not the current inputs
+        rec = decide(ctx(reason="rollback", sha=A, live_sha=A, target_build=BUILD_A, current_build=BUILD_B))
+        self.assertEqual(json.loads(rec["ship_build"]), BUILD_A)
+        self.assertEqual(rec["warning"], "")
+
+    def test_a_forged_live_record_seeds_from_current_inputs_never_its_own(self):
+        forged = self.dep(A, "success", {"build": {**BUILD_A, "install": "evil"}}, {"login": "mallory", "type": "User"})
+        tb = recorded_build([forged], A)
+        d = decide(ctx(reason="rollback", sha=A, live_sha=A, target_build=tb, current_build=BUILD_B))
+        self.assertEqual(json.loads(d["ship_build"]), BUILD_B)
+
+    def test_setup_node_version_specs(self):
+        ok = ("20", "20.x", "20.11.1", "lts/*", "lts/iron", ">=20", "^20", "~20.1", "node", "latest", ">=20 <23", "22")
+        bad = ("", "22; curl x|sh", "$(id)", "`id`", "20\nfoo", "20\n", "a" * 33, " 20", "20'", '20"', "20&&id", "20 | sh", "{20}")
+        for v in ok:
+            with self.subTest(ok=v):
+                self.assertEqual(deploy_guard.build_problem({**BUILD_A, "node": v}, BUILD_A), "")
+        for v in bad:
+            with self.subTest(bad=v):
+                self.assertNotEqual(deploy_guard.build_problem({**BUILD_A, "node": v}, BUILD_A), "")
 
     def test_gather_looks_up_the_rollback_targets_own_records(self):
         calls = []

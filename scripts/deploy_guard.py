@@ -14,9 +14,15 @@ decide() is pure and unit-tested. Rules, in order:
 The ledger is GitHub Deployments. A deploy's auto-rollback target is whatever was live.
 Each successful deploy records the build params it shipped with (payload.build); a rollback (auto or
 manual) rebuilds the target with THOSE, never the failed deploy's inputs. No trusted record -> no ship,
-loudly. A record is trusted only if github-actions[bot] created it (write access to the ledger is
-otherwise deploy-code access), its kind/cf_project match this run, and node/out_dir have a safe shape.
-decide() emits one resolved `ship_build` that every ship path uses.
+loudly. A record is trusted only if github-actions[bot] created it, its kind/cf_project match this run,
+and node/out_dir have a safe shape. The creator check stops PATs, people and third-party Apps; it does NOT
+stop any workflow run on any branch of the repo (they post as github-actions[bot] too). That is no escalation
+today, since such a workflow already receives the CF secrets. If the CF secrets ever move behind a
+main-only Environment, the ledger becomes the bypass: bind the content then (an HMAC keyed by an
+Environment-scoped secret, or params re-derived from reviewed code).
+decide() emits one resolved `ship_build` that every ship path uses. Callers that pass no --current-build
+(eos-deploy) get the plain pre-params behaviour. A manual rollback of the LIVE sha with no trusted record
+re-ships it with the current inputs (seeding); its green verify writes the first trusted record.
 """
 import re
 import argparse
@@ -29,7 +35,9 @@ FREEZE_LABEL, HOTFIX_LABEL, ACTIONS_APP = "deploy-freeze", "hotfix", "github-act
 # Every cf-ship input that can differ per revision (sha and cf_branch are per-run, not build params).
 BUILD_KEYS = ("kind", "node", "install", "build", "out_dir", "cf_project")
 TRUSTED_CREATOR = "github-actions[bot]"
-NODE_RE = re.compile(r"^(lts/(\*|[a-z]+)|[0-9]+(\.([0-9]+|x)){0,2})$")
+# setup-node version specs (20, 20.x, 20.11.1, lts/*, lts/iron, >=20, ^20, ~20.1, node, latest). Only ever fed
+# to `with: node-version`, never a run: block, so the charset just has to be inert.
+NODE_RE = re.compile(r"^[A-Za-z0-9^~<>=*][A-Za-z0-9._*/<>=^~ -]{0,31}$")
 OUT_DIR_RE = re.compile(r"^[A-Za-z0-9._/-]*$")
 FREEZE_BODY = ("{env} was rolled back from `{frm}` to `{to}` ({run}).\n\n"
                "Forward deploys are held: the deploy guard skips every SHA whose PR is not labelled `hotfix` "
@@ -61,13 +69,23 @@ def decide(c):
     if c["reason"] == "rollback":
         if not green and c["sha"] not in c.get("ledger_success_shas", []):
             return no(f"refused: {s7} has no green ci and never deployed successfully to {c['env']}")
+        cur = c.get("current_build")
+        noop = " (no-op redeploy)" if c["sha"] == live else ""
+        if cur is None:  # a caller with no CF build params (eos-deploy): the params rule does not apply
+            return {**base, "go": True, "message": f"go: rollback to {s7}{noop}"}
         tb = c.get("target_build")
-        why = build_problem(tb, c.get("current_build"))
+        if not tb and c["sha"] == live:
+            # Seeding: re-ship the live SHA with this run's inputs (attended, and exactly what is live); the
+            # green verify then writes the first trusted record. Every other no-record case refuses.
+            return {**base, "go": True, "ship_build": json.dumps(cur, sort_keys=True),
+                    "warning": f"seeding: no recorded params for the live SHA {s7}; re-shipping it with current inputs",
+                    "message": f"go: rollback to {s7} (no-op redeploy, seeding its build params)"}
+        why = build_problem(tb, cur)
         if why:  # never rebuild the target with the broken change's inputs
             head = f"no recorded build params for {s7}" if not tb else f"{s7} {why}"
             return no(f"refused: {head}; manual rollback needed (bin/rollback <repo> --revert opens the revert PR)")
         return {**base, "go": True, "ship_build": json.dumps(tb, sort_keys=True),
-                "message": f"go: rollback to {s7}" + (" (no-op redeploy)" if c["sha"] == live else "")}
+                "message": f"go: rollback to {s7}{noop}"}
     if c["reason"] != "deploy":
         return no(f"refused: unknown reason {c['reason']!r}")
     if not green:
@@ -79,6 +97,9 @@ def decide(c):
     if c.get("freezes") and HOTFIX_LABEL not in c.get("pr_labels", []):
         return no(f"skip: forward deploys frozen by #{c['freezes'][0]}; ship the fix as a `hotfix` PR")
     lb = c.get("live_build")
+    if c.get("current_build") is None:  # no CF build params (eos-deploy): plain auto-rollback target
+        tail = f", auto-rollback target {live[:7]}" if live else ", no rollback target on record (first v4 deploy)"
+        return {**base, "go": True, "prev_sha": live, "message": f"go: {s7}{tail}"}
     why = build_problem(lb, c.get("current_build")) if live else ""
     armed = bool(live) and not why
     if armed:
@@ -141,10 +162,10 @@ def build_problem(b, current):
     for k in ("kind", "cf_project"):
         if k in cur and b[k] != cur[k]:
             return f"has recorded build params for a different {k} than this run ships"
-    if not NODE_RE.match(b["node"]):
+    if not NODE_RE.fullmatch(b["node"]):
         return "has a recorded node version of an unexpected shape"
     o = b["out_dir"]
-    if not OUT_DIR_RE.match(o) or o.startswith("/") or ".." in o.split("/"):
+    if not OUT_DIR_RE.fullmatch(o) or o.startswith("/") or ".." in o.split("/"):
         return "has a recorded out_dir of an unsafe shape"
     return ""
 
