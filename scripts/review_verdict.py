@@ -349,15 +349,18 @@ def derive_asked_at(head_pushed_at, event_times):
     return max([head_pushed_at, *event_times], key=ts)
 
 
+# GitHub Actions' own app id. Only its check suites are read (the slug filter below is a second check).
+GITHUB_ACTIONS_APP_ID = 15368
+
 GQL = """
 query($owner:String!,$name:String!,$n:Int!){ repository(owner:$owner,name:$name){ pullRequest(number:$n){
   headRefOid isDraft state createdAt labels(first:20){nodes{name}}
   timelineItems(last:5, itemTypes:[READY_FOR_REVIEW_EVENT, REOPENED_EVENT]){nodes{... on ReadyForReviewEvent{createdAt} ... on ReopenedEvent{createdAt}}}
-  commits(last:1){nodes{commit{committedDate checkSuites(first:20){nodes{createdAt app{slug}}}}}}
+  commits(last:1){nodes{commit{committedDate checkSuites(first:20, filterBy:{appId:__ACTIONS_APP_ID__}){nodes{createdAt app{slug}}}}}}
   reviews(first:100){nodes{author{login} submittedAt commit{oid}}}
   comments(last:100){totalCount nodes{author{login} body createdAt}}
   reviewThreads(first:100){nodes{id isResolved comments(first:20){nodes{author{login __typename} editor{login __typename} lastEditedAt body createdAt commit{oid}}}}}
-}}}"""
+}}}""".replace("__ACTIONS_APP_ID__", str(GITHUB_ACTIONS_APP_ID))
 
 
 def _codex_summaries(comments):
