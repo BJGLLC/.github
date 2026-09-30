@@ -1,0 +1,36 @@
+# .github/workflows/linear-deploy-notify.yml — reusable (workflow_call). Review v4 phase 4 (spec §8).
+# Replaces the three per-repo copies (cd-dashboard, cd-home, cd-pages), whose regex knew only
+# ops|rnd|bjg|eng|des|sec|mar and so tied 0 of 28 deploys to a ticket. Team keys live in
+# scripts/deploy_notify.py TEAM_KEYS, and nowhere else.
+name: linear-deploy-notify
+on:
+  workflow_call:
+    inputs:
+      surface:     { type: string, required: true }
+      state:       { type: string, default: deployed }
+      attempted:   { type: string, default: "" }   # default: github.sha
+      live_before: { type: string, default: "" }   # default: github.event.before (push callers)
+    secrets:
+      LINEAR_API_KEY: { required: false }
+permissions: {}
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions: { contents: read }
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: BJGLLC/.github, ref: main, path: .deploylib, persist-credentials: false }
+      - name: Post to every ticket in the deployed range
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+          SURFACE: ${{ inputs.surface }}
+          STATE: ${{ inputs.state }}
+          ATTEMPTED: ${{ inputs.attempted || github.sha }}
+          BEFORE: ${{ inputs.live_before || github.event.before }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          case "$BEFORE" in 0000000000000000000000000000000000000000) BEFORE="" ;; esac
+          python3 .deploylib/scripts/deploy_notify.py notify --repo "$GITHUB_REPOSITORY" --state "$STATE" \
+            --surface "$SURFACE" --attempted "$ATTEMPTED" --live-before "$BEFORE" --run-url "$RUN_URL" || true

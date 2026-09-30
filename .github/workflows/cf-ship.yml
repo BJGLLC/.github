@@ -1,0 +1,93 @@
+# .github/workflows/cf-ship.yml — reusable: build + upload one SHA to Cloudflare (Review v4 phase 4).
+# Called twice by cf-deploy.yml (the SHA, then the rollback target if the smoke fails).
+# Trust: install/build run here as code, with the deploy secrets in reach of later steps. For a rollback they come
+# from a deployment-ledger record, so write access to the ledger is deploy-code access; cf-deploy only trusts records
+# github-actions[bot] created (that stops PATs, people and Apps, not other workflow runs on the repo, which already
+# hold the secrets; if the CF secrets move behind a main-only Environment, bind the record's content, e.g. an HMAC). Callers should keep the default GITHUB_TOKEN read-only and grant deployments: write
+# per job. (Review v4 SSSF-31.)
+name: cf-ship
+on:
+  workflow_call:
+    inputs:
+      sha:        { type: string, required: true }
+      kind:       { type: string, required: true }        # pages | worker
+      node:       { type: string, default: "22" }
+      install:    { type: string, default: "npm ci" }     # "" = skip
+      build:      { type: string, default: "" }           # "" = no build (static dir, or Worker bundled by wrangler)
+      out_dir:    { type: string, default: "" }           # pages: uploaded dir; version.json lands here
+      cf_project: { type: string, default: "" }
+      cf_branch:  { type: string, default: main }         # production branch, or the drill alias
+    secrets:
+      CLOUDFLARE_API_TOKEN:  { required: false }
+      CLOUDFLARE_API_KEY:    { required: false }
+      CLOUDFLARE_EMAIL:      { required: false }
+      CLOUDFLARE_ACCOUNT_ID: { required: true }
+permissions: {}
+jobs:
+  ship:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions: { contents: read }
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: "${{ inputs.sha }}", persist-credentials: false }
+      - uses: actions/setup-node@v4
+        with: { node-version: "${{ inputs.node }}" }
+      - name: Install + build
+        env: { INSTALL: "${{ inputs.install }}", BUILD: "${{ inputs.build }}" }
+        run: |
+          set -euo pipefail
+          if [ -n "$INSTALL" ]; then bash -ec "$INSTALL"; fi
+          if [ -n "$BUILD" ]; then bash -ec "$BUILD"; fi
+      - name: Stamp version.json (pages)
+        if: inputs.kind == 'pages'
+        env: { OUT: "${{ inputs.out_dir }}", SHA: "${{ inputs.sha }}" }
+        run: |
+          set -euo pipefail
+          test -d "$OUT" || { echo "::error::out_dir '$OUT' missing after build"; exit 1; }
+          printf '{"sha":"%s","repo":"%s","built_at":"%s"}\n' "$SHA" "${GITHUB_REPOSITORY#*/}" "$(date -u +%FT%TZ)" > "$OUT/version.json"
+      # Cloudflare creds are scoped to the preflight + upload steps only. best-effort isolation: a hostile
+      # dependency could still write $GITHUB_ENV / $GITHUB_PATH; full isolation would need a separate job.
+      - name: Refuse a Git-integrated Pages project or a drill aimed at production
+        if: inputs.kind == 'pages'
+        env:
+          PROJ: ${{ inputs.cf_project }}
+          BRANCH: ${{ inputs.cf_branch }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_API_KEY: ${{ secrets.CLOUDFLARE_API_KEY }}
+          CLOUDFLARE_EMAIL: ${{ secrets.CLOUDFLARE_EMAIL }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+        run: |
+          set -euo pipefail
+          if [ -n "$CLOUDFLARE_API_TOKEN" ]; then auth=(-H "Authorization: Bearer $CLOUDFLARE_API_TOKEN")
+          else auth=(-H "X-Auth-Email: $CLOUDFLARE_EMAIL" -H "X-Auth-Key: $CLOUDFLARE_API_KEY"); fi
+          if ! p="$(curl -sf "${auth[@]}" "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/pages/projects/$PROJ")"; then
+            echo "::warning::could not read Pages project $PROJ (token scope?); git-integration check skipped"; exit 0
+          fi
+          src="$(jq -r '.result.source.type // "none"' <<<"$p")"; prod="$(jq -r '.result.production_branch' <<<"$p")"
+          [ "$src" = none ] || { echo "::error::$PROJ is connected to $src: Cloudflare builds every push itself, around ci. Disconnect it first."; exit 1; }
+          [ "$prod" = main ] || { echo "::error::$PROJ production branch is '$prod', not main"; exit 1; }
+          if [ "$BRANCH" != main ] && [ "$BRANCH" = "$prod" ]; then echo "::error::drill branch is the production branch"; exit 1; fi
+      - name: Upload
+        env:
+          KIND: ${{ inputs.kind }}
+          OUT: ${{ inputs.out_dir }}
+          PROJ: ${{ inputs.cf_project }}
+          BRANCH: ${{ inputs.cf_branch }}
+          SHA: ${{ inputs.sha }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_API_KEY: ${{ secrets.CLOUDFLARE_API_KEY }}
+          CLOUDFLARE_EMAIL: ${{ secrets.CLOUDFLARE_EMAIL }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+        run: |
+          set -euo pipefail
+          for v in CLOUDFLARE_API_TOKEN CLOUDFLARE_API_KEY CLOUDFLARE_EMAIL; do [ -n "${!v}" ] || unset "$v"; done
+          w=(npx --yes wrangler@4); [ -x node_modules/.bin/wrangler ] && w=(node_modules/.bin/wrangler)
+          if [ "$KIND" = pages ]; then
+            "${w[@]}" pages deploy "$OUT" --project-name="$PROJ" --branch="$BRANCH" --commit-hash="$SHA" \
+              --commit-message="review-v4 ${SHA:0:7}" --commit-dirty=false
+          else
+            "${w[@]}" deploy --var "GIT_SHA:$SHA"
+          fi
