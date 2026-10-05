@@ -242,6 +242,13 @@ class CfDeploy(unittest.TestCase):
         self.assertIn('[ "$CLIENT" = true ] && [ "$ENVN" = production ]', refused)
         self.assertLess(refused.index("deploy_notify.py ping"), refused.index("exit 1"))
 
+    def test_a_skip_is_silent_by_design(self):
+        # nothing ships on a skip (build-free range, already live, older than live, frozen after a pinged rollback)
+        run = self._step("guard", "id", "d")["run"]
+        skip = run[run.index("skip:*)"):]
+        self.assertNotIn("ping", skip[:skip.index(";;")])
+        self.assertIn("rolls back or is refused", (WF / "cf-deploy.yml").read_text())
+
     def test_client_production_probes_live_before_and_after_and_pings(self):
         pb = self._step("guard", "id", "pb")
         for s in ("inputs.client", "inputs.env == 'production'", "steps.d.outputs.go == 'true'"):

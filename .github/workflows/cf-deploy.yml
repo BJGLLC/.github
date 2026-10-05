@@ -4,7 +4,9 @@
 # build_paths: the range filter (decision 01M3N14TGN §3): a deploy whose live..sha range touches none of
 # these globs is skipped, never while the auto-rollback is unarmed. client: client production (decision
 # 01M46ESRWR): the guard holds a deploy until a preview drill is green and the Moshi ping is configured,
-# the live site is probed before and after, and Blake gets a Moshi ping on every production outcome.
+# the live site is probed before and after, and Blake gets a Moshi ping for every client production run
+# that ships, rolls back or is refused. A skip is silent on purpose: nothing ships (a build-free range, a
+# SHA already live or older than live, or a freeze, whose rollback already pinged).
 name: cf-deploy
 on:
   workflow_call:
