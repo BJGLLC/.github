@@ -356,7 +356,12 @@ class NudgedHelper(unittest.TestCase):
                      "Ticket text:\n\n    @codex review\n\nmore text",
                      "Ticket text:\n\n\t@codex review\n",
                      "Ticket text: <code>@codex review</code> and <pre>\n@codex review\n</pre>",
-                     "Ticket text:\n\n```\n@codex review\n(no closing fence)"):
+                     "Ticket text:\n\n```\n@codex review\n(no closing fence)",
+                     # Codex P1, round 2: a closing fence must match the opener's character and
+                     # length, so a ```` fence showing a ``` example stays code to its own close
+                     "Example:\n\n````markdown\n```\nfoo\n```\n@codex review\n````\n",
+                     "Example:\n\n````\n```\n@codex review\n````\n",
+                     "Example:\n\n~~~~\n~~~\n@codex review\n~~~~\n"):
             with self.subTest(body=body[:40]):
                 comments = [{"author": "tracker-bot[bot]", "body": body, "created_at": iso(T0 + timedelta(minutes=1))}]
                 self.assertFalse(is_nudged(comments, iso(T0)))

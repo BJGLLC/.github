@@ -326,9 +326,10 @@ def pushed_at(commit_node):
     return commit["committedDate"]
 
 
-# Every Markdown code form: ``` and ~~~ fences (an unclosed one runs to the end, as GitHub
+# Every Markdown code form: ``` and ~~~ fences closed only by the same character at the same
+# length (a ```` fence can show a ``` example; an unclosed one runs to the end, as GitHub
 # renders it), <pre>/<code>, inline spans, then indented blocks (4 spaces or a tab).
-CODE = re.compile(r"```.*?(?:```|\Z)|~~~.*?(?:~~~|\Z)|<pre\b.*?(?:</pre>|\Z)|<code\b.*?(?:</code>|\Z)"
+CODE = re.compile(r"(?P<fence>`{3,}|~{3,}).*?(?:(?P=fence)|\Z)|<pre\b.*?(?:</pre>|\Z)|<code\b.*?(?:</code>|\Z)"
                   r"|``[^\n]*?``|`[^`\n]*`", re.S | re.I)
 INDENTED_CODE = re.compile(r"^(?: {4}|\t).*$", re.M)
 
