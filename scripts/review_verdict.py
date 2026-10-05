@@ -2,16 +2,20 @@
 """review-verdict: turn Codex's advisory review into one deterministic commit status.
 
 Pure part: compute(pr, now), parse_summary(body), pushed_at(commit_node), is_nudged(comments, head_pushed_at),
-nudge_decision(pr), poll_done(pr, verdict, now), clock_start(pr), derive_asked_at(...).
+nudge_decision(pr), nudge_due(pr, verdict, now), poll_done(pr, verdict, now), clock_start(pr), derive_asked_at(...).
 Fetch/act part: fetch(repo, number) via `gh`; run_nudge = fetch -> nudge_decision -> one
-`@codex review` comment; run_once = fetch -> compute -> queue_threads (fresh marker check, then
-the marker reply) -> post status; poll = run_once every 60 s until poll_done (<= 8 min).
+`@codex review` comment; run_once = fetch -> compute -> [poller only: nudge_due -> one
+`@codex review`] -> queue_threads (fresh marker check, then the marker reply) -> post status;
+poll = run_once every 60 s until poll_done (a verdict, or codex-unavailable at 30 min).
 SSSF-25 (Blake, 2026-09-28; reverses R32 "the gate never comments"): on a new head (pull_request
 synchronize) the gate asks Codex itself, once per head: one `@codex review` comment carrying a
 hidden per-SHA marker, skipped for drafts, `hotfix`, closed PRs and heads someone already asked
-about. Codex reviews opened / ready-for-review PRs by itself, so those are never nudged. P2/P3
-threads get a `queued-for-janitor` reply, which IS the queue entry; the gate no longer resolves
-them (resolveReviewThread needs contents: write; the callers grant read).
+about. SSSF-46: Codex's review on open can be a bare 👍 (R46: never a verdict) or nothing at all
+(it reviews by itself only PRs its users authored), and a 👍 fires no event, so the poller also
+asks once nobody has: at ASK_AFTER, or at once for a bot-authored PR. It then holds until a
+verdict or the 30-min codex-unavailable failure, so an unanswered PR goes red, never hangs.
+P2/P3 threads get a `queued-for-janitor` reply, which IS the queue entry; the gate no longer
+resolves them (resolveReviewThread needs contents: write; the callers grant read).
 The reusable workflow (.github/workflows/review-verdict.yml) runs `nudge` (synchronize only) and
 then `poll` after a push / open / ready / reopen, and the one-shot `<repo> <n>` for every other
 event. Spec: claude-dotfiles docs/superpowers/specs/2026-09-26-review-system-v4-design.md §6.
@@ -25,14 +29,13 @@ import time
 from datetime import datetime, timedelta, timezone
 
 CODEX = "chatgpt-codex-connector"
-ASK_AFTER = timedelta(minutes=10)      # after this with no verdict and nobody asking, the status asks
+ASK_AFTER = timedelta(minutes=10)      # after this with no verdict and nobody asking, the poller asks
+                                       # (SSSF-46; a one-shot run's status asks a human instead)
+# The poller holds until a verdict or this failure (SSSF-46). SSSF-25 stopped it at +8 on the
+# theory that Codex's reply fires its own event, but a 👍 fires none and an unanswered request
+# fires nothing, so the PR hung pending for good. When Codex answers, the hold ends with the
+# verdict (~2 min after a request); only a request nobody answers holds the full 30 min.
 UNAVAILABLE_AFTER = timedelta(minutes=30)
-# SSSF-25: a poller never waits past clock_start + 8 min. Codex answered the gate's bot nudge in
-# 1m19s-1m56s (trial, 9/28) and 45 of 49 poll jobs across the gated repos ended inside 6.3 min;
-# 8 min is ~4x the slowest nudge response. Past it a held runner buys nothing: Codex's reply
-# fires issue_comment / pull_request_review, which recompute by themselves, and codex-unavailable
-# (30 min) is reached by any later event or a workflow_dispatch recompute. Was 31 min.
-POLL_WINDOW = timedelta(minutes=8)
 POLL_INTERVAL = 60                     # seconds between poll iterations
 POLL_MAX_ERRORS = 3                    # consecutive failed iterations before the poller gives up
 DRAFT_DESC = "draft: Codex reviews when marked ready"
@@ -166,8 +169,9 @@ def compute(pr, now):
     one-shot, dispatch) feeds it the same fetch() output, so two runs on the same SHA post
     the same status. The ask (10 min) and codex-unavailable (30 min) ages run from
     clock_start(pr). compute() never comments: after a push the `nudge` step already asked
-    Codex (SSSF-25); when nobody has asked (e.g. Codex skipped an opened PR) and a review is
-    due, the pending description asks for `@codex review`. An error comment counts only when no head
+    Codex (SSSF-25), and at ASK_AFTER the poller asks (SSSF-46); when nobody has asked anyway
+    (no poller running, or its ask failed), the pending description asks for `@codex review`.
+    An error comment counts only when no head
     verdict exists, so a successful retry wins over an earlier error. A retry does NOT
     restart the window: the status stays codex-unavailable until Codex's summary edit (an
     issue_comment event -> one-shot run) recomputes it once the review lands (spec §6)."""
@@ -264,19 +268,20 @@ def compute(pr, now):
 
 def poll_done(pr, verdict, now):
     """Loop control for `poll`: True once there is nothing left to wait for.
-    - a verdict landed (success/failure), or
+    - a verdict landed (success/failure, codex-unavailable included), or
     - the PR is a draft (Codex skips drafts; ready_for_review starts a new poller) -- so a
       draft push bills ~1 minute, not 31, or
     - the PR was closed/merged mid-poll (nobody will review it), or
-    - clock_start (later of head push / asked_at) + POLL_WINDOW (8 min) has passed, so a
-      re-run long after the push and the ask does not wait again. The PR may stay pending
-      then: Codex's late reply recomputes through its own event, and codex-unavailable at
-      30 min comes from any later event or a `workflow_dispatch -f pr=<n>` recompute."""
+    - clock_start (later of head push / asked_at) + UNAVAILABLE_AFTER has passed: compute()
+      has posted codex-unavailable by then, so this is only the backstop that keeps a re-run
+      long after the push from waiting again. SSSF-46: there is no earlier stop. A poller that
+      quits while the PR is pending leaves it pending for good when Codex answers with only a
+      👍 or not at all, since neither fires an event that would recompute it."""
     if verdict["state"] != "pending":
         return True
     if pr.get("draft") or not is_open(pr):
         return True
-    return now >= clock_start(pr) + POLL_WINDOW
+    return now >= clock_start(pr) + UNAVAILABLE_AFTER
 
 
 # ---- fetch / act (thin; every decision is in the pure functions above) ------------
@@ -318,8 +323,9 @@ def nudge_body(sha):
 
 
 def nudge_decision(pr):
-    """(post, why): whether the gate should post `@codex review` for the PR's head now. Pure.
-    Runs only on pull_request synchronize (Codex reviews open and ready-for-review by itself)."""
+    """(post, why): whether the gate may post `@codex review` for the PR's head at all. Pure.
+    On pull_request synchronize it is the whole rule (Codex never reviews a push by itself);
+    the poller adds nudge_due's timing on top of it."""
     if not is_open(pr):
         return False, "closed"
     if pr.get("draft"):
@@ -332,6 +338,35 @@ def nudge_decision(pr):
     if pr.get("nudged"):
         return False, "already asked about this head (a @codex review comment after the push)"
     return True, "new head, nobody asked"
+
+
+def nudge_due(pr, verdict, now):
+    """(post, why): SSSF-46 -- should the poller post the one `@codex review` for this head now?
+    Pure. Codex's own review on open can end in a bare 👍 (R46: never a verdict) or never come
+    (Codex reviews by itself only PRs its users authored), and neither fires an event, so a
+    poller that only waited left the PR pending. It asks when all hold:
+    - no verdict (`verdict` is compute()'s for the same PR and time): a review, a head-named
+      clean comment, an error or a codex-unavailable failure is never nudged;
+    - nudge_decision allows it (open, not a draft, not `hotfix`, no marker for this head and
+      nobody's request after the push), so a head is asked about at most once;
+    - Codex does not have the head in hand: no sticky summary for this head (running, or a
+      status word we cannot read; a completed one is a verdict). An older head's summary does
+      not count, so a failed synchronize nudge is retried here;
+    - the PR's author is a Bot (Codex never reviews it by itself: ask at once), or ASK_AFTER
+      has passed since clock_start, the point where compute() would ask in the status."""
+    if verdict["state"] != "pending":
+        return False, f"verdict: {verdict['state']}"
+    post, why = nudge_decision(pr)
+    if not post:
+        return post, why
+    summary = pr.get("summary")
+    if summary and summary.get("commit") and pr["head_sha"].startswith(summary["commit"]):
+        return False, f"Codex's summary for this head says {summary.get('status')}: it is answering"
+    if pr.get("author_type") == "Bot":
+        return True, "bot-authored PR: Codex reviews it only when asked"
+    if now - clock_start(pr) >= ASK_AFTER:
+        return True, f"no verdict and nobody asked {int(ASK_AFTER.total_seconds() // 60)} min after the clock start"
+    return False, "Codex may still review this head by itself"
 
 
 def derive_asked_at(head_pushed_at, event_times):
@@ -354,7 +389,7 @@ GITHUB_ACTIONS_APP_ID = 15368
 
 GQL = """
 query($owner:String!,$name:String!,$n:Int!){ repository(owner:$owner,name:$name){ pullRequest(number:$n){
-  headRefOid isDraft state createdAt labels(first:20){nodes{name}}
+  headRefOid isDraft state createdAt author{__typename} labels(first:20){nodes{name}}
   timelineItems(last:5, itemTypes:[READY_FOR_REVIEW_EVENT, REOPENED_EVENT]){nodes{... on ReadyForReviewEvent{createdAt} ... on ReopenedEvent{createdAt}}}
   commits(last:1){nodes{commit{committedDate checkSuites(first:20, filterBy:{appId:__ACTIONS_APP_ID__}){nodes{createdAt app{slug}}}}}}
   reviews(first:100){nodes{author{login} submittedAt commit{oid}}}
@@ -406,6 +441,7 @@ def fetch(repo, number):
     return {
         "head_sha": p["headRefOid"], "head_pushed_at": head_pushed_at,
         "draft": p["isDraft"], "state": p["state"],
+        "author_type": (p.get("author") or {}).get("__typename", ""),   # "Bot" | "User"; "" = deleted
         "labels": [l["name"] for l in p["labels"]["nodes"]],
         "reviews": [{"author": login(r["author"]), "submitted_at": r["submittedAt"], "commit_sha": (r["commit"] or {}).get("oid", "")} for r in p["reviews"]["nodes"]],
         "comments": comments,
@@ -432,7 +468,8 @@ def post_status(repo, sha, verdict):
 def post_comment(repo, number, body):
     """One PR (issue) comment via the caller's GITHUB_TOKEN. Needs only pull-requests: write,
     which every caller grants (probe, BJGLLC/.github#5 run 36483153709). A GITHUB_TOKEN comment
-    triggers no workflow, so the nudge never re-runs the gate."""
+    triggers no workflow (and the callers admit issue_comment only from Codex), so the nudge
+    never re-runs the gate: Codex's reply does, or the poller still running sees it."""
     gh("api", "-X", "POST", f"repos/{repo}/issues/{number}/comments", "-f", f"body={body}")
 
 
@@ -447,6 +484,26 @@ def run_nudge(repo, number):
     if post:
         post_comment(repo, number, nudge_body(pr["head_sha"]))
     return post
+
+
+def poller_nudge(repo, number, pr, verdict, now):
+    """The poller's ask (SSSF-46): nudge_due -> at most one `@codex review` with the head's
+    marker. Returns whether it posted. A failed post is loud (an ::error:: annotation naming the
+    remedy) but never ends the poll: the status still gets posted, and since nothing marks the
+    head as asked, the next iteration tries again."""
+    post, why = nudge_due(pr, verdict, now)
+    print(json.dumps({"pr": number, "sha": pr["head_sha"], "nudge": post, "why": why}), flush=True)
+    if not post:
+        return False
+    try:
+        post_comment(repo, number, nudge_body(pr["head_sha"]))
+    except subprocess.CalledProcessError as e:
+        print(annotation("error", f"the gate could not ask Codex about PR #{number} "
+                                  f"(gh exit {e.returncode}: {(e.stderr or '').strip()}); retrying next poll. "
+                                  f"Or comment {REVIEW_REQUEST} on the PR yourself.",
+                         title="review-verdict nudge"), flush=True)
+        return False
+    return True
 
 
 
@@ -525,16 +582,22 @@ def withhold_success(v, not_queued, number):
     return {**v, "state": "failure", "description": desc[:140]}
 
 
-def run_once(repo, number, now=None):
+def run_once(repo, number, now=None, nudge=False):
     """The one-shot path, shared by `<repo> <n>` and every `poll` iteration:
     fetch -> compute -> queue P2/P3 threads for the janitor -> post status. Queue BEFORE
     publishing, so success is only ever posted once every finding is durable (a lost marker
-    posts failure, then raises QueueError). No mode-specific input (asked_at comes from
-    fetch(), R23b) and no PR comments (only run_nudge comments, on synchronize).
+    posts failure, then raises QueueError). No mode-specific input to the verdict (asked_at
+    comes from fetch(), R23b). nudge=True (the poller only, SSSF-46) may post the one
+    `@codex review` for the head (poller_nudge) before the status, which is then computed as
+    asked, so it says "waiting" rather than flapping to "comment @codex review" and back. The
+    one-shot path never comments: one-shot runs are not serialized with the poller.
     Returns (pr, verdict, now) so the poller can decide whether to keep going."""
     pr = fetch(repo, number)
     now = now or datetime.now(timezone.utc)
     v = compute(pr, now)
+    if nudge and poller_nudge(repo, number, pr, v, now):
+        pr = {**pr, "nudged": True}
+        v = compute(pr, now)
     print(json.dumps({"pr": number, "sha": pr["head_sha"], **v}), flush=True)
     not_queued = queue_threads(v["queue"])
     v = withhold_success(v, not_queued, number)
@@ -546,11 +609,11 @@ def run_once(repo, number, now=None):
 
 def poll(repo, number, *, step=None, sleep=time.sleep,
          interval=POLL_INTERVAL, max_errors=POLL_MAX_ERRORS):
-    """run_once every `interval` s until poll_done. A failed iteration (gh/API hiccup) is
-    retried; only `max_errors` consecutive failures end the poller, because a dead poller
-    leaves the PR pending with no ask and no 30-minute escalation until some other event
-    arrives."""
-    step = step or run_once
+    """run_once (with the poller's nudge) every `interval` s until poll_done. A failed
+    iteration (gh/API hiccup) is retried; only `max_errors` consecutive failures end the
+    poller, because a dead poller leaves the PR pending with no ask and no 30-minute
+    escalation until some other event arrives."""
+    step = step or (lambda r, n: run_once(r, n, nudge=True))
     errors = 0
     while True:
         try:

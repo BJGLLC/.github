@@ -392,9 +392,11 @@ class PollDone(unittest.TestCase):
         for state in ("success", "failure"):
             self.assertTrue(rv.poll_done(pr(), dict(pending(), state=state), T0 + timedelta(minutes=1)), state)
 
-    def test_stops_8_minutes_after_the_clock_start(self):  # SSSF-25 short poll (was 31)
-        self.assertFalse(rv.poll_done(pr(), pending(), T0 + timedelta(minutes=7, seconds=59)))
-        self.assertTrue(rv.poll_done(pr(), pending(), T0 + timedelta(minutes=8)))
+    def test_holds_until_codex_unavailable_30_minutes_after_the_clock_start(self):
+        # SSSF-46: SSSF-25's stop at +8 left a PR Codex never answered pending for good (nothing
+        # else recomputes it), so the poller holds until the verdict or the 30-min failure.
+        self.assertFalse(rv.poll_done(pr(), pending(), T0 + timedelta(minutes=29, seconds=59)))
+        self.assertTrue(rv.poll_done(pr(), pending(), T0 + timedelta(minutes=30)))
 
     def test_rerun_long_after_push_stops_immediately(self):
         self.assertTrue(rv.poll_done(pr(), pending(), T0 + timedelta(days=2)))
@@ -418,8 +420,8 @@ class NoRereviewFlag(unittest.TestCase):  # R32's re-review flag stays gone; the
 
 class FakeGitHub:
     """Records the side effects run_once performs; hands back a fixed PR from fetch. Any
-    other gh call (e.g. posting a comment) fails the test: run_once never comments (only the
-    `nudge` subcommand does, on synchronize).
+    other gh call (e.g. posting a comment) fails the test: the one-shot run_once never comments
+    (only the poller does: the `nudge` subcommand on synchronize, run_once(nudge=True), SSSF-46).
     fail_reply / fail_check: thread ids whose marker reply / fresh marker check raises like a
     failed gh call. queued_now: thread ids the fresh check finds already marked (another run
     replied after this run's fetch). A thread this fake replied to reads as marked from then on."""
@@ -641,13 +643,15 @@ class NeedsSummaryScan(unittest.TestCase):  # R46: pure decision behind the mark
 
 
 class FetchWiring(unittest.TestCase):
-    def fetch_with(self, ready=(), comments=(), created=None, total=None, scanned=()):
+    def fetch_with(self, ready=(), comments=(), created=None, total=None, scanned=(), author=None):
         """ready = createdAt of READY_FOR_REVIEW / REOPENED timeline events; created = PR createdAt
         (default: an hour before the push, i.e. the PR predates its head); total = the PR's
         comments.totalCount (default: all of them are in the fetched window); scanned = what
-        the full-history REST marker scan returns. self.calls records every gh call."""
+        the full-history REST marker scan returns; author = the PR's author node (None: a
+        deleted account). self.calls records every gh call."""
         gql = {"data": {"repository": {"pullRequest": {
             "headRefOid": "abc", "isDraft": True, "state": "OPEN", "labels": {"nodes": [{"name": "x"}]},
+            "author": author,
             "createdAt": created or iso(T0 - timedelta(hours=1)),
             "commits": {"nodes": [{"commit": {"committedDate": iso(T0), "checkSuites": {"nodes": []}}}]},
             "timelineItems": {"nodes": [{"createdAt": r} for r in ready]},
@@ -717,6 +721,12 @@ class FetchWiring(unittest.TestCase):
 
     def test_reopen_event_starts_the_clock(self):  # R23e: timeline nodes carry READY_FOR_REVIEW and REOPENED alike
         self.assertEqual(self.fetch_with(ready=[iso(T0 + timedelta(hours=2))])["asked_at"], iso(T0 + timedelta(hours=2)))
+
+    def test_fetch_reports_the_pr_authors_type(self):  # SSSF-46: a Bot author is asked for at once
+        self.assertEqual(self.fetch_with(author={"__typename": "Bot"})["author_type"], "Bot")
+        self.assertEqual(self.fetch_with(author={"__typename": "User"})["author_type"], "User")
+        self.assertEqual(self.fetch_with()["author_type"], "")   # a deleted account: GitHub reports null
+        self.assertRegex(rv.GQL, r"pullRequest\(number:\$n\)\{\s*headRefOid[^\n]*\bauthor\{__typename\}")
 
     def test_query_asks_for_pr_created_at_and_both_event_types(self):  # R23e wiring
         self.assertRegex(rv.GQL, r"pullRequest\(number:\$n\)\{\s*headRefOid[^\n]*\bcreatedAt\b")
@@ -801,8 +811,8 @@ class AskedAtClock(unittest.TestCase):  # R23
 
     def test_poll_deadline_uses_the_later_of_push_and_asked_at(self):
         p = pr(asked_at=iso(ASK))
-        self.assertFalse(rv.poll_done(p, pending(), ASK + timedelta(minutes=7, seconds=59)))
-        self.assertTrue(rv.poll_done(p, pending(), ASK + timedelta(minutes=8)))
+        self.assertFalse(rv.poll_done(p, pending(), ASK + timedelta(minutes=29, seconds=59)))
+        self.assertTrue(rv.poll_done(p, pending(), ASK + timedelta(minutes=30)))
 
     def test_once_path_uses_the_fetched_asked_at(self):
         # Review Focus 4: the clock comes from fetch(), so a one-shot run (e.g. Codex's
@@ -851,7 +861,7 @@ def poll_job_timeout():
 REUSABLE_WF = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".github", "workflows", "review-verdict.yml")
 
 
-class SilentCodexReplay(unittest.TestCase):  # R23c/R23d; SSSF-25: the poller stops at +8, a recompute escalates
+class SilentCodexReplay(unittest.TestCase):  # R23c/R23d; SSSF-46: the poller itself escalates at +30
     def setUp(self):
         self.POLL_JOB_TIMEOUT = poll_job_timeout()
 
@@ -870,22 +880,25 @@ class SilentCodexReplay(unittest.TestCase):  # R23c/R23d; SSSF-25: the poller st
         rv.run_once("o/r", 7, now=now)
         return g.posted[-1]
 
-    def test_opened_no_codex_poller_stops_pending_at_8_and_a_recompute_escalates(self):
-        # SSSF-25: the poller holds a runner for at most 8 min, then stops with the PR pending.
-        p, v, now = self.state_at(8, [])
-        self.assertEqual((v["state"], v["description"]), ("pending", WAIT_NEW))
+    def test_opened_no_codex_the_poller_itself_posts_codex_unavailable_at_30(self):
+        # SSSF-46: the SSSF-25 poller stopped pending at +8 and nothing recomputed the PR (no
+        # event: a 👍 fires none), so it hung. Now it holds, still pending at +29, red at +30.
+        p, v, now = self.state_at(29, [])
+        self.assertEqual(v["state"], "pending"); self.assertFalse(rv.poll_done(p, v, now))
+        p, v, now = self.state_at(30, [])
+        self.assertEqual(v, {"state": "failure", "description": UNAVAILABLE_30, "queue": []})
         self.assertTrue(rv.poll_done(p, v, now))
         self.assertLess(now - T0, self.POLL_JOB_TIMEOUT)
-        # Recomputes (dispatch or any later event) still ask at +10 and fail at +30, exactly as today.
+        # A recompute (dispatch or any later event) with nobody asking still asks at +10.
         self.assertEqual(self.recompute_at(10, [])["description"], ASK_NEW)
-        self.assertEqual(self.recompute_at(29, [])["state"], "pending")
         self.assertEqual(self.recompute_at(30, []), {"state": "failure", "description": UNAVAILABLE_30, "queue": []})
 
     def test_ready_for_review_no_codex_is_unavailable_30_min_after_ready(self):
         ready = [iso(T0 + timedelta(minutes=40))]  # poller starts at +40
-        p, v, now = self.state_at(48, [], ready)
-        self.assertEqual(v["state"], "pending"); self.assertTrue(rv.poll_done(p, v, now))
-        self.assertEqual(self.recompute_at(69, [], ready)["state"], "pending")
+        p, v, now = self.state_at(69, [], ready)
+        self.assertEqual(v["state"], "pending"); self.assertFalse(rv.poll_done(p, v, now))
+        p, v, now = self.state_at(70, [], ready)
+        self.assertEqual(v["description"], UNAVAILABLE_30); self.assertTrue(rv.poll_done(p, v, now))
         self.assertEqual(self.recompute_at(70, [], ready)["description"], UNAVAILABLE_30)
 
     def human_retry(self, minutes):
@@ -915,20 +928,18 @@ class SilentCodexReplay(unittest.TestCase):  # R23c/R23d; SSSF-25: the poller st
 
     # ---- R23e: PR creation and reopen are clock starts too -----------------------------
     def assert_relative_timings(self, start_min):
-        """From a clock start at T0+start_min (its own poller starts there): waiting at +5, the
-        poller done at +8 (inside its job timeout); then recomputes ask for `@codex review` at
-        +10 and post codex-unavailable at +30."""
+        """From a clock start at T0+start_min (its own poller starts there): waiting at +5, a
+        recompute nobody asked about asks for `@codex review` at +10, the poller still holding
+        at +29 and done at +30 with codex-unavailable, inside its job timeout (SSSF-46)."""
         starts = [iso(T0 + timedelta(minutes=start_min))]
         _, v, _ = self.state_at(start_min + 5, [], starts)
         self.assertEqual(v["state"], "pending"); self.assertEqual(v["description"], WAIT_NEW)
-        p, v, now = self.state_at(start_min + 7, [], starts)
-        self.assertFalse(rv.poll_done(p, v, now))
-        p, v, now = self.state_at(start_min + 8, [], starts)
-        self.assertEqual(v["state"], "pending"); self.assertTrue(rv.poll_done(p, v, now))
-        self.assertLess(now - rv.ts(starts[0]), self.POLL_JOB_TIMEOUT)
         self.assertEqual(self.recompute_at(start_min + 10, [], starts)["description"], ASK_NEW)
-        self.assertEqual(self.recompute_at(start_min + 29, [], starts)["state"], "pending")
-        self.assertEqual(self.recompute_at(start_min + 30, [], starts)["description"], UNAVAILABLE_30)
+        p, v, now = self.state_at(start_min + 29, [], starts)
+        self.assertEqual(v["state"], "pending"); self.assertFalse(rv.poll_done(p, v, now))
+        p, v, now = self.state_at(start_min + 30, [], starts)
+        self.assertEqual(v["description"], UNAVAILABLE_30); self.assertTrue(rv.poll_done(p, v, now))
+        self.assertLess(now - rv.ts(starts[0]), self.POLL_JOB_TIMEOUT)
 
     def test_pr_opened_45_min_after_the_push(self):
         self.assert_relative_timings(45)   # the P1: previously codex-unavailable on the first poll
@@ -1316,16 +1327,15 @@ class NudgeWiring(unittest.TestCase):
                                                      "statuses": "write", "issues": "read"})
 
 
-class ShortPoll(unittest.TestCase):
-    def test_window_is_8_minutes(self):
-        self.assertEqual(rv.POLL_WINDOW, timedelta(minutes=8))
-        self.assertFalse(hasattr(rv, "POLL_DEADLINE"))
+class PollHold(unittest.TestCase):  # SSSF-46: was ShortPoll (SSSF-25's 8-min window stalled PRs)
+    def test_the_8_minute_window_is_gone(self):
+        self.assertFalse(hasattr(rv, "POLL_WINDOW")); self.assertFalse(hasattr(rv, "POLL_DEADLINE"))
 
-    def test_job_timeout_covers_the_window_and_stays_short(self):
-        # window + the last sleep + slack for the nudge, checkout and a slow fetch
+    def test_job_timeout_covers_codex_unavailable_and_stays_bounded(self):
+        # 30 min + the last sleep + slack for the nudge, checkout and a slow fetch; never open-ended
         t = poll_job_timeout()
-        self.assertGreaterEqual(t, rv.POLL_WINDOW + timedelta(seconds=rv.POLL_INTERVAL) + timedelta(minutes=2))
-        self.assertLessEqual(t, timedelta(minutes=15))
+        self.assertGreaterEqual(t, rv.UNAVAILABLE_AFTER + timedelta(seconds=rv.POLL_INTERVAL) + timedelta(minutes=2))
+        self.assertLessEqual(t, timedelta(minutes=36))
 
     def test_dispatch_recompute_is_the_one_shot_path(self):
         once = workflow()["jobs"]["once"]
@@ -1553,6 +1563,197 @@ class EditedFirstComment(unittest.TestCase):  # SSSF-38: a write-access actor ed
 
     def test_the_fetch_query_selects_the_editor(self):
         self.assertIn("editor{login __typename}", rv.GQL); self.assertIn("lastEditedAt", rv.GQL)
+
+
+# ==== SSSF-46: an unattended PR reaches green or red with no human event ===================
+# 9/30: Codex's auto-review on open left only a 👍 (R46: never a verdict), the gate asked only
+# on synchronize, and the poller stopped at +8, so the PR sat pending with no event left to
+# recompute it. Now the poller asks Codex itself when nobody has (at ASK_AFTER, or at once for
+# a bot-authored PR, which Codex never reviews by itself) and holds until a verdict or the
+# 30-min codex-unavailable failure.
+THUMBS_UP = {"user": CODEX + "[bot]", "content": "+1", "created_at": iso(T0 + timedelta(minutes=4))}
+WAIT_HEAD = f"waiting for Codex review of {HEAD[:7]}"
+ASK_HEAD = f"no Codex review of {HEAD[:7]} yet: comment @codex review"
+
+
+def opened(author_type="User", **over):
+    """A PR opened at T0 (its head pushed just before) whose only Codex trace is a 👍 on the PR
+    (not even fetched: R46) and that nobody has asked about."""
+    return fetched(**{"reactions": [THUMBS_UP], "author_type": author_type, "asked_at": iso(T0), **over})
+
+
+def at(minutes):
+    return T0 + timedelta(minutes=minutes)
+
+
+class NudgeDue(unittest.TestCase):
+    def due(self, p, minutes):
+        return rv.nudge_due(p, compute(p, at(minutes)), at(minutes))
+
+    def test_thumbs_up_only_unnudged_pr_is_due_at_ask_after(self):
+        self.assertFalse(self.due(opened(), 9)[0])
+        post, why = self.due(opened(), 10)
+        self.assertTrue(post, why)
+
+    def test_a_bot_authored_pr_is_due_at_once(self):  # Codex auto-reviews only its users' own PRs
+        post, why = self.due(opened("Bot"), 0)
+        self.assertTrue(post); self.assertIn("bot", why)
+
+    def test_a_pr_with_a_verdict_is_never_nudged(self):
+        cases = {"success": {"reviews": [review(3, HEAD)]},
+                 "P1 failure": {"reviews": [review(3, HEAD)], "threads": [thread("T1", 1, 3, sha=HEAD)]},
+                 "codex error": {"comments": [asked(REAL_ERROR, 3, CODEX)]}}
+        for name, over in cases.items():
+            for author_type in ("User", "Bot"):
+                with self.subTest(name, author_type=author_type):
+                    p = opened(author_type, **over)
+                    self.assertNotEqual(compute(p, at(11))["state"], "pending")
+                    self.assertFalse(self.due(p, 11)[0])
+
+    def test_a_pr_with_the_sticky_summary_for_its_head_is_never_nudged(self):
+        # Codex has this head in hand: it answers by editing the summary (an issue_comment
+        # event); a completed summary is a verdict (above).
+        for status in ("running", "unknown"):
+            for author_type in ("User", "Bot"):
+                with self.subTest(status=status, author_type=author_type):
+                    p = opened(author_type, summary={"status": status, "commit": HEAD[:7]})
+                    self.assertEqual(compute(p, at(11))["state"], "pending")
+                    post, why = self.due(p, 11)
+                    self.assertFalse(post); self.assertIn("summary", why)
+
+    def test_a_summary_for_an_older_head_does_not_block(self):
+        # after a push the summary still names the old commit; if the synchronize nudge
+        # failed, this is its retry
+        self.assertTrue(self.due(opened(summary={"status": "completed", "commit": "0ld1234"}), 10)[0])
+
+    def test_nudge_decisions_skips_still_hold(self):
+        for over in ({"draft": True}, {"labels": ["hotfix"]}, {"state": "MERGED"},
+                     {"comments": [asked(rv.nudge_body(HEAD), 1, "github-actions")]},
+                     {"comments": [asked("@codex review", 1)]}):
+            for author_type in ("User", "Bot"):
+                with self.subTest(over=str(over)[:40], author_type=author_type):
+                    self.assertFalse(self.due(opened(author_type, **over), 11)[0])
+
+    def test_it_reuses_nudge_decision(self):
+        orig = rv.nudge_decision
+        rv.nudge_decision = lambda p: (False, "stubbed"); self.addCleanup(setattr, rv, "nudge_decision", orig)
+        self.assertEqual(self.due(opened("Bot"), 11), (False, "stubbed"))
+
+
+class FakeUnattendedGitHub:
+    """One PR on a fake clock, nobody watching. Codex answers any `@codex review` (first line)
+    `answer_after` later with a head-named clean comment; None = it never answers (an outage,
+    or a repo where it ignores the gate's bot identity). Posted comments land on the shared PR,
+    so every later run sees them (runs are serialized per PR by the poll job's concurrency
+    group). post_fails = how many comment posts fail like a gh error first."""
+    def __init__(self, test, prdict, answer_after=timedelta(minutes=2), post_fails=0):
+        self.pr, self.now, self.answer_after, self.post_fails = prdict, T0, answer_after, post_fails
+        self.nudges, self.statuses = [], []
+        for name, fn in (("fetch", self.fetch), ("post_status", self.post_status), ("post_comment", self.post_comment),
+                         ("reply_thread", lambda *a: test.fail("nothing to queue")),
+                         ("thread_is_queued", lambda *a: test.fail("nothing to queue")),
+                         ("gh", lambda *a, **k: test.fail(f"unexpected gh call: {a[:4]}"))):
+            orig = getattr(rv, name); setattr(rv, name, fn); test.addCleanup(setattr, rv, name, orig)
+
+    def fetch(self, repo, n):
+        p = json.loads(json.dumps(self.pr))
+        for c in list(p["comments"]):
+            if (self.answer_after is not None and c["body"].splitlines()[0] == rv.REVIEW_REQUEST
+                    and self.now >= ts(c["created_at"]) + self.answer_after):
+                p["comments"].append({"author": CODEX, "created_at": iso(ts(c["created_at"]) + self.answer_after),
+                                      "body": "Codex Review: Didn't find any major issues. Nice work!\n\n"
+                                              f"**Reviewed commit:** `{p['head_sha'][:10]}`"})
+        p["nudged"] = rv.is_nudged(p["comments"], p["head_pushed_at"])
+        return p
+
+    def post_status(self, repo, sha, v):
+        self.statuses.append((self.now, v["state"], v["description"])); return "posted"
+
+    def post_comment(self, repo, n, body):
+        if self.post_fails:
+            self.post_fails -= 1
+            raise subprocess.CalledProcessError(1, ["gh", "api"], stderr="HTTP 502: Bad Gateway\n")
+        self.nudges.append((self.now, body))
+        self.pr["comments"].append({"author": "github-actions", "body": body, "created_at": iso(self.now)})
+
+    def poll(self):
+        """The real poll loop over the real run_once with the poller's nudge on; every sleep
+        advances the clock. Returns (verdict, stdout)."""
+        def sleep(s):
+            self.now += timedelta(seconds=s)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            v = rv.poll("o/r", 7, step=lambda r, n: rv.run_once(r, n, now=self.now, nudge=True), sleep=sleep)
+        return v, out.getvalue()
+
+
+class UnattendedPoll(unittest.TestCase):
+    def test_thumbs_up_only_pr_gets_one_nudge_at_10_min_and_codexs_answer_is_success(self):
+        g = FakeUnattendedGitHub(self, opened())
+        v, _ = g.poll()
+        self.assertEqual(v["state"], "success")
+        self.assertEqual(g.nudges, [(at(10), rv.nudge_body(HEAD))])
+        self.assertEqual(g.now, at(12))  # the runner is released as soon as the verdict lands
+
+    def test_a_bot_authored_pr_is_nudged_on_the_first_iteration(self):
+        g = FakeUnattendedGitHub(self, opened("Bot"))
+        v, _ = g.poll()
+        self.assertEqual(v["state"], "success")
+        self.assertEqual([t for t, _ in g.nudges], [at(0)]); self.assertEqual(g.now, at(2))
+
+    def test_codex_never_answers_one_nudge_then_codex_unavailable_at_30(self):
+        # the stall: pending forever before; now red with the remedy, inside the job timeout
+        for author_type in ("User", "Bot"):
+            with self.subTest(author_type=author_type):
+                g = FakeUnattendedGitHub(self, opened(author_type), answer_after=None)
+                v, _ = g.poll()
+                self.assertEqual(v, {"state": "failure", "description": UNAVAILABLE_30, "queue": []})
+                self.assertEqual(len(g.nudges), 1, g.nudges)  # fails if the nudge posts twice
+                self.assertEqual(g.now, at(30)); self.assertLess(g.now - T0, poll_job_timeout())
+
+    def test_a_second_run_posts_nothing(self):
+        g = FakeUnattendedGitHub(self, opened(), answer_after=None)
+        for m in (11, 11.02, 12, 20):
+            g.now = at(m)
+            with contextlib.redirect_stdout(io.StringIO()):
+                rv.run_once("o/r", 7, now=g.now, nudge=True)
+        self.assertEqual([t for t, _ in g.nudges], [at(11)])
+
+    def test_the_nudging_iteration_posts_waiting_never_the_ask(self):
+        # the gate asked, so the status does not flap to "comment @codex review" and back
+        g = FakeUnattendedGitHub(self, opened(), answer_after=None)
+        g.poll()
+        self.assertEqual({d for _, s, d in g.statuses if s == "pending"}, {WAIT_HEAD})
+
+    def test_a_sticky_summary_pr_is_never_nudged_and_still_goes_red_at_30(self):
+        g = FakeUnattendedGitHub(self, opened(summary={"status": "running", "commit": HEAD[:7]}), answer_after=None)
+        v, _ = g.poll()
+        self.assertEqual(g.nudges, []); self.assertEqual(v["description"], UNAVAILABLE_30)
+
+    def test_a_failed_nudge_is_loud_keeps_polling_and_is_retried_next_iteration(self):
+        g = FakeUnattendedGitHub(self, opened(), post_fails=1)
+        v, out = g.poll()
+        self.assertEqual(v["state"], "success")
+        self.assertEqual([t for t, _ in g.nudges], [at(11)])
+        err = [l for l in out.splitlines() if l.startswith("::error")]
+        self.assertEqual(len(err), 1, out); self.assertIn("@codex review", err[0]); self.assertIn("502", err[0])
+        self.assertIn((at(10), "pending", ASK_HEAD), g.statuses)  # meanwhile the status asks a human
+
+    def test_the_once_path_never_nudges(self):
+        g = FakeUnattendedGitHub(self, opened("Bot"), answer_after=None)
+        with contextlib.redirect_stdout(io.StringIO()):
+            rv.run_once("o/r", 7, now=at(11))
+        self.assertEqual(g.nudges, [])
+
+    def test_the_poll_subcommand_nudges(self):
+        calls = []
+
+        def fake_run_once(repo, n, **kw):
+            calls.append(kw)
+            return opened(), {"state": "success", "description": "", "queue": []}, at(1)
+        orig = rv.run_once; rv.run_once = fake_run_once; self.addCleanup(setattr, rv, "run_once", orig)
+        rv.poll("o/r", 7, sleep=lambda s: self.fail("a verdict ends the loop"))
+        self.assertEqual(calls, [{"nudge": True}])
 
 
 if __name__ == "__main__":

@@ -8,22 +8,26 @@
 #   poll   — pull_request opened/synchronize/reopened/ready_for_review. On synchronize (a new
 #            head) it first asks Codex: one `@codex review` comment with a hidden per-SHA
 #            marker, skipped for drafts, `hotfix`, closed PRs and heads someone already asked
-#            about (SSSF-25, Blake 2026-09-28; reverses R32 "the gate never comments"). Codex
-#            reviews opened / ready PRs by itself, so those are never nudged. Then it waits for
-#            Codex <=8 min after it was asked (asked_at, which the script derives from PR state:
-#            the latest of the push, the PR's creation, the last draft->ready and the last
-#            reopen -- each of which starts its own poller; `@codex review` comments never move
-#            it). Codex's reply fires issue_comment / pull_request_review, which recompute by
-#            themselves, so a longer hold only bills runner minutes. No cron: the $25/mo hard
-#            Actions budget cannot carry one.
+#            about (SSSF-25, Blake 2026-09-28; reverses R32 "the gate never comments"). Then it
+#            polls every 60 s until a verdict or the codex-unavailable failure, 30 min after the
+#            clock start (asked_at, which the script derives from PR state: the latest of the
+#            push, the PR's creation, the last draft->ready and the last reopen -- each of which
+#            starts its own poller; `@codex review` comments never move it). SSSF-46: while it
+#            polls it asks Codex itself, once per head, when nobody has: at +10 min, or at once
+#            on a bot-authored PR (Codex reviews by itself only PRs its users authored, and its
+#            review on open can be a bare 👍, which is never a verdict and fires no event). When
+#            Codex answers, its reply ends the hold (~2 min after a request); only a request
+#            nobody answers holds the full 30 min, and that PR goes red instead of hanging.
+#            No cron: the $25/mo hard Actions budget cannot carry one per repo.
 #   once   — every other event: one fetch -> compute -> post, or a drill (workflow_dispatch;
 #            only `p1-open`, and a drill may only ever post failure -- R39: a success drill
-#            satisfied the required check on any head).
+#            satisfied the required check on any head). It never comments: only the poller,
+#            serialized per PR, asks Codex, so a head is asked about once.
 # pull_request `closed` runs nothing (a running poller sees the close and stops by itself).
-# Codex silent: the poller stops at +8 min with the status pending. Any later event, or
-# `gh workflow run <caller>.yml -f pr=<n>`, recomputes: at +10 the pending description asks
-# for `@codex review` if nobody asked; at +30 it posts the codex-unavailable failure. If nobody
-# recomputes, the status stays pending, and pending blocks the merge: it fails safe.
+# Codex silent: the poller asks at +10 (if nobody did) and posts the codex-unavailable failure
+# at +30 (retry `@codex review` from your own account, or label `hotfix`). A poller that died
+# early (3 straight gh errors) leaves the PR pending: recompute it with
+# `gh workflow run <caller>.yml -f pr=<n>`; pending blocks the merge, so it fails safe.
 # P2/P3 threads get a `queued-for-janitor` reply (the queue entry); the gate never resolves
 # them (resolveReviewThread needs contents: write, which no caller grants). Event data and
 # dispatch inputs reach shell only via env: (never ${{ }} inside run:). Agent order after a
@@ -54,7 +58,7 @@ jobs:
   poll:
     if: github.event_name == 'pull_request' && contains(fromJSON('["opened","synchronize","reopened","ready_for_review"]'), github.event.action)
     runs-on: ubuntu-latest
-    timeout-minutes: 12   # the 8-min window + the last 60-s sleep + the nudge + slack
+    timeout-minutes: 35   # codex-unavailable at +30 + the last 60-s sleep + the nudges + slack (SSSF-46)
     concurrency:          # a newer push cancels the superseded poller for the same PR; one poller
                           # per PR at a time is also what makes the nudge's marker check race-free
       group: review-verdict-poll-${{ github.repository }}-${{ github.event.pull_request.number }}
@@ -70,7 +74,7 @@ jobs:
         run: |
           [[ "$PR" =~ ^[1-9][0-9]*$ ]] || { echo "::error::no PR number in the pull_request payload"; exit 1; }
           python3 scripts/review_verdict.py nudge "$GITHUB_REPOSITORY" "$PR"
-      - name: Poll until Codex's verdict lands (<=8 min after it was last asked)
+      - name: Poll until Codex's verdict or codex-unavailable (<=30 min; asks Codex once if nobody has)
         if: ${{ !cancelled() }}   # a failed nudge (red, annotated) must not leave the head without a status
         env:
           GH_TOKEN: ${{ github.token }}
