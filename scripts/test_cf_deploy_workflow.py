@@ -219,6 +219,55 @@ class CfDeploy(unittest.TestCase):
         env = next(s["env"] for s in self.j["guard"]["steps"] if s.get("id") == "u")
         self.assertEqual(env["KIND"], "${{ inputs.kind }}")
 
+    # --- range filter + client production (SSSF-31 carries; decisions 01M3N14TGN §3, 01M46ESRWR) ---
+    def test_new_inputs_and_secret_are_declared(self):
+        call = load("cf-deploy.yml")["on"]["workflow_call"]
+        self.assertEqual(call["inputs"]["client"], {"type": "boolean", "default": False})
+        self.assertEqual(call["inputs"]["build_paths"], {"type": "string", "default": ""})
+        self.assertEqual(call["secrets"]["MOSHI_TOKEN"], {"required": False})
+
+    def test_range_filter_and_client_reach_decide_through_env(self):
+        step = self._step("guard", "id", "d")
+        self.assertEqual(step["env"]["BUILD_PATHS"], "${{ inputs.build_paths }}")
+        self.assertEqual(step["env"]["CLIENT"], "${{ inputs.client }}")
+        self.assertEqual(step["env"]["PING"], "${{ secrets.MOSHI_TOKEN != '' }}")
+        for s in ('args+=(--build-paths "$BUILD_PATHS")', "args+=(--client)", "args+=(--ping-configured)"):
+            self.assertIn(s, step["run"])
+
+    def test_a_refused_client_deploy_pings_blake_before_the_run_goes_red(self):
+        run = self._step("guard", "id", "d")["run"]
+        refused = run[run.index("refused:*)"):]
+        refused = refused[:refused.index(";;")]
+        self.assertIn("deploy_notify.py ping", refused)
+        self.assertIn('[ "$CLIENT" = true ] && [ "$ENVN" = production ]', refused)
+        self.assertLess(refused.index("deploy_notify.py ping"), refused.index("exit 1"))
+
+    def test_a_skip_is_silent_by_design(self):
+        # nothing ships on a skip (build-free range, already live, older than live, frozen after a pinged rollback)
+        run = self._step("guard", "id", "d")["run"]
+        skip = run[run.index("skip:*)"):]
+        self.assertNotIn("ping", skip[:skip.index(";;")])
+        self.assertIn("rolls back or is refused", (WF / "cf-deploy.yml").read_text())
+
+    def test_client_production_probes_live_before_and_after_and_pings(self):
+        pb = self._step("guard", "id", "pb")
+        for s in ("inputs.client", "inputs.env == 'production'", "steps.d.outputs.go == 'true'"):
+            self.assertIn(s, pb["if"])
+        self.assertIn("deploy_notify.py probe", pb["run"])
+        self.assertEqual(self.j["guard"]["outputs"]["before"], "${{ steps.pb.outputs.before }}")
+        n = self._step("report", "name", "PR comment + Linear")
+        self.assertEqual(n["env"]["MOSHI_TOKEN"], "${{ secrets.MOSHI_TOKEN }}")
+        self.assertEqual(n["env"]["BEFORE"], "${{ needs.guard.outputs.before }}")
+        for s in ("deploy_notify.py probe", "args+=(--client", '--before "$BEFORE"', '--after "$after"'):
+            self.assertIn(s, n["run"])
+
+    def test_the_moshi_token_reaches_only_lib_steps(self):
+        for name, job in self.j.items():
+            for s in job.get("steps", []):
+                if "MOSHI_TOKEN }}" in str(s.get("env", {})):
+                    self.assertIn((name, s.get("id") or s.get("name")), {("guard", "d"), ("report", "PR comment + Linear")})
+        self.assertNotIn("MOSHI", (WF / "cf-ship.yml").read_text())
+
 
 class CfShip(unittest.TestCase):
     def setUp(self):

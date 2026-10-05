@@ -330,7 +330,7 @@ class RecordedBuild(unittest.TestCase):
         # A was live without params; B deployed, failed smoke (its failure record is newest); B still serves.
         deps = [self.dep(B, "failure", {}), self.dep(A, "success", {})]
         c = self._gather(deps)
-        self.assertEqual(c["live_sha"], A)
+        self.assertEqual(c["live_sha"], "")  # CF mode: a record without params is nobody's rollback target
         self.assertNotIn("seedable", c)
         self.assertRefusesNoRecord(decide(c))
 
@@ -359,7 +359,7 @@ class RecordedBuild(unittest.TestCase):
         with mock.patch.object(deploy_guard, "gather", lambda *a: seen.append(a) or ctx(current_build=None, live_build=None)), \
                 contextlib.redirect_stdout(io.StringIO()):
             deploy_guard.main(["decide", "--repo", "o/r", "--sha", B, "--reason", "deploy", "--env", "production"])
-        self.assertIsNone(seen[0][-1])
+        self.assertIsNone(seen[0][6])  # gather's current_build
 
     def test_node_specs_with_dot_dot_are_rejected(self):
         for v in ("..", "20..1", "lts/../x", "../20"):
@@ -459,6 +459,262 @@ class Gather(unittest.TestCase):
                 contextlib.redirect_stderr(io.StringIO()) as se, self.assertRaises(subprocess.CalledProcessError):
             deploy_guard.gh("api", "x")
         self.assertIn("HTTP 403: nope", se.getvalue())
+
+
+BOT = {"login": "github-actions[bot]", "type": "Bot"}
+MALLORY = {"login": "mallory", "type": "User"}
+
+
+def rec(sha, state, payload=None, creator=BOT):
+    return {"sha": sha, "state": state, "created_at": "", "payload": payload or {}, "creator": creator}
+
+
+def gather_with(deps, sha=B, reason="deploy", env="production", current_build=BUILD_B, files=None, drill=(), extra=()):
+    """gather() over a fake ledger. `files`: what the compare API lists for live...sha. `extra`: gather's
+    positional args after current_build (build_paths, client, ping_configured)."""
+    calls = []
+
+    def fake_ledger(repo, e, n=20, s=""):
+        calls.append(("ledger", e, s))
+        if e == "drill":
+            return list(drill)
+        return [d for d in deps if not s or d["sha"] == s]
+
+    def fake_gh_json(path):
+        calls.append(("gh_json", path))
+        if "/compare/" in path:
+            return {"status": "ahead", "files": files or []}
+        raise AssertionError(path)
+    fakes = {"gh": lambda *a, **k: sha, "now": lambda: "t", "ledger": fake_ledger, "gh_json": fake_gh_json,
+             "pr_of": lambda *a: (None, []), "ancestor_or_equal": lambda *a: True, "ci_state": lambda *a: "success",
+             "open_freezes": lambda *a: []}
+    with contextlib.ExitStack() as st:
+        for k, v in fakes.items():
+            st.enter_context(mock.patch.object(deploy_guard, k, v))
+        c = deploy_guard.gather("o/r", sha, reason, env, False, True, current_build, *extra)
+    return c, calls
+
+
+class TrustedLedger(unittest.TestCase):
+    """The CF pipeline's live/previous are the newest records it can actually roll back to (SSSF-31 carry)."""
+
+    def test_trusted_live_skips_records_nobody_can_roll_back_to(self):
+        deps = [rec(C, "success", {"build": BUILD_A}, MALLORY), rec(B, "success", {}), rec(A, "success", {"build": BUILD_A})]
+        self.assertEqual(pick_live(deps), C)  # eos mode: unchanged, the newest success
+        self.assertEqual(pick_live(deps, trusted_only=True), A)
+
+    def test_trusted_previous_returns_only_rollable_shas(self):
+        deps = [rec(A, "success", {"build": BUILD_A}), rec(C, "success", {"build": BUILD_A}, MALLORY),
+                rec(B, "success", {"build": BUILD_B})]
+        self.assertEqual(pick_previous(deps), C)
+        self.assertEqual(pick_previous(deps, trusted_only=True), B)
+        self.assertEqual(pick_previous([rec(A, "success", {"build": BUILD_A}), rec(C, "success", {})], trusted_only=True), "")
+
+    def test_trusted_previous_still_skips_rolled_back_shas(self):
+        deps = [rec(A, "success", {"build": BUILD_A, "rolled_back_from": B}), rec(B, "success", {"build": BUILD_B}),
+                rec(C, "success", {"build": BUILD_A})]
+        self.assertEqual(pick_previous(deps, trusted_only=True), C)
+
+    def test_an_untrusted_newer_record_cannot_disarm_the_auto_rollback(self):
+        # A shipped through the pipeline; then someone hand-wrote a success for C. B fails its smoke: with C
+        # as "live" the rollback had no params, so B stayed up as smoke-failed-no-target.
+        c, _ = gather_with([rec(C, "success", {}, MALLORY), rec(A, "success", {"build": BUILD_A})])
+        self.assertEqual(c["live_sha"], A)
+        d = decide(c)
+        self.assertEqual((d["go"], d["prev_sha"], json.loads(d["prev_build"])), (True, A, BUILD_A))
+        self.assertNotIn("DISARMED", d["message"])
+
+    def test_eos_mode_keeps_the_plain_ledger(self):
+        c, _ = gather_with([rec(C, "success", {}, MALLORY), rec(A, "success", {"build": BUILD_A})], current_build=None)
+        self.assertEqual(c["live_sha"], C)
+
+    def test_live_and_previous_cli_take_trusted(self):
+        deps = [rec(C, "success", {}, MALLORY), rec(B, "success", {"build": BUILD_B}), rec(A, "success", {"build": BUILD_A})]
+        for argv, want in ((["live"], C), (["live", "--trusted"], B), (["previous"], B), (["previous", "--trusted"], A)):
+            with self.subTest(argv=argv), mock.patch.object(deploy_guard, "ledger", lambda *a: deps), \
+                    contextlib.redirect_stdout(io.StringIO()) as out:
+                deploy_guard.main([argv[0], "--repo", "o/r", "--env", "production", *argv[1:]])
+            self.assertEqual(out.getvalue().strip(), want)
+
+
+class RangeFilter(unittest.TestCase):
+    """Build-change-only deploys (decision 01M3N14TGN §3), never while live is unprotected."""
+
+    PATHS = ["site/**", ".github/workflows/deploy.yml", "package*.json"]
+
+    def test_a_build_free_range_is_skipped_when_the_rollback_is_armed(self):
+        d = decide(ctx(skippable=True))
+        self.assertFalse(d["go"])
+        self.assertEqual(d["message"], "skip: aaaaaaa..bbbbbbb changes no build input; live stays aaaaaaa")
+
+    def test_never_skips_while_live_has_no_trusted_record(self):
+        # the workflow-only first deploy must ship: its green verify writes the first trusted record
+        for kw in (dict(live_build=None), dict(live_sha="", ledger_success_shas=[], live_build=None),
+                   dict(live_build={**BUILD_B, "cf_project": "other"})):
+            with self.subTest(kw=kw):
+                self.assertTrue(decide(ctx(skippable=True, **kw))["go"])
+
+    def test_never_skips_rollbacks_drills_or_eos_targets(self):
+        self.assertTrue(decide(ctx(skippable=True, reason="rollback", sha=A))["go"])
+        self.assertTrue(decide(ctx(skippable=True, env="drill"))["go"])
+        self.assertTrue(decide(ctx(skippable=True, current_build=None, live_build=None))["go"])
+
+    def test_a_hotfix_during_a_freeze_ships_even_if_build_free(self):
+        self.assertTrue(decide(ctx(skippable=True, freezes=[42], pr_labels=["hotfix"]))["go"])
+
+    def test_gather_reads_the_range_from_the_compare_api(self):
+        deps = [rec(A, "success", {"build": BUILD_A})]
+        cases = ((["README.md", "docs/a/b.md"], True), (["site/index.html"], False), (["site/a/b/c.css", "README.md"], False),
+                 ([".github/workflows/deploy.yml"], False), (["package-lock.json"], False), ([], True),
+                 ([".github/workflows/ci.yml"], True))
+        for names, skip in cases:
+            with self.subTest(names=names):
+                c, calls = gather_with(deps, files=[{"filename": n} for n in names], extra=(self.PATHS,))
+                self.assertIs(c["skippable"], skip)
+                self.assertIn(("gh_json", f"repos/o/r/compare/{A}...{B}"), calls)
+
+    def test_a_rename_out_of_a_build_path_is_a_build_change(self):
+        c, _ = gather_with([rec(A, "success", {"build": BUILD_A})], extra=(self.PATHS,),
+                           files=[{"filename": "old/index.html", "previous_filename": "site/index.html"}])
+        self.assertFalse(c["skippable"])
+
+    def test_a_truncated_file_list_is_never_skippable(self):
+        c, _ = gather_with([rec(A, "success", {"build": BUILD_A})], extra=(self.PATHS,),
+                           files=[{"filename": f"docs/{i}.md"} for i in range(300)])
+        self.assertFalse(c["skippable"])
+
+    def test_no_compare_call_without_paths_a_live_record_or_for_a_rollback(self):
+        live = [rec(A, "success", {"build": BUILD_A})]
+        for deps, kw in ((live, dict()), ([], dict(extra=(self.PATHS,))), (live, dict(extra=(self.PATHS,), reason="rollback", sha=A))):
+            with self.subTest(deps=deps, kw=kw):
+                c, calls = gather_with(deps, **kw)
+                self.assertFalse(c["skippable"])
+                self.assertFalse([x for x in calls if x[0] == "gh_json"])
+
+    def test_decide_cli_passes_the_build_paths(self):
+        seen = []
+        with mock.patch.object(deploy_guard, "gather", lambda *a: seen.append(a) or ctx()), \
+                contextlib.redirect_stdout(io.StringIO()):
+            deploy_guard.main(["decide", "--repo", "o/r", "--sha", B, "--reason", "deploy", "--env", "production",
+                               "--current-build", json.dumps(BUILD_B), "--build-paths", "site/**\nREADME.md, x/*"])
+        self.assertEqual(seen[0][7], ["site/**", "README.md", "x/*"])
+
+
+class ClientProduction(unittest.TestCase):
+    """Decision 01M46ESRWR (10/5): client deploys ship on green like anything else, plus an extra check."""
+
+    def ok(self, **kw):
+        return ctx(client=True, drill_green=True, ping_configured=True, **kw)
+
+    def test_happy_client_deploy_goes_armed(self):
+        d = decide(self.ok())
+        self.assertTrue(d["go"])
+        self.assertEqual(json.loads(d["prev_build"]), BUILD_A)
+
+    def test_needs_a_green_preview_drill_on_record_first(self):
+        d = decide(ctx(client=True, drill_green=False, ping_configured=True))
+        self.assertFalse(d["go"])
+        self.assertTrue(d["message"].startswith("refused: client production needs a green preview drill on record"))
+
+    def test_needs_the_ping_to_blake_configured(self):
+        d = decide(ctx(client=True, drill_green=True, ping_configured=False))
+        self.assertFalse(d["go"])
+        self.assertIn("MOSHI_TOKEN", d["message"])
+
+    def test_refuses_a_disarmed_auto_rollback(self):
+        d = decide(self.ok(live_build={**BUILD_A, "cf_project": "other"}))
+        self.assertFalse(d["go"])
+        self.assertIn("auto-rollback armed", d["message"])
+        self.assertTrue(decide(self.ok(live_sha="", ledger_success_shas=[], live_build=None))["go"])  # first v4 deploy
+
+    def test_skips_stay_skips(self):
+        self.assertTrue(decide(ctx(client=True, sha=A))["message"].startswith("skip:"))
+        self.assertTrue(decide(ctx(client=True, skippable=True))["message"].startswith("skip:"))
+
+    def test_rollbacks_and_drills_are_never_held_by_the_client_rules(self):
+        self.assertTrue(decide(ctx(client=True, reason="rollback", sha=A))["go"])
+        self.assertTrue(decide(ctx(client=True, env="drill"))["go"])
+
+    def test_gather_reads_the_drill_ledger_only_for_client_production(self):
+        deps = [rec(A, "success", {"build": BUILD_A})]
+        for drill, green in (([rec(B, "success", {"build": BUILD_B})], True), ([rec(B, "failure", {})], False),
+                             ([rec(B, "success", {"build": BUILD_B}, MALLORY)], False), ([], False)):
+            with self.subTest(drill=drill):
+                c, _ = gather_with(deps, drill=drill, extra=([], True, True))
+                self.assertIs(c["drill_green"], green)
+                self.assertIs(c["ping_configured"], True)
+        c, calls = gather_with(deps, drill=[rec(B, "success", {"build": BUILD_B})])
+        self.assertFalse(c["drill_green"])
+        self.assertNotIn("drill", [x[1] for x in calls if x[0] == "ledger"])
+
+    def test_decide_cli_takes_client_and_ping(self):
+        seen = []
+        with mock.patch.object(deploy_guard, "gather", lambda *a: seen.append(a) or ctx()), \
+                contextlib.redirect_stdout(io.StringIO()):
+            deploy_guard.main(["decide", "--repo", "o/r", "--sha", B, "--reason", "deploy", "--env", "production",
+                               "--current-build", json.dumps(BUILD_B), "--client", "--ping-configured"])
+        self.assertEqual(seen[0][8:], (True, True))
+
+
+class RollbackPrecheck(unittest.TestCase):
+    """bin/rollback asks the guard before it opens a freeze; a CF target needs its own trusted record."""
+
+    def test_recorded_build_only_checks_the_targets_record_without_current_inputs(self):
+        self.assertTrue(decide(ctx(reason="rollback", sha=A, current_build={}, target_build=BUILD_A))["go"])
+        d = decide(ctx(reason="rollback", sha=A, current_build={}, target_build=None))
+        self.assertFalse(d["go"])
+        self.assertIn("no recorded build params", d["message"])
+
+    def test_recorded_build_only_cli(self):
+        seen = []
+        with mock.patch.object(deploy_guard, "gather", lambda *a: seen.append(a) or ctx(reason="rollback", sha=A)), \
+                contextlib.redirect_stdout(io.StringIO()):
+            deploy_guard.main(["decide", "--repo", "o/r", "--sha", A, "--reason", "rollback", "--env", "production",
+                               "--recorded-build-only"])
+        self.assertEqual(seen[0][6], {})
+        for bad in (["--reason", "deploy", "--recorded-build-only"],
+                    ["--reason", "rollback", "--recorded-build-only", "--current-build", json.dumps(BUILD_A)]):
+            with self.subTest(bad=bad), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit), \
+                    mock.patch.object(deploy_guard, "gather", side_effect=AssertionError("must fail before gather")):
+                deploy_guard.main(["decide", "--repo", "o/r", "--sha", A, "--env", "production", *bad])
+
+
+class FreezeTitles(unittest.TestCase):
+    """A freeze never says "rolled back" when nothing verified (deferred minor, mapped to Task 5)."""
+
+    def opened(self, **kw):
+        made = []
+
+        def fake_gh(*args, stdin=None):
+            made.append(args)
+            return "https://github.com/BJGLLC/r/issues/9"
+        a = types.SimpleNamespace(repo="BJGLLC/r", env="production", frm=B, to=A, run_url="https://run", **kw)
+        with mock.patch.object(deploy_guard, "gh", fake_gh):
+            deploy_guard.freeze_open(a)
+        issue = next(c for c in made if c[:2] == ("issue", "create"))
+        return issue[issue.index("--title") + 1], issue[issue.index("--body") + 1]
+
+    def test_rollback_failed_says_live_is_unknown(self):
+        title, body = self.opened(state="rollback-failed")
+        self.assertEqual(title, "deploy-freeze [production]: bbbbbbb did not verify; live state unknown")
+        self.assertIn("UNKNOWN", body)
+        self.assertIn("`aaaaaaa`", body)
+
+    def test_bin_rollback_freeze_says_what_is_being_attempted(self):
+        title, body = self.opened(state="manual")
+        self.assertEqual(title, "deploy-freeze [production]: bin/rollback from bbbbbbb to aaaaaaa")
+        self.assertIn("bin/rollback", body)
+        self.assertNotIn("was rolled back", body)
+
+    def test_auto_rolled_back_keeps_the_old_title(self):
+        self.assertEqual(self.opened(state="auto-rolled-back")[0], "deploy-freeze [production]: rolled back from bbbbbbb")
+        self.assertEqual(self.opened()[0], "deploy-freeze [production]: rolled back from bbbbbbb")
+
+    def test_freeze_open_cli_rejects_unknown_states(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit), \
+                mock.patch.object(deploy_guard, "gh", side_effect=AssertionError("no gh")):
+            deploy_guard.main(["freeze-open", "--repo", "o/r", "--env", "production", "--from", B, "--to", A,
+                               "--run-url", "x", "--state", "bogus"])
 
 
 if __name__ == "__main__":
