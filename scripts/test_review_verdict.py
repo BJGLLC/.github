@@ -333,6 +333,46 @@ class NudgedHelper(unittest.TestCase):
         comments = [{"author": "github-actions", "body": "unrelated", "created_at": iso(T0 + timedelta(minutes=1))}]
         self.assertFalse(is_nudged(comments, iso(T0)))
 
+    # A tracker's link-back bot quotes the linked ticket into the PR. That ticket described the
+    # command (`@codex review`) without issuing it, the gate read it as a request, and so it
+    # never asked. Text in code is about the command, not a request: GitHub makes no mention of
+    # it, and Codex did not act on it.
+    LINKBACK = ("<!-- tracker-linkback -->\n<details>\n<summary>TICKET-1 Gate nudge</summary>\n<p>\n\n"
+                "* An agent's `@codex review` at about 22:00Z brought a verdict in about 90 s.\n"
+                "**Workaround:** the session that opens the PR comments `@codex review` once the 👍 shows up.\n"
+                "```\ngh pr comment 7 --body \"@codex review\"\n```\n</p>\n</details>")
+
+    def test_the_command_quoted_in_code_is_not_a_request(self):
+        for author in ("tracker-bot[bot]", "blakejgruber"):
+            comments = [{"author": author, "body": self.LINKBACK, "created_at": iso(T0 + timedelta(minutes=1))}]
+            self.assertFalse(is_nudged(comments, iso(T0)), author)
+
+    def test_every_markdown_code_form_hides_the_command(self):
+        # Codex P1 on this fix: a ~~~ fence or an indented block left the quote looking like a
+        # request. Stripping too much costs at most a second, harmless ask; too little costs the
+        # only one, so any code form counts as code (an unclosed fence runs to the end, as GitHub
+        # renders it).
+        for body in ("Ticket text:\n\n~~~shell\ngh pr comment 7 --body '@codex review'\n~~~\n",
+                     "Ticket text:\n\n    @codex review\n\nmore text",
+                     "Ticket text:\n\n\t@codex review\n",
+                     "Ticket text: <code>@codex review</code> and <pre>\n@codex review\n</pre>",
+                     "Ticket text:\n\n```\n@codex review\n(no closing fence)",
+                     # Codex P1, round 2: a closing fence must match the opener's character and
+                     # length, so a ```` fence showing a ``` example stays code to its own close
+                     "Example:\n\n````markdown\n```\nfoo\n```\n@codex review\n````\n",
+                     "Example:\n\n````\n```\n@codex review\n````\n",
+                     "Example:\n\n~~~~\n~~~\n@codex review\n~~~~\n"):
+            with self.subTest(body=body[:40]):
+                comments = [{"author": "tracker-bot[bot]", "body": body, "created_at": iso(T0 + timedelta(minutes=1))}]
+                self.assertFalse(is_nudged(comments, iso(T0)))
+
+    def test_a_request_outside_code_still_counts_next_to_quoted_code(self):
+        body = "Re-asking after the fix (the `@codex review` above was before the push).\n\n@codex review"
+        comments = [{"author": "claude-agent", "body": body, "created_at": iso(T0 + timedelta(minutes=1))}]
+        self.assertTrue(is_nudged(comments, iso(T0)))
+        mid_line = [{"author": "claude-agent", "body": "Fixed in c0ffee1. @codex review", "created_at": iso(T0 + timedelta(minutes=1))}]
+        self.assertTrue(is_nudged(mid_line, iso(T0)))
+
 
 # ==== Task 8 (SSSF-23): drafts, poll loop, re-review, drills ========================
 # New names are reached through the module (rv.*) so the older tests above keep

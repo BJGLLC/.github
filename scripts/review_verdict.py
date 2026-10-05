@@ -326,13 +326,31 @@ def pushed_at(commit_node):
     return commit["committedDate"]
 
 
+# Every Markdown code form: ``` and ~~~ fences closed only by the same character at the same
+# length (a ```` fence can show a ``` example; an unclosed one runs to the end, as GitHub
+# renders it), <pre>/<code>, inline spans, then indented blocks (4 spaces or a tab).
+CODE = re.compile(r"(?P<fence>`{3,}|~{3,}).*?(?:(?P=fence)|\Z)|<pre\b.*?(?:</pre>|\Z)|<code\b.*?(?:</code>|\Z)"
+                  r"|``[^\n]*?``|`[^`\n]*`", re.S | re.I)
+INDENTED_CODE = re.compile(r"^(?: {4}|\t).*$", re.M)
+
+
+def asks_codex(body):
+    """True when the body issues '@codex review' outside code. Inside code it is text about the
+    command, not a request (GitHub makes no mention of it): a tracker's link-back bot quoted a
+    ticket that described `@codex review`, and the gate took it for a request and never asked.
+    Erring toward code is the safe side: a missed request costs one extra, harmless ask from
+    the gate; a false one suppresses its only ask."""
+    return REVIEW_REQUEST in INDENTED_CODE.sub("", CODE.sub("", body))
+
+
 def is_nudged(comments, head_pushed_at):
-    """True if a comment containing '@codex review', by anyone except Codex, was created after
-    head_pushed_at: someone (a human, an agent, or the gate's own nudge) already asked Codex
-    about this SHA, so the gate neither nudges nor asks in the status. Codex's own comments
-    never count: its summary, clean-review and error comments all say 'comment "@codex review"'."""
+    """True if a comment asking '@codex review' (outside code, see asks_codex), by anyone except
+    Codex, was created after head_pushed_at: someone (a human, an agent, or the gate's own
+    nudge) already asked Codex about this SHA, so the gate neither nudges nor asks in the
+    status. Codex's own comments never count: its summary, clean-review and error comments all
+    say 'comment "@codex review"'."""
     pushed = ts(head_pushed_at)
-    return any(REVIEW_REQUEST in c["body"] and not is_codex(c["author"]) and ts(c["created_at"]) > pushed
+    return any(asks_codex(c["body"]) and not is_codex(c["author"]) and ts(c["created_at"]) > pushed
                for c in comments)
 
 
