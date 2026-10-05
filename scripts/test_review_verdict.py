@@ -1756,5 +1756,97 @@ class UnattendedPoll(unittest.TestCase):
         self.assertEqual(calls, [{"nudge": True}])
 
 
+# ==== Body-only findings: Codex can put its P0/P1 badge in the review BODY, with no thread ====
+# A Codex review (COMMENTED, commit = the head) carried its one P1 only in the review body;
+# pulls/<n>/comments was empty, so the gate counted no thread and posted "round 1: no blocking
+# findings", and auto-merge took the PR. A body finding now blocks like a thread: bound to the
+# head it reviewed, cleared only by a push (and a fresh review of the new head without it).
+P1_BODY = ("\n### 💡 Codex Review\n\nhttps://github.com/o/r/blob/new/x.py#L1\n"
+           "**<sub><sub>![P{p} Badge](https://img.shields.io/badge/P{p}-orange?style=flat)</sub></sub>  Fix it**\n\nWhy.\n")
+REVIEW_FIXTURE = "codex-review-body-p1.json"
+
+
+def body_review(minutes, sha="new", p=1, rid="PRR_body", **over):
+    return {"author": CODEX, "submitted_at": iso(T0 + timedelta(minutes=minutes)), "commit_sha": sha,
+            "body": P1_BODY.format(p=p), "id": rid, **over}
+
+
+class ReviewBodyFindings(unittest.TestCase):
+    NOW = T0 + timedelta(minutes=4)
+
+    def test_a_body_only_p1_on_the_head_blocks(self):
+        v = compute(pr(reviews=[body_review(3)]), self.NOW)
+        self.assertEqual(v["state"], "failure")
+        self.assertEqual(v["description"], "round 1: 1 unresolved P0/P1 (push a fix): PRR_body")
+
+    def test_a_body_p0_still_blocks_and_a_body_p1_does_not_in_a_late_round(self):  # same rule as threads
+        late = [review(-30, "a"), review(-20, "b")]
+        self.assertEqual(compute(pr(reviews=[*late, body_review(3, p=0)]), self.NOW)["state"], "failure")
+        self.assertEqual(compute(pr(reviews=[*late, body_review(3, p=1)]), self.NOW)["state"], "success")
+
+    def test_body_p2_p3_never_block(self):
+        for p in (2, 3):
+            self.assertEqual(compute(pr(reviews=[body_review(3, p=p)]), self.NOW)["state"], "success", p)
+
+    def test_a_newer_head_with_a_clean_codex_review_passes(self):
+        v = compute(pr(reviews=[body_review(-10, sha="old"), review(3)]), self.NOW)
+        self.assertEqual(v["state"], "success"); self.assertTrue(v["description"].startswith("round 2:"))
+
+    def test_a_newer_head_whose_review_repeats_it_still_blocks(self):
+        v = compute(pr(reviews=[body_review(-10, sha="old", rid="PRR_old"), body_review(3, rid="PRR_new")]), self.NOW)
+        self.assertEqual(v["state"], "failure"); self.assertIn("PRR_new", v["description"])
+        self.assertNotIn("PRR_old", v["description"])
+
+    def test_a_second_clean_review_of_the_same_head_does_not_clear_it(self):
+        # only a push clears it, as for a resolved thread (R23): no re-asking until Codex relents
+        v = compute(pr(reviews=[body_review(3), review(6)]), self.NOW + timedelta(minutes=3))
+        self.assertEqual(v["state"], "failure")
+
+    def test_a_sha_less_review_after_the_push_counts_as_the_heads(self):  # fail closed, as has_verdict does
+        self.assertEqual(compute(pr(reviews=[body_review(3, sha="")]), self.NOW)["state"], "failure")
+        self.assertEqual(compute(pr(reviews=[body_review(-3, sha=""), review(3)]), self.NOW)["state"], "success")
+
+    def test_hotfix_overrides_it(self):
+        v = compute(pr(labels=["hotfix"], reviews=[body_review(3)]), self.NOW)
+        self.assertEqual(v["state"], "success"); self.assertEqual(v["description"], rv.HOTFIX_DESC)
+
+    def test_a_body_edited_by_someone_else_blocks_whatever_it_says(self):  # SSSF-38, as for threads
+        clean = body_review(3, p=3)
+        for editor in ("blakejgruber", None):
+            with self.subTest(editor=editor):
+                v = compute(pr(reviews=[{**clean, "editor": editor, "last_edited_at": iso(T0 + timedelta(minutes=3))}]), self.NOW)
+                self.assertEqual(v["state"], "failure")
+        v = compute(pr(reviews=[{**clean, "editor": CODEX + "[bot]", "last_edited_at": iso(T0)}]), self.NOW)
+        self.assertEqual(v["state"], "success")
+
+    def test_replay_the_real_review(self):
+        # Codex's real review JSON (REST), repo paths and finding prose genericized: one P1 in the
+        # body, no inline comment, state COMMENTED, on the head; a later one on the merge commit.
+        with open(os.path.join(FIXTURES, REVIEW_FIXTURE)) as f:
+            raw = json.load(f)
+        reviews = [{"author": r["user"]["login"], "submitted_at": r["submitted_at"], "commit_sha": r["commit_id"],
+                    "body": r["body"], "id": r["node_id"]} for r in raw]
+        head = raw[0]["commit_id"]
+        p = pr(head_sha=head, head_pushed_at="2026-10-05T16:58:00Z", reviews=reviews, threads=[])
+        v = compute(p, rv.ts("2026-10-05T17:06:14Z"))
+        self.assertEqual(v["state"], "failure")
+        self.assertIn(raw[0]["node_id"], v["description"]); self.assertNotIn(raw[1]["node_id"], v["description"])
+
+    def test_fetch_carries_each_reviews_id_body_and_editor(self):
+        gql = {"data": {"repository": {"pullRequest": {
+            "headRefOid": "abc", "isDraft": False, "state": "OPEN", "labels": {"nodes": []},
+            "createdAt": iso(T0 - timedelta(hours=1)),
+            "commits": {"nodes": [{"commit": {"committedDate": iso(T0), "checkSuites": {"nodes": []}}}]},
+            "timelineItems": {"nodes": []}, "reviewThreads": {"nodes": []},
+            "comments": {"totalCount": 0, "nodes": []},
+            "reviews": {"nodes": [{"id": "PRR_x", "author": {"login": CODEX}, "body": P1_BODY.format(p=1),
+                                   "submittedAt": iso(T0), "lastEditedAt": None, "editor": None, "commit": {"oid": "abc"}}]}}}}}
+        orig = rv.gh; rv.gh = lambda *a, **k: json.dumps(gql); self.addCleanup(setattr, rv, "gh", orig)
+        (r,) = rv.fetch("o/r", 7)["reviews"]
+        self.assertEqual((r["id"], r["commit_sha"], r["editor"], r["last_edited_at"]), ("PRR_x", "abc", None, None))
+        self.assertIn("P1 Badge]", r["body"])
+        self.assertIn("reviews(first:100){nodes{id author{login} body submittedAt lastEditedAt editor{login} commit{oid}}}", rv.GQL)
+
+
 if __name__ == "__main__":
     unittest.main()
