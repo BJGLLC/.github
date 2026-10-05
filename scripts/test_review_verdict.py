@@ -347,6 +347,20 @@ class NudgedHelper(unittest.TestCase):
             comments = [{"author": author, "body": self.LINKBACK, "created_at": iso(T0 + timedelta(minutes=1))}]
             self.assertFalse(is_nudged(comments, iso(T0)), author)
 
+    def test_every_markdown_code_form_hides_the_command(self):
+        # Codex P1 on this fix: a ~~~ fence or an indented block left the quote looking like a
+        # request. Stripping too much costs at most a second, harmless ask; too little costs the
+        # only one, so any code form counts as code (an unclosed fence runs to the end, as GitHub
+        # renders it).
+        for body in ("Ticket text:\n\n~~~shell\ngh pr comment 7 --body '@codex review'\n~~~\n",
+                     "Ticket text:\n\n    @codex review\n\nmore text",
+                     "Ticket text:\n\n\t@codex review\n",
+                     "Ticket text: <code>@codex review</code> and <pre>\n@codex review\n</pre>",
+                     "Ticket text:\n\n```\n@codex review\n(no closing fence)"):
+            with self.subTest(body=body[:40]):
+                comments = [{"author": "tracker-bot[bot]", "body": body, "created_at": iso(T0 + timedelta(minutes=1))}]
+                self.assertFalse(is_nudged(comments, iso(T0)))
+
     def test_a_request_outside_code_still_counts_next_to_quoted_code(self):
         body = "Re-asking after the fix (the `@codex review` above was before the push).\n\n@codex review"
         comments = [{"author": "claude-agent", "body": body, "created_at": iso(T0 + timedelta(minutes=1))}]

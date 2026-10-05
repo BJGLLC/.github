@@ -326,15 +326,20 @@ def pushed_at(commit_node):
     return commit["committedDate"]
 
 
-CODE = re.compile(r"```.*?```|``[^\n]*?``|`[^`\n]*`", re.S)   # fenced blocks, then inline spans
+# Every Markdown code form: ``` and ~~~ fences (an unclosed one runs to the end, as GitHub
+# renders it), <pre>/<code>, inline spans, then indented blocks (4 spaces or a tab).
+CODE = re.compile(r"```.*?(?:```|\Z)|~~~.*?(?:~~~|\Z)|<pre\b.*?(?:</pre>|\Z)|<code\b.*?(?:</code>|\Z)"
+                  r"|``[^\n]*?``|`[^`\n]*`", re.S | re.I)
+INDENTED_CODE = re.compile(r"^(?: {4}|\t).*$", re.M)
 
 
 def asks_codex(body):
-    """True when the body issues '@codex review' outside code. Inside a code span or block it is
-    text about the command, not a request (GitHub makes no mention of it, and Codex does not act
-    on it): a tracker's link-back bot quoted a ticket that described `@codex review`, and the
-    gate took it for a request and never asked."""
-    return REVIEW_REQUEST in CODE.sub("", body)
+    """True when the body issues '@codex review' outside code. Inside code it is text about the
+    command, not a request (GitHub makes no mention of it): a tracker's link-back bot quoted a
+    ticket that described `@codex review`, and the gate took it for a request and never asked.
+    Erring toward code is the safe side: a missed request costs one extra, harmless ask from
+    the gate; a false one suppresses its only ask."""
+    return REVIEW_REQUEST in INDENTED_CODE.sub("", CODE.sub("", body))
 
 
 def is_nudged(comments, head_pushed_at):
