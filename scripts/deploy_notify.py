@@ -1,21 +1,31 @@
 #!/usr/bin/env python3
 """deploy_notify.py: deploy/rollback messages for Linear and the PR (Review v4 §8, phase 4).
 
-Pure, unit-tested core: tickets(), final_state(), body(). Thin I/O: `notify` reads the commit
-range from the GitHub compare API and posts one PR comment plus one comment per Linear ticket
+Pure, unit-tested core: tickets(), final_state(), body(), ping_text(), probe(). Thin I/O: `notify` reads
+the commit range from the GitHub compare API and posts one PR comment plus one comment per Linear ticket
 (cap 5). I/O failures warn and exit 0. A deploy never goes red because Linear is down (OPS-350).
+
+Client production (decision 01M46ESRWR, 10/5): `notify --client` on env=production also pings Blake on
+Moshi (MOSHI_TOKEN env), with the live page probed before and after (`probe`: HTTP status, sha256 of the
+body, version.json's sha). The guard's refusals of a client deploy ping through `ping`. Never fails.
 
   deploy_notify.py state  --reason deploy|rollback --ship R --smoke-ok T --rb-ship R --rb-smoke-ok T
   deploy_notify.py notify --repo OWNER/NAME --state S --surface TEXT --attempted SHA
                           [--live-before SHA] [--run-url URL] [--pr N] [--freeze N]
                           [--env production|drill] [--rollback-hint TEXT] [--dry-run]
+                          [--client [--before PROBE] [--after PROBE]]
+  deploy_notify.py ping   --surface TEXT --detail TEXT [--state refused] [--run-url URL]
+  deploy_notify.py probe  --url URL [--version-url URL]
 """
 import argparse
+import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
+import time
+import urllib.error
 import urllib.request
 
 TEAM_KEYS = ("cd", "tool", "auto", "sssf", "data", "ops", "rnd", "bjg")  # every live team, spec §8
@@ -26,6 +36,9 @@ LINEAR = "https://api.linear.app/graphql"
 # false "UNKNOWN" alarm, so `notify --state` rejects anything else.
 STATES = ("deployed", "rolled-back", "auto-rolled-back", "ship-failed", "rollback-failed", "smoke-failed-no-target")
 ZERO_SHA = "0" * 40  # github.event.before on a branch's first push
+MOSHI = "https://api.getmoshi.app/api/webhook"  # same endpoint as claude-dotfiles bin/moshi-notify
+GREEN = ("deployed", "rolled-back")
+PROBE_CAP = 4 << 20  # bytes hashed per probe
 
 
 def tickets(messages, cap=CAP):
@@ -74,7 +87,8 @@ def body(state, surface, repo, attempted, live_before="", run_url="", freeze=Non
     if state == "rolled-back":
         if a == b:
             return f"{tag}**Redeployed** — {surface} on `{a}` (no-op rollback drill){run}"
-        return f"{tag}**Rolled back** — {surface} is on `{a}` (was `{b}`){run}{fz}"
+        was = f" (was `{b}`)" if b else ""
+        return f"{tag}**Rolled back** — {surface} is on `{a}`{was}{run}{fz}"
     if state == "auto-rolled-back":
         return f"{tag}**Auto-rolled back** — `{a}` failed the smoke check; {surface} is back on `{b}`{run}{fz}"
     if state == "ship-failed":
@@ -118,6 +132,70 @@ def post_linear(key, ticket, text):
     return bool(((res.get("data") or {}).get("commentCreate") or {}).get("success"))
 
 
+def ping_text(state, surface, attempted="", live_before="", before="", after="", run_url="", detail=""):
+    """-> (title, message) of the Moshi push. Anything but a clean deploy/rollback shouts."""
+    word = state if state in GREEN else state.upper()
+    parts = [f"{attempted[:7]} (was {(live_before or '')[:7] or 'none'})" if attempted else "", detail,
+             f"live before: {before}" if before else "", f"live after: {after}" if after else "", run_url]
+    return f"Client deploy {word}: {surface}"[:120], " · ".join(p for p in parts if p)
+
+
+def post_moshi(token, title, message):
+    req = urllib.request.Request(MOSHI, headers={"Content-Type": "application/json"}, data=json.dumps(
+        {"token": token, "title": title, "message": message, "unified": True}).encode())
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return 200 <= r.status < 300
+
+
+def ping(title, message):
+    """The one client-production ping to Blake. Warns (never the token) and returns False on any failure."""
+    token = os.environ.get("MOSHI_TOKEN", "")
+    if not token:
+        print("::warning title=client ping::MOSHI_TOKEN not set; Blake was NOT pinged about this client deploy")
+        return False
+    try:
+        ok = post_moshi(token, title, message)
+    except Exception as e:  # noqa: BLE001 — a ping must not fail the deploy
+        print(f"::warning title=client ping::Moshi push failed ({type(e).__name__}); Blake was NOT pinged")
+        return False
+    print("client ping: sent" if ok else "::warning title=client ping::Moshi did not accept the push")
+    return ok
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def fetch_raw(url):
+    """-> (status, body bytes). Redirects are reported, not followed; network errors -> (0, b'')."""
+    req = urllib.request.Request(url, headers={"Cache-Control": "no-cache", "User-Agent": "review-v4-probe"})
+    try:
+        with urllib.request.build_opener(_NoRedirect).open(req, timeout=10) as r:
+            return r.status, r.read(PROBE_CAP)
+    except urllib.error.HTTPError as e:
+        return e.code, b""
+    except Exception:  # noqa: BLE001 — DNS, TLS, timeout
+        return 0, b""
+
+
+def probe(url, version_url="", fetch=None):
+    """One line on what the live site serves: HTTP status, sha256 of the body, version.json's sha."""
+    fetch = fetch or fetch_raw
+    st, page = fetch(url)
+    out = f"HTTP {st}" if st else "unreachable"
+    if st == 200:
+        out += f", sha256 {hashlib.sha256(page).hexdigest()[:12]}"
+    if version_url:
+        vst, vbody = fetch(f"{version_url}{'&' if '?' in version_url else '?'}_={int(time.time())}")
+        try:
+            sha = json.loads(vbody).get("sha") if vst == 200 else ""
+        except (ValueError, AttributeError):
+            sha = ""
+        out += f", version {sha[:7]}" if isinstance(sha, str) and sha else f", no version (HTTP {vst})"
+    return out
+
+
 def cmd_notify(a):
     if a.live_before == ZERO_SHA:
         a.live_before = ""
@@ -138,6 +216,8 @@ def cmd_notify(a):
             gh("pr", "comment", str(a.pr), "-R", a.repo, "--body", text + "\n<!-- review-v4-deploy -->")
         except Exception as e:  # noqa: BLE001
             print(f"::warning::PR comment failed: {e}")
+    if a.client and a.env == "production":
+        ping(*ping_text(a.state, a.surface, a.attempted, a.live_before, a.before, a.after, a.run_url))
     key = os.environ.get("LINEAR_API_KEY", "")
     if not key:
         print("::notice::LINEAR_API_KEY not set; Linear posting skipped")
@@ -171,9 +251,26 @@ def main(argv=None):
     n.add_argument("--env", default="production")
     n.add_argument("--rollback-hint", default=None)
     n.add_argument("--dry-run", action="store_true")
+    n.add_argument("--client", action="store_true", help="client production: also ping Blake on Moshi")
+    n.add_argument("--before", default="", help="probe line of the live site before the deploy")
+    n.add_argument("--after", default="", help="probe line of the live site after it")
+    pg = sub.add_parser("ping")
+    pg.add_argument("--surface", required=True)
+    pg.add_argument("--state", default="refused")
+    pg.add_argument("--detail", default="")
+    pg.add_argument("--run-url", default="")
+    pr = sub.add_parser("probe")
+    pr.add_argument("--url", required=True)
+    pr.add_argument("--version-url", default="")
     a = p.parse_args(argv)
     if a.cmd == "state":
         print(final_state(a.reason, a.ship, a.smoke_ok, a.rb_ship, a.rb_smoke_ok))
+        return 0
+    if a.cmd == "ping":
+        ping(*ping_text(a.state, a.surface, run_url=a.run_url, detail=a.detail))
+        return 0
+    if a.cmd == "probe":
+        print(probe(a.url, a.version_url))
         return 0
     a.freeze = a.freeze or None
     return cmd_notify(a)

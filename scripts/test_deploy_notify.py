@@ -1,12 +1,15 @@
 # scripts/test_deploy_notify.py
 import contextlib
+import hashlib
 import io
+import json
+import os
 import subprocess
 import unittest
 from unittest import mock
 
 import deploy_notify
-from deploy_notify import STATES, TEAM_KEYS, body, final_state, tickets
+from deploy_notify import STATES, TEAM_KEYS, body, final_state, ping_text, probe, tickets
 
 A, B = "1234567" + "0" * 33, "abcdef0" + "0" * 33
 
@@ -117,6 +120,118 @@ class Hardening(unittest.TestCase):
                 contextlib.redirect_stderr(io.StringIO()) as se, self.assertRaises(subprocess.CalledProcessError):
             deploy_notify.gh("api", "x")
         self.assertIn("HTTP 403: nope", se.getvalue())
+
+
+class ClientPing(unittest.TestCase):
+    """Decision 01M46ESRWR (10/5): every client production deploy pings Blake on Moshi, with live before/after."""
+
+    def notify(self, *extra, env=None, token="tok"):
+        sent = []
+        environ = {k: v for k, v in os.environ.items() if k not in ("MOSHI_TOKEN", "LINEAR_API_KEY")}
+        if token:
+            environ["MOSHI_TOKEN"] = token
+        with mock.patch.object(deploy_notify, "range_messages", lambda *a: []), \
+                mock.patch.object(deploy_notify, "post_moshi", lambda tok, t, m: sent.append((tok, t, m)) or True), \
+                mock.patch.dict(os.environ, environ, clear=True), contextlib.redirect_stdout(io.StringIO()) as out:
+            rc = deploy_notify.main(["notify", "--repo", "o/r", "--state", "deployed", "--surface", "site", "--attempted", A,
+                                     "--live-before", B, "--run-url", "https://run/1", *extra])
+        return rc, sent, out.getvalue()
+
+    def test_rolled_back_with_no_live_before_has_no_empty_was(self):
+        t = body("rolled-back", "s", "BJGLLC/x", A, "")
+        self.assertNotIn("(was ``)", t)
+        self.assertIn("is on `1234567`", t)
+
+    def test_ping_text(self):
+        title, msg = ping_text("deployed", "site", A, B, "HTTP 200, sha256 aaa", "HTTP 200, sha256 bbb", "https://run/1")
+        self.assertEqual(title, "Client deploy deployed: site")
+        self.assertEqual(msg, "1234567 (was abcdef0) · live before: HTTP 200, sha256 aaa · live after: HTTP 200, sha256 bbb"
+                              " · https://run/1")
+        self.assertEqual(ping_text("auto-rolled-back", "site", A)[0], "Client deploy AUTO-ROLLED-BACK: site")
+        self.assertEqual(ping_text("refused", "site", detail="refused: x")[1], "refused: x")
+        self.assertIn("(was none)", ping_text("deployed", "site", A)[1])
+
+    def test_client_production_notify_pings_even_without_linear(self):
+        rc, sent, _ = self.notify("--client", "--before", "HTTP 200", "--after", "HTTP 200")
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0][0], "tok")
+        self.assertIn("live before: HTTP 200", sent[0][2])
+
+    def test_no_ping_for_internal_targets_drills_or_dry_runs(self):
+        for extra in ((), ("--client", "--env", "drill"), ("--client", "--dry-run")):
+            with self.subTest(extra=extra):
+                self.assertEqual(self.notify(*extra)[1], [])
+
+    def test_a_missing_token_warns_and_never_fails(self):
+        rc, sent, out = self.notify("--client", token="")
+        self.assertEqual((rc, sent), (0, []))
+        self.assertIn("NOT pinged", out)
+
+    def test_a_failed_push_never_fails_and_never_prints_the_token(self):
+        def boom(tok, t, m):
+            raise OSError("network down")
+        with mock.patch.object(deploy_notify, "post_moshi", boom), mock.patch.dict(os.environ, {"MOSHI_TOKEN": "s3cret"}), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertFalse(deploy_notify.ping("t", "m"))
+        self.assertIn("::warning", out.getvalue())
+        self.assertNotIn("s3cret", out.getvalue())
+
+    def test_post_moshi_sends_one_unified_push(self):
+        seen = []
+
+        class Resp:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+        with mock.patch.object(deploy_notify.urllib.request, "urlopen", lambda req, timeout: seen.append(req) or Resp()):
+            self.assertTrue(deploy_notify.post_moshi("tok", "title", "msg"))
+        self.assertEqual(seen[0].full_url, "https://api.getmoshi.app/api/webhook")
+        self.assertEqual(json.loads(seen[0].data), {"token": "tok", "title": "title", "message": "msg", "unified": True})
+
+    def test_ping_cli_for_guard_refusals(self):
+        sent = []
+        with mock.patch.object(deploy_notify, "post_moshi", lambda tok, t, m: sent.append((t, m)) or True), \
+                mock.patch.dict(os.environ, {"MOSHI_TOKEN": "tok"}), contextlib.redirect_stdout(io.StringIO()):
+            rc = deploy_notify.main(["ping", "--surface", "site", "--detail", "refused: no drill", "--run-url", "https://run/2"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(sent, [("Client deploy REFUSED: site", "refused: no drill · https://run/2")])
+
+
+class Probe(unittest.TestCase):
+    PAGE = b"<html>live</html>"
+
+    def fake(self, pages):
+        def fetch(url):
+            for prefix, resp in pages.items():
+                if url.startswith(prefix):
+                    return resp
+            return 0, b""
+        return fetch
+
+    def test_status_body_hash_and_version(self):
+        f = self.fake({"https://x/version.json": (200, json.dumps({"sha": A}).encode()), "https://x/": (200, self.PAGE)})
+        want = f"HTTP 200, sha256 {hashlib.sha256(self.PAGE).hexdigest()[:12]}, version 1234567"
+        self.assertEqual(probe("https://x/", "https://x/version.json", fetch=f), want)
+
+    def test_a_site_without_a_version_says_so(self):
+        for vresp in ((200, b"<html>fallback</html>"), (404, b""), (200, b"[1]")):
+            with self.subTest(vresp=vresp):
+                f = self.fake({"https://x/version.json": vresp, "https://x/": (200, self.PAGE)})
+                self.assertTrue(probe("https://x/", "https://x/version.json", fetch=f).endswith(f"no version (HTTP {vresp[0]})"))
+
+    def test_unreachable_and_errors_are_reported_not_raised(self):
+        self.assertEqual(probe("https://down/", fetch=self.fake({})), "unreachable")
+        self.assertEqual(probe("https://x/", fetch=self.fake({"https://x/": (503, b"")})), "HTTP 503")
+
+    def test_probe_cli_always_exits_0(self):
+        with mock.patch.object(deploy_notify, "fetch_raw", lambda url: (0, b"")), contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(deploy_notify.main(["probe", "--url", "https://down/", "--version-url", "https://down/v.json"]), 0)
+        self.assertEqual(out.getvalue().strip(), "unreachable, no version (HTTP 0)")
 
 
 if __name__ == "__main__":

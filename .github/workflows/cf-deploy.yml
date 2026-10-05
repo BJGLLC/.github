@@ -1,6 +1,10 @@
 # .github/workflows/cf-deploy.yml — reusable Cloudflare deploy pipeline (Review v4 phase 4, spec §8).
 # guard -> ship -> verify -> [rollback-ship -> rollback-verify] -> report. The auto-rollback runs
 # inline, inside the caller's concurrency slot, so a newer queued run can never cancel it.
+# build_paths: the range filter (decision 01M3N14TGN §3): a deploy whose live..sha range touches none of
+# these globs is skipped, never while the auto-rollback is unarmed. client: client production (decision
+# 01M46ESRWR): the guard holds a deploy until a preview drill is green and the Moshi ping is configured,
+# the live site is probed before and after, and Blake gets a Moshi ping on every production outcome.
 name: cf-deploy
 on:
   workflow_call:
@@ -21,6 +25,8 @@ on:
       version_url:      { type: string,  required: true }
       health_url:       { type: string,  default: "" }
       access:           { type: boolean, default: false }
+      build_paths:      { type: string,  default: "" }          # globs, whitespace/comma separated; "" = every commit
+      client:           { type: boolean, default: false }
     secrets:
       CLOUDFLARE_API_TOKEN:    { required: false }
       CLOUDFLARE_API_KEY:      { required: false }
@@ -29,6 +35,7 @@ on:
       LINEAR_API_KEY:          { required: false }
       CF_ACCESS_CLIENT_ID:     { required: false }
       CF_ACCESS_CLIENT_SECRET: { required: false }
+      MOSHI_TOKEN:             { required: false }
     outputs:
       state: { value: "${{ jobs.report.outputs.state }}" }
 permissions: {}
@@ -51,6 +58,7 @@ jobs:
       health_url: ${{ steps.u.outputs.health_url }}
       cf_branch: ${{ steps.u.outputs.cf_branch }}
       lenv: ${{ steps.u.outputs.lenv }}
+      before: ${{ steps.pb.outputs.before }}
     steps:
       - uses: actions/checkout@v4
         with: { repository: BJGLLC/.github, ref: main, path: .deploylib, persist-credentials: false }
@@ -86,6 +94,12 @@ jobs:
           BUILD: ${{ inputs.build }}
           OUT_DIR: ${{ inputs.out_dir }}
           PROJ: ${{ inputs.cf_project }}
+          BUILD_PATHS: ${{ inputs.build_paths }}
+          CLIENT: ${{ inputs.client }}
+          PING: ${{ secrets.MOSHI_TOKEN != '' }}
+          MOSHI_TOKEN: ${{ secrets.MOSHI_TOKEN }}
+          SURFACE: ${{ inputs.surface }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
           cur="$(jq -nc --arg kind "$KIND" --arg node "$NODE" --arg install "$INSTALL" --arg build "$BUILD" \
@@ -94,6 +108,9 @@ jobs:
           args=(decide --repo "$GITHUB_REPOSITORY" --sha "$SHA" --reason "$REASON" --env "$LENV" --current-build "$cur")
           if [ "$FORCE" = true ]; then args+=(--force-smoke-fail); fi
           if [ "$KIND" = worker ] && [ "$ENVN" = drill ]; then args+=(--no-drill-alias); fi
+          if [ -n "$BUILD_PATHS" ]; then args+=(--build-paths "$BUILD_PATHS"); fi
+          if [ "$CLIENT" = true ]; then args+=(--client); fi
+          if [ "$PING" = true ]; then args+=(--ping-configured); fi
           # decide() only lets force through when env == drill; the ledger env for a drill is "drill".
           python3 .deploylib/scripts/deploy_guard.py "${args[@]}" | tee guard.json
           jq -r 'to_entries[] | "\(.key)=\(.value // "" | tostring)"' guard.json >> "$GITHUB_OUTPUT"
@@ -102,9 +119,22 @@ jobs:
           warn="$(jq -r .warning guard.json)"
           if [ -n "$warn" ]; then echo "::warning::$warn"; fi
           case "$msg" in
-            refused:*) echo "::error::$msg"; exit 1 ;;
+            refused:*)
+              echo "::error::$msg"
+              if [ "$CLIENT" = true ] && [ "$ENVN" = production ]; then
+                python3 .deploylib/scripts/deploy_notify.py ping --surface "$SURFACE" --detail "$msg" --run-url "$RUN_URL" || true
+              fi
+              exit 1 ;;
             skip:*) echo "::notice::$msg" ;;
           esac
+      - id: pb
+        name: Live before (client production)
+        if: inputs.client && inputs.env == 'production' && steps.d.outputs.go == 'true'
+        env: { VU: "${{ steps.u.outputs.version_url }}", HU: "${{ steps.u.outputs.health_url }}" }
+        run: |
+          b="$(python3 .deploylib/scripts/deploy_notify.py probe --url "${HU:-$VU}" --version-url "$VU")"
+          echo "before=$b" >> "$GITHUB_OUTPUT"
+          echo "live before: $b" >> "$GITHUB_STEP_SUMMARY"
 
   ship:
     needs: guard
@@ -290,9 +320,19 @@ jobs:
           SURFACE: ${{ inputs.surface }}
           ENVN: ${{ inputs.env }}
           FREEZE: ${{ steps.fz.outputs.freeze }}
+          CLIENT: ${{ inputs.client }}
+          MOSHI_TOKEN: ${{ secrets.MOSHI_TOKEN }}
+          BEFORE: ${{ needs.guard.outputs.before }}
+          VU: ${{ needs.guard.outputs.version_url }}
+          HU: ${{ needs.guard.outputs.health_url }}
         run: |
           args=(notify --repo "$GITHUB_REPOSITORY" --state "$STATE" --surface "$SURFACE" --attempted "$SHA" \
                 --live-before "$FROM" --run-url "$RUN_URL" --env "$ENVN")
+          if [ "$CLIENT" = true ] && [ "$ENVN" = production ]; then   # every client production outcome pings Blake
+            after="$(python3 .deploylib/scripts/deploy_notify.py probe --url "${HU:-$VU}" --version-url "$VU")"
+            echo "live after: $after" >> "$GITHUB_STEP_SUMMARY"
+            args+=(--client --before "$BEFORE" --after "$after")
+          fi
           if [ -n "$PR" ]; then args+=(--pr "$PR"); fi
           if [ -n "$FREEZE" ]; then args+=(--freeze "$FREEZE"); fi
           if [ "$STATE" = smoke-failed-no-target ] && [ -n "$PREV" ] && [ -z "$PREV_BUILD" ]; then

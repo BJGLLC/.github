@@ -21,3 +21,8 @@ With no Codex response by then, the recompute posts the `codex-unavailable` fail
 ## Deploy library
 
 This repo also hosts the shared deploy library (SSSF-31, Review v4 phase 4): `scripts/deploy_*.py`, `.github/workflows/linear-deploy-notify.yml`, `cf-deploy.yml` and `cf-ship.yml`. Callers pin `BJGLLC/.github@main`; team keys live in `scripts/deploy_notify.py` only.
+
+`cf-deploy.yml` caller options beyond the build params:
+- `build_paths` (range filter): a production deploy whose live..sha range touches none of these globs is skipped and live stays the last shipped SHA. It never skips while the auto-rollback is unarmed (no trusted ledger record yet), so a surface's first v4 deploy (a workflow-only commit, after its preview drill) still ships and writes the first trusted record.
+- `client: true` (client production): no deploy window. The guard refuses until a preview drill is green on the `drill` ledger, the `MOSHI_TOKEN` secret is set, and (after the first deploy) the auto-rollback is armed. The live site is probed before and after, and every production outcome, including a refusal, pings Blake on Moshi.
+- A rollback's target is the newest ledger record the pipeline can rebuild (written by `github-actions[bot]`, with build params); `deploy_guard.py live|previous --trusted` show the same view.
