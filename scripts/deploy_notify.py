@@ -37,6 +37,7 @@ LINEAR = "https://api.linear.app/graphql"
 STATES = ("deployed", "rolled-back", "auto-rolled-back", "ship-failed", "rollback-failed", "smoke-failed-no-target")
 ZERO_SHA = "0" * 40  # github.event.before on a branch's first push
 MOSHI = "https://api.getmoshi.app/api/webhook"  # same endpoint as claude-dotfiles bin/moshi-notify
+UA = "bjgllc-deploy-notify/1 (+https://github.com/BJGLLC/.github)"
 GREEN = ("deployed", "rolled-back")
 PROBE_CAP = 4 << 20  # bytes hashed per probe
 
@@ -141,7 +142,8 @@ def ping_text(state, surface, attempted="", live_before="", before="", after="",
 
 
 def post_moshi(token, title, message):
-    req = urllib.request.Request(MOSHI, headers={"Content-Type": "application/json"}, data=json.dumps(
+    # An explicit agent: Cloudflare in front of Moshi bans urllib's default "Python-urllib/3.x" (403, error 1010).
+    req = urllib.request.Request(MOSHI, headers={"Content-Type": "application/json", "User-Agent": UA}, data=json.dumps(
         {"token": token, "title": title, "message": message, "unified": True}).encode())
     with urllib.request.urlopen(req, timeout=15) as r:
         return 200 <= r.status < 300

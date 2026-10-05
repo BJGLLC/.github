@@ -192,6 +192,10 @@ class ClientPing(unittest.TestCase):
             self.assertTrue(deploy_notify.post_moshi("tok", "title", "msg"))
         self.assertEqual(seen[0].full_url, "https://api.getmoshi.app/api/webhook")
         self.assertEqual(json.loads(seen[0].data), {"token": "tok", "title": "title", "message": "msg", "unified": True})
+        # Cloudflare in front of api.getmoshi.app answers urllib's default "Python-urllib/3.x" with 403 / error
+        # 1010 (live, 10/5: the first client deploy's ping was lost). Any other agent string reaches the app.
+        ua = seen[0].get_header("User-agent") or ""
+        self.assertTrue(ua and not ua.startswith("Python-urllib"), ua)
 
     def test_ping_cli_for_guard_refusals(self):
         sent = []
