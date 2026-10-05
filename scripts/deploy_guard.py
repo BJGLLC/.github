@@ -11,7 +11,16 @@ decide() is pure and unit-tested. Rules, in order:
      of order, and the older one must not overwrite the newer deploy.
   5. reason=deploy skips while a `deploy-freeze` issue is open for the env, unless the SHA's PR
      has the `hotfix` label (spec §8: rollback first, hotfix second).
-The ledger is GitHub Deployments. A deploy's auto-rollback target is whatever was live.
+  6. Range filter (--build-paths; decision 01M3N14TGN §3): a production deploy whose live..SHA range
+     touches no build path is skipped, and live stays the last SHA that shipped. It NEVER skips while the
+     auto-rollback is unarmed (no trusted live record yet), so the workflow-only first deploy still ships
+     and writes the first trusted record. Nor during a freeze: a hotfix always ships, so it can clear it.
+  7. Client production (--client; decision 01M46ESRWR, 10/5): no time window, but a deploy is refused
+     until a green preview drill is on record, the Moshi ping to Blake is configured, and (after the first
+     deploy) the auto-rollback is armed. Rollbacks and drills are never held by these.
+The ledger is GitHub Deployments. A deploy's auto-rollback target is whatever was live. In the CF pipeline
+(--current-build) "live" is the newest record it can roll back to (a trusted success with build params),
+so a record nobody can roll back to never disarms the auto-rollback while a rollable one exists.
 Each successful deploy records the build params it shipped with (payload.build); a rollback (auto or
 manual) rebuilds the target with THOSE, never the failed deploy's inputs. No trusted record -> no ship,
 loudly. A record is trusted only if github-actions[bot] created it, its kind/cf_project match this run,
@@ -30,6 +39,7 @@ drill: its green verify writes the first trusted record, and every later deploy 
 import re
 import argparse
 import datetime
+import fnmatch
 import json
 import subprocess
 import sys
@@ -51,6 +61,20 @@ FREEZE_BODY_NOT_ROLLED_BACK = (
     "{why}\n\n"
     "Forward deploys are held: the deploy guard skips every SHA whose PR is not labelled `hotfix` until one deploys "
     "green. Revert with `bin/rollback {name} --revert` or ship the fix as a `hotfix` PR; its deploy closes this issue.")
+FREEZE_BODY_UNVERIFIED = (
+    "A ship of `{frm}` to {env} did not verify and no verified rollback followed ({run}), so what is live is UNKNOWN; "
+    "before this run it was `{to}`. Check the live version first, then `bin/rollback {name} <sha>` to a known-good "
+    "SHA, or ship the fix as a `hotfix` PR.\n\n"
+    "Forward deploys are held: the deploy guard skips every SHA whose PR is not labelled `hotfix` until one deploys "
+    "green; its deploy closes this issue.")
+FREEZE_BODY_MANUAL = (
+    "`bin/rollback` is rolling {env} back from `{frm}` to `{to}` ({run}). It comments here if the rollback does not "
+    "verify.\n\n"
+    "Forward deploys are held: the deploy guard skips every SHA whose PR is not labelled `hotfix` until one deploys "
+    "green. Ship the fix, or the revert that `bin/rollback {name} --revert` opens, as a `hotfix` PR; its deploy "
+    "closes this issue. Review v4 spec §8.")
+FREEZE_STATES = ("", "auto-rolled-back", "rollback-failed", "smoke-failed-no-target", "manual")
+COMPARE_FILE_CAP = 300  # the compare API lists at most 300 files; a full page may be truncated
 
 
 def decide(c):
@@ -99,6 +123,17 @@ def decide(c):
         return {**base, "go": True, "prev_sha": live, "message": f"go: {s7}{tail}"}
     why = build_problem(lb, c.get("current_build")) if live else ""
     armed = bool(live) and not why
+    prod = c["env"] != "drill"
+    if c.get("skippable") and armed and prod and not c.get("freezes"):
+        return no(f"skip: {live[:7]}..{s7} changes no build input; live stays {live[:7]}")
+    if c.get("client") and prod:
+        if not c.get("drill_green"):
+            return no("refused: client production needs a green preview drill on record first "
+                      "(dispatch the deploy workflow with env=drill)")
+        if not c.get("ping_configured"):
+            return no("refused: client production deploys ping Blake; set the MOSHI_TOKEN secret first")
+        if live and not armed:
+            return no(f"refused: client production keeps its auto-rollback armed, but rollback target {live[:7]} {why}")
     if armed:
         tail = f", auto-rollback target {live[:7]}"
     elif live:
@@ -111,20 +146,23 @@ def decide(c):
             "message": f"go: {s7}{tail}"}
 
 
-def pick_live(deps):
-    """deps: newest first, each {sha, state, created_at, payload}. Live = newest success."""
+def pick_live(deps, trusted_only=False):
+    """deps: newest first, each {sha, state, created_at, payload, creator}. Live = newest success.
+    trusted_only (the CF pipeline): newest rollable success, so a record nobody can roll back to (a hand-written
+    or forged one) never becomes the auto-rollback target and leaves a failed smoke live."""
     for d in deps:
-        if d["state"] == "success":
+        if rollable(d) if trusted_only else d["state"] == "success":
             return d["sha"]
     return ""
 
 
-def pick_previous(deps):
-    """Newest success that is not live and was never rolled away from."""
-    live = pick_live(deps)
+def pick_previous(deps, trusted_only=False):
+    """Newest success that is not live and was never rolled away from; trusted_only: only rollable ones,
+    so `bin/rollback <repo>` never picks a SHA the CF guard would refuse."""
+    live = pick_live(deps, trusted_only)
     bad = {(d.get("payload") or {}).get("rolled_back_from") for d in deps} - {None, ""}
     for d in deps:
-        if d["state"] == "success" and d["sha"] != live and d["sha"] not in bad:
+        if (rollable(d) if trusted_only else d["state"] == "success") and d["sha"] != live and d["sha"] not in bad:
             return d["sha"]
     return ""
 
@@ -137,6 +175,19 @@ def trusted(d):
     """Only the gate's own workflow (github-actions[bot]) writes records a rollback may rebuild from."""
     cr = d.get("creator") or {}
     return cr.get("login") == TRUSTED_CREATOR and cr.get("type") == "Bot"
+
+
+def rollable(d):
+    """A success the CF pipeline can rebuild: written by its bot, carrying well-formed build params."""
+    return d["state"] == "success" and trusted(d) and valid_build((d.get("payload") or {}).get("build"))
+
+
+def touches_build(files, patterns):
+    """files: paths changed in live..sha (renames list both names), or None when unknown. fnmatch globs,
+    where * also crosses /, so `site/**` covers the whole tree. Unknown -> True: ship rather than skip."""
+    if files is None:
+        return True
+    return any(fnmatch.fnmatchcase(f, p) for f in files for p in patterns)
 
 
 def recorded_build(deps, sha):
@@ -246,18 +297,32 @@ def now():
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def gather(repo, sha, reason, env, force, has_alias, current_build=None):
+def changed_files(repo, base, head):
+    """Paths changed in base...head (a rename lists both names), or None if the list may be truncated."""
+    files = gh_json(f"repos/{repo}/compare/{base}...{head}").get("files") or []
+    if len(files) >= COMPARE_FILE_CAP:
+        return None
+    return [n for f in files for n in (f.get("filename"), f.get("previous_filename")) if n]
+
+
+def gather(repo, sha, reason, env, force, has_alias, current_build=None, build_paths=(), client=False,
+           ping_configured=False):
     full = gh("api", f"repos/{repo}/commits/{sha}", "--jq", ".sha")  # expands a short SHA; unknown SHA -> error
     tip = gh("api", f"repos/{repo}/commits/main", "--jq", ".sha")
     decided_at = now()  # before the freezes are read, so a freeze opened later is never older than this
     deps = ledger(repo, env)
-    live = pick_live(deps)
+    live = pick_live(deps, trusted_only=current_build is not None)  # the CF pipeline: newest rollable record
     target = recorded_build(ledger(repo, env, 20, full), full) if reason == "rollback" else None
     pr, labels = pr_of(repo, full)
+    newer = bool(live) and live != full and ancestor_or_equal(repo, live, full)
+    skippable = (bool(build_paths) and reason == "deploy" and newer
+                 and not touches_build(changed_files(repo, live, full), build_paths))
+    prod_client = client and env != "drill"
+    drill_green = prod_client and any(d["state"] == "success" and trusted(d) for d in ledger(repo, "drill"))
     return {"sha": full, "reason": reason, "env": env, "force_smoke_fail": force, "has_drill_alias": has_alias,
             "on_main": ancestor_or_equal(repo, full, tip), "ci": ci_state(repo, full), "live_sha": live, "live_build": recorded_build(deps, live) if live else None,
-            "current_build": current_build, "target_build": target,
-            "newer_than_live": bool(live) and live != full and ancestor_or_equal(repo, live, full),
+            "current_build": current_build, "target_build": target, "newer_than_live": newer, "skippable": skippable,
+            "client": client, "drill_green": drill_green, "ping_configured": ping_configured,
             "ledger_success_shas": [d["sha"] for d in deps if d["state"] == "success"],
             "freezes": [f["number"] for f in open_freezes(repo, env)], "pr": pr, "pr_labels": labels, "now": decided_at}
 
@@ -281,12 +346,16 @@ def freeze_open(a):
     # when it decided, so a rollback that lands mid-deploy keeps its own freeze.
     gh("label", "create", FREEZE_LABEL, "-R", a.repo, "--color", "B60205",
        "--description", "Review v4: forward deploys held after a rollback", "--force")
-    held = getattr(a, "state", "") == "smoke-failed-no-target"
+    state = getattr(a, "state", "")
     why = (f"the rollback target `{a.to[:7]}` has no trusted recorded build params, and the guard never rebuilds with guessed inputs."
            if a.to else "there was no earlier green deploy to roll back to.")
-    title = (f"deploy-freeze [{a.env}]: {a.frm[:7]} failed smoke, not rolled back" if held
-             else f"deploy-freeze [{a.env}]: rolled back from {a.frm[:7]}")
-    text = FREEZE_BODY_NOT_ROLLED_BACK if held else FREEZE_BODY
+    # The title says only what is true when the issue opens: "rolled back" only after a verified rollback.
+    title, text = {
+        "smoke-failed-no-target": (f"{a.frm[:7]} failed smoke, not rolled back", FREEZE_BODY_NOT_ROLLED_BACK),
+        "rollback-failed": (f"{a.frm[:7]} did not verify; live state unknown", FREEZE_BODY_UNVERIFIED),
+        "manual": (f"bin/rollback from {a.frm[:7]} to {a.to[:7]}", FREEZE_BODY_MANUAL),
+    }.get(state, (f"rolled back from {a.frm[:7]}", FREEZE_BODY))
+    title = f"deploy-freeze [{a.env}]: {title}"
     url = gh("issue", "create", "-R", a.repo, "--label", FREEZE_LABEL, "--title", title,
              "--body", text.format(env=a.env, frm=a.frm[:7], to=a.to[:7], run=a.run_url, name=a.repo.split("/")[-1], why=why))
     return int(url.rstrip("/").rsplit("/", 1)[1])
@@ -308,6 +377,11 @@ def main(argv=None):
     d.add_argument("--force-smoke-fail", action="store_true")
     d.add_argument("--no-drill-alias", action="store_true")
     d.add_argument("--current-build", default=None, help="JSON of this run's kind/node/install/build/out_dir/cf_project")
+    d.add_argument("--recorded-build-only", action="store_true",
+                   help="rollback pre-check (bin/rollback): CF rules, but only the target's own record is checked")
+    d.add_argument("--build-paths", default="", help="range filter: globs (whitespace/comma separated) of build inputs")
+    d.add_argument("--client", action="store_true", help="client production target (rule 7)")
+    d.add_argument("--ping-configured", action="store_true", help="the Moshi ping to Blake has its token")
     r = sub.add_parser("record")
     for f in ("--repo", "--sha", "--env", "--reason", "--url", "--run-url"):
         r.add_argument(f, required=True)
@@ -318,11 +392,12 @@ def main(argv=None):
         q = sub.add_parser(name)
         q.add_argument("--repo", required=True)
         q.add_argument("--env", required=True)
+        q.add_argument("--trusted", action="store_true", help="CF targets: only records a rollback can rebuild from")
     fo = sub.add_parser("freeze-open")
     for f in ("--repo", "--env", "--to", "--run-url"):
         fo.add_argument(f, required=True)
     fo.add_argument("--from", dest="frm", required=True)
-    fo.add_argument("--state", default="")
+    fo.add_argument("--state", default="", choices=FREEZE_STATES)
     fc = sub.add_parser("freeze-close")
     for f in ("--repo", "--env", "--sha", "--decided-at"):
         fc.add_argument(f, required=True)
@@ -336,6 +411,10 @@ def main(argv=None):
         if not valid_build(cur):
             p.error("--current-build must be a JSON object of strings with keys " + ", ".join(BUILD_KEYS))
         a.current_build = cur
+    if a.cmd == "decide" and a.recorded_build_only:
+        if a.reason != "rollback" or a.current_build is not None:
+            p.error("--recorded-build-only is a rollback pre-check and excludes --current-build")
+        a.current_build = {}  # CF mode with nothing to pin kind/cf_project against; the in-run guard pins them
     if a.cmd == "record" and a.build_json:
         try:
             ok = valid_build(json.loads(a.build_json))
@@ -344,14 +423,15 @@ def main(argv=None):
         if not ok:
             p.error(f"--build-json must be a JSON object of strings with keys {', '.join(BUILD_KEYS)}")
     if a.cmd == "decide":
+        paths = [x for x in re.split(r"[\s,]+", a.build_paths) if x]
         print(json.dumps(decide(gather(a.repo, a.sha, a.reason, a.env, a.force_smoke_fail,
-                                     not a.no_drill_alias, a.current_build))))
+                                     not a.no_drill_alias, a.current_build, paths, a.client, a.ping_configured))))
     elif a.cmd == "record":
         print(record(a))
     elif a.cmd == "live":
-        print(pick_live(ledger(a.repo, a.env)))
+        print(pick_live(ledger(a.repo, a.env), a.trusted))
     elif a.cmd == "previous":
-        print(pick_previous(ledger(a.repo, a.env)))
+        print(pick_previous(ledger(a.repo, a.env), a.trusted))
     elif a.cmd == "freeze-open":
         print(freeze_open(a))
     elif a.cmd == "freeze-close":
