@@ -326,13 +326,25 @@ def pushed_at(commit_node):
     return commit["committedDate"]
 
 
+CODE = re.compile(r"```.*?```|``[^\n]*?``|`[^`\n]*`", re.S)   # fenced blocks, then inline spans
+
+
+def asks_codex(body):
+    """True when the body issues '@codex review' outside code. Inside a code span or block it is
+    text about the command, not a request (GitHub makes no mention of it, and Codex does not act
+    on it): a tracker's link-back bot quoted a ticket that described `@codex review`, and the
+    gate took it for a request and never asked."""
+    return REVIEW_REQUEST in CODE.sub("", body)
+
+
 def is_nudged(comments, head_pushed_at):
-    """True if a comment containing '@codex review', by anyone except Codex, was created after
-    head_pushed_at: someone (a human, an agent, or the gate's own nudge) already asked Codex
-    about this SHA, so the gate neither nudges nor asks in the status. Codex's own comments
-    never count: its summary, clean-review and error comments all say 'comment "@codex review"'."""
+    """True if a comment asking '@codex review' (outside code, see asks_codex), by anyone except
+    Codex, was created after head_pushed_at: someone (a human, an agent, or the gate's own
+    nudge) already asked Codex about this SHA, so the gate neither nudges nor asks in the
+    status. Codex's own comments never count: its summary, clean-review and error comments all
+    say 'comment "@codex review"'."""
     pushed = ts(head_pushed_at)
-    return any(REVIEW_REQUEST in c["body"] and not is_codex(c["author"]) and ts(c["created_at"]) > pushed
+    return any(asks_codex(c["body"]) and not is_codex(c["author"]) and ts(c["created_at"]) > pushed
                for c in comments)
 
 

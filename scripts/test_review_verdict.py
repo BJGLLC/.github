@@ -333,6 +333,27 @@ class NudgedHelper(unittest.TestCase):
         comments = [{"author": "github-actions", "body": "unrelated", "created_at": iso(T0 + timedelta(minutes=1))}]
         self.assertFalse(is_nudged(comments, iso(T0)))
 
+    # A tracker's link-back bot quotes the linked ticket into the PR. That ticket described the
+    # command (`@codex review`) without issuing it, the gate read it as a request, and so it
+    # never asked. Text in code is about the command, not a request: GitHub makes no mention of
+    # it, and Codex did not act on it.
+    LINKBACK = ("<!-- tracker-linkback -->\n<details>\n<summary>TICKET-1 Gate nudge</summary>\n<p>\n\n"
+                "* An agent's `@codex review` at about 22:00Z brought a verdict in about 90 s.\n"
+                "**Workaround:** the session that opens the PR comments `@codex review` once the 👍 shows up.\n"
+                "```\ngh pr comment 7 --body \"@codex review\"\n```\n</p>\n</details>")
+
+    def test_the_command_quoted_in_code_is_not_a_request(self):
+        for author in ("tracker-bot[bot]", "blakejgruber"):
+            comments = [{"author": author, "body": self.LINKBACK, "created_at": iso(T0 + timedelta(minutes=1))}]
+            self.assertFalse(is_nudged(comments, iso(T0)), author)
+
+    def test_a_request_outside_code_still_counts_next_to_quoted_code(self):
+        body = "Re-asking after the fix (the `@codex review` above was before the push).\n\n@codex review"
+        comments = [{"author": "claude-agent", "body": body, "created_at": iso(T0 + timedelta(minutes=1))}]
+        self.assertTrue(is_nudged(comments, iso(T0)))
+        mid_line = [{"author": "claude-agent", "body": "Fixed in c0ffee1. @codex review", "created_at": iso(T0 + timedelta(minutes=1))}]
+        self.assertTrue(is_nudged(mid_line, iso(T0)))
+
 
 # ==== Task 8 (SSSF-23): drafts, poll loop, re-review, drills ========================
 # New names are reached through the module (rv.*) so the older tests above keep
