@@ -1,0 +1,26 @@
+[
+  {
+    "id": 5418060168,
+    "node_id": "PRR_kwDOSPzId88AAAABQvEJiA",
+    "user": {
+      "login": "chatgpt-codex-connector[bot]",
+      "type": "Bot"
+    },
+    "body": "\n### 💡 Codex Review\n\nhttps://github.com/o/r/blob/bd70b7431ff3c38b260ae3222419c6ea16ef7e20/path/to/file#L1\n**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  <finding title>**\n\n<finding detail>\n\nAGENTS.md reference: [AGENTS.md:L1-L2](https://github.com/o/r/blob/sha/AGENTS.md#L1-L2)\n    \n\n<details> <summary>ℹ️ About Codex in GitHub</summary>\n<br/>\n\nCodex has been enabled to automatically review pull requests in this repo. Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\".\n\nIf Codex has suggestions, it will comment; otherwise it will react with 👍.\n\n\n\n\nWhen you [sign up for Codex through ChatGPT](https://openai.com/codex), Codex can also answer questions or update the PR, like \"@codex address that feedback\".\n            \n</details>",
+    "state": "COMMENTED",
+    "commit_id": "bd70b7431ff3c38b260ae3222419c6ea16ef7e20",
+    "submitted_at": "2026-10-05T17:06:00Z"
+  },
+  {
+    "id": 5418122237,
+    "node_id": "PRR_kwDOSPzId88AAAABQvH7_Q",
+    "user": {
+      "login": "chatgpt-codex-connector[bot]",
+      "type": "Bot"
+    },
+    "body": "\n### 💡 Codex Review\n\nhttps://github.com/o/r/blob/38ab66cf912796154c8f9162b93959c0a6fe5c5b/path/to/file#L1\n**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  <finding title>**\n\n<finding detail>\n\nAGENTS.md reference: [AGENTS.md:L1-L2](https://github.com/o/r/blob/sha/AGENTS.md#L1-L2)\n    \n\n<details> <summary>ℹ️ About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\".\n\nIf Codex has suggestions, it will comment; otherwise it will react with 👍.\n\n\n\n\nCodex can also answer questions or update the PR. Try commenting \"@codex address that feedback\".\n            \n</details>",
+    "state": "COMMENTED",
+    "commit_id": "38ab66cf912796154c8f9162b93959c0a6fe5c5b",
+    "submitted_at": "2026-10-05T17:11:56Z"
+  }
+]

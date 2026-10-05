@@ -91,13 +91,17 @@ def is_gate_marker(comment):
     return (comment.get("body") or "").lstrip().startswith(QUEUE_REPLY)
 
 
+def edited_by_other(c):
+    """SSSF-38: a Codex comment or review body edited by someone other than Codex, so its badge
+    cannot be trusted (P1 -> P3 downgrade). A null editor with an edit time is a deleted
+    account: fail closed."""
+    ed = c.get("editor")
+    return bool(c.get("last_edited_at") or ed) and not is_codex(ed)
+
+
 def tampered(thread):
-    """SSSF-38: the first (Codex) comment was edited by someone other than Codex, so its badge
-    cannot be trusted (P1 -> P3 downgrade)."""
-    first = thread["comments"][0]
-    ed = first.get("editor")
-    # a null editor with an edit time is a deleted account: fail closed
-    return bool(first.get("last_edited_at") or ed) and not is_codex(ed)
+    """The thread's first (Codex) comment was edited by someone other than Codex."""
+    return edited_by_other(thread["comments"][0])
 
 
 def priority(thread):
@@ -106,6 +110,17 @@ def priority(thread):
     first = thread["comments"][0]["body"]
     m = BADGE.search(first)
     return int(m.group(1)) if m else 2
+
+
+def review_priority(review):
+    """The most severe badge in a Codex review's BODY (0-3), or None when it carries none.
+    Codex can put a finding only there, with no inline thread: its review of one head was a
+    COMMENTED review whose body held the PR's only P1, and the thread-only count passed it. A
+    body edited by anyone but Codex counts as P0 (SSSF-38, as for threads)."""
+    if edited_by_other(review):
+        return 0
+    found = [int(p) for p in BADGE.findall(review.get("body") or "")]
+    return min(found) if found else None
 
 
 def reviewed_commit(body):
@@ -261,6 +276,15 @@ def compute(pr, now):
             # replies only to queued (non-blocking) threads, so a marker never unblocks a P0/P1
             # (a PR-added workflow can post as github-actions: SSSF-38).
             queue.append(t["id"])
+    # Body-only findings block like threads. A review counts for the head it reviewed (its
+    # commit, or a SHA-less one after the push, as has_verdict reads them), so only a push
+    # clears it: a later clean review of the same head does not, as a resolved thread doesn't
+    # (R23). Body P2/P3 have no thread to hand to the janitor, so they are left alone.
+    for r in reviews:
+        about_head = r.get("commit_sha") == head_sha or (not r.get("commit_sha") and after(r["submitted_at"]))
+        p = review_priority(r) if about_head else None
+        if p is not None and p <= blocking_max:
+            blocking.append(r.get("id") or f"review@{r['submitted_at']}")
     if blocking:
         return {"state": "failure", "description": f"{label}: {len(blocking)} unresolved P0/P1 (push a fix): {', '.join(blocking)}"[:140], "queue": queue}
     return {"state": "success", "description": f"{label}: no blocking findings" + (f"; {len(queue)} queued for janitor" if queue else ""), "queue": queue}
@@ -392,7 +416,7 @@ query($owner:String!,$name:String!,$n:Int!){ repository(owner:$owner,name:$name)
   headRefOid isDraft state createdAt author{__typename} labels(first:20){nodes{name}}
   timelineItems(last:5, itemTypes:[READY_FOR_REVIEW_EVENT, REOPENED_EVENT]){nodes{... on ReadyForReviewEvent{createdAt} ... on ReopenedEvent{createdAt}}}
   commits(last:1){nodes{commit{committedDate checkSuites(first:20, filterBy:{appId:__ACTIONS_APP_ID__}){nodes{createdAt app{slug}}}}}}
-  reviews(first:100){nodes{author{login} submittedAt commit{oid}}}
+  reviews(first:100){nodes{id author{login} body submittedAt lastEditedAt editor{login} commit{oid}}}
   comments(last:100){totalCount nodes{author{login} body createdAt}}
   reviewThreads(first:100){nodes{id isResolved comments(first:20){nodes{author{login __typename} editor{login __typename} lastEditedAt body createdAt commit{oid}}}}}
 }}}""".replace("__ACTIONS_APP_ID__", str(GITHUB_ACTIONS_APP_ID))
@@ -443,7 +467,10 @@ def fetch(repo, number):
         "draft": p["isDraft"], "state": p["state"],
         "author_type": (p.get("author") or {}).get("__typename", ""),   # "Bot" | "User"; "" = deleted
         "labels": [l["name"] for l in p["labels"]["nodes"]],
-        "reviews": [{"author": login(r["author"]), "submitted_at": r["submittedAt"], "commit_sha": (r["commit"] or {}).get("oid", "")} for r in p["reviews"]["nodes"]],
+        "reviews": [{"id": r.get("id"), "author": login(r["author"]), "submitted_at": r["submittedAt"],
+                     "commit_sha": (r["commit"] or {}).get("oid", ""), "body": r.get("body") or "",
+                     "editor": login(r.get("editor")) or None, "last_edited_at": r.get("lastEditedAt")}
+                    for r in p["reviews"]["nodes"]],
         "comments": comments,
         "threads": [{"id": t["id"], "is_resolved": t["isResolved"], "comments": [
             {"author": login(c["author"]), "author_type": (c["author"] or {}).get("__typename", ""),
