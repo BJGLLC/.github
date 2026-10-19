@@ -36,3 +36,12 @@ regexes = [
 description = "Obsidian plugin bundle (.obsidian/plugins/*/main.js): minified identifiers, not keys"
 targetRules = ["generic-api-key"]
 paths = ['''(?:^|/)\.obsidian/plugins/[^/]+/main\.js$''']
+
+# 1Password plan-tier names (Families/Individual · Teams · Business) read as a generic key
+# in the facts mirror's SA-budget Q&A and blocked its push for a day (TOOL-492). Exempt only
+# when the extracted value IS a tier name; a key beside the prose still fires.
+[[allowlists]]
+description = "1Password plan tier as the extracted value (Families/Individual | Teams | Business), not a key"
+targetRules = ["generic-api-key"]
+regexTarget = "secret"
+regexes = ['''^(?:Families(?:/Individual)?|Individual|Teams|Business)$''']
