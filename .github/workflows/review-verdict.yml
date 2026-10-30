@@ -19,6 +19,8 @@
 #            Codex answers, its reply ends the hold (~2 min after a request); only a request
 #            nobody answers holds the full 30 min, and that PR goes red instead of hanging.
 #            No cron: the $25/mo hard Actions budget cannot carry one per repo.
+# runs-on: org variable BJG_RUNS_ON routes both jobs to the eos runners (OPS-973; a private-repo
+# variable, so this repo's own self-test stays on ubuntu-latest); unset = ubuntu-latest.
 #   once   — every other event: one fetch -> compute -> post, or a drill (workflow_dispatch;
 #            only `p1-open`, and a drill may only ever post failure -- R39: a success drill
 #            satisfied the required check on any head). It never comments: only the poller,
@@ -57,7 +59,7 @@ defaults:
 jobs:
   poll:
     if: github.event_name == 'pull_request' && contains(fromJSON('["opened","synchronize","reopened","ready_for_review"]'), github.event.action)
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.BJG_RUNS_ON || '"ubuntu-latest"') }}
     timeout-minutes: 35   # codex-unavailable at +30 + the last 60-s sleep + the nudges + slack (SSSF-46)
     concurrency:          # a newer push cancels the superseded poller for the same PR; one poller
                           # per PR at a time is also what makes the nudge's marker check race-free
@@ -85,7 +87,7 @@ jobs:
 
   once:
     if: github.event_name != 'pull_request' || !contains(fromJSON('["opened","synchronize","reopened","ready_for_review","closed"]'), github.event.action)
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.BJG_RUNS_ON || '"ubuntu-latest"') }}
     timeout-minutes: 5
     concurrency:          # one one-shot per PR at a time; a newer event waits (a pending one is
                           # replaced by the newest, which recomputes from fresh state). Racing

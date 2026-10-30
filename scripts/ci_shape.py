@@ -29,7 +29,9 @@ INPUTS = {"node-version", "node-cache", "python-version", "python-cache", "cache
 OUTPUTS = {"failing_step": "${{ steps.check.outputs.failing_step }}"}
 CONCURRENCY = {"group": "ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.sha }}",
                "cancel-in-progress": True}
-RUNS_ON = "ubuntu-latest"
+# GitHub's Linux machine, or the OPS-973 route: org variable BJG_RUNS_ON picks the eos runners,
+# and an unset variable falls back to ubuntu-latest. Nothing else (macOS bills 10x).
+RUNS_ON = ("ubuntu-latest", "${{ fromJSON(vars.BJG_RUNS_ON || '\"ubuntu-latest\"') }}")
 MAX_TIMEOUT = 30
 # Every key a job named `ci` may carry. What each banned key would do to the required check:
 BANNED = {
@@ -137,8 +139,8 @@ def check_ci(wf, repo):
         return v
     for key in sorted(set(ci) - CI_JOB_KEYS, key=str):
         v.append(f"jobs.ci.{key} is not allowed: {BANNED.get(key, 'not part of the uniform shape')}")
-    if ci.get("runs-on") != RUNS_ON:
-        v.append(f"jobs.ci.runs-on must be {RUNS_ON}")
+    if ci.get("runs-on") not in RUNS_ON:
+        v.append(f"jobs.ci.runs-on must be one of {RUNS_ON}")
     t = ci.get("timeout-minutes")
     if not (isinstance(t, int) and not isinstance(t, bool) and 1 <= t <= MAX_TIMEOUT):
         v.append(f"jobs.ci.timeout-minutes must be an integer from 1 to {MAX_TIMEOUT}")
