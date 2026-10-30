@@ -145,8 +145,13 @@ class Shape(unittest.TestCase):
 
     # --- the job's body
     def test_runs_on_pinned(self):
-        wf = good(); wf["jobs"]["ci"]["runs-on"] = "macos-latest"
-        self.hit(wf, "runs-on")
+        for bad in ("macos-latest", "${{ vars.BJG_RUNS_ON }}", ["self-hosted", "eos"]):
+            wf = good(); wf["jobs"]["ci"]["runs-on"] = bad
+            self.hit(wf, "runs-on")
+
+    def test_runs_on_eos_route_passes(self):
+        wf = good(); wf["jobs"]["ci"]["runs-on"] = "${{ fromJSON(vars.BJG_RUNS_ON || '\"ubuntu-latest\"') }}"
+        self.assertEqual(self.v(wf), [])
 
     def test_timeout_required_and_bounded(self):
         for bad in (None, 0, 90, "20", True):
