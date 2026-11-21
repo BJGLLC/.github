@@ -6,9 +6,11 @@ locally it skips."""
 import os
 import pathlib
 import random
+import shlex
 import shutil
 import string
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -101,22 +103,60 @@ class Action(unittest.TestCase):
 
     def test_every_python_invocation_is_isolated(self):
         # -I keeps the PR checkout (cwd) off sys.path: a root yaml.py must never run in the shape step.
+        # ci-python.sh (the shape step's interpreter pick, SSSF-59) is held to the same rule.
         import re
+        lines = [ln for s in self.a["runs"]["steps"] for ln in s.get("run", "").splitlines()]
+        lines += (HERE / "ci-python.sh").read_text().splitlines()
         n = 0
-        for s in self.a["runs"]["steps"]:
-            for line in s.get("run", "").splitlines():
-                for m in re.finditer(r'("\$py"|python3?)\s+(\S+)', line):
-                    n += 1
-                    self.assertEqual(m.group(2), "-I", f"python call without -I: {line.strip()}")
-        self.assertGreaterEqual(n, 3)
+        for line in lines:
+            for m in re.finditer(r'("\$py"|python3?)\s+(\S+)', line):
+                n += 1
+                self.assertEqual(m.group(2), "-I", f"python call without -I: {line.strip()}")
+        self.assertGreaterEqual(n, 5)
+
+    def shape_step(self, d, *candidates, runner_temp=None):
+        """Run the shape step's own text in checkout d. candidates (SSSF-59 drills) are appended to
+        its ci-python.sh call, standing in for a runner image's /usr/bin/python3 and python3."""
+        run = self.step_run("shape")
+        call = '"$BJG_CI/scripts/ci-python.sh"'
+        if candidates:
+            self.assertEqual(run.count(call), 1, "shape step no longer picks its python via ci-python.sh")
+            run = run.replace(call, call + "".join(f" {shlex.quote(c)}" for c in candidates))
+        env = {**os.environ, "BJG_CI": str(HERE.parent), "GITHUB_REPOSITORY": "BJGLLC/x",
+               "RUNNER_TEMP": runner_temp or d}
+        return subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", run],
+                               cwd=d, env=env, capture_output=True, text=True)
 
     def test_hostile_root_yaml_py_does_not_run(self):
         with tempfile.TemporaryDirectory() as d:
             marker = pathlib.Path(d, "pwned")
             pathlib.Path(d, "yaml.py").write_text(f"import pathlib; pathlib.Path({str(marker)!r}).write_text('x')\n")
-            env = {**os.environ, "BJG_CI": str(HERE.parent), "GITHUB_REPOSITORY": "BJGLLC/x"}
-            subprocess.run(["bash", "-c", self.step_run("shape")], cwd=d, env=env, capture_output=True, text=True)
+            self.shape_step(d)
             self.assertFalse(marker.exists(), "the PR's own yaml.py ran inside the shape step")
+
+    def test_hostile_root_yaml_py_does_not_run_on_the_venv_path(self):
+        # same drill, with a system python that has no PyYAML: the probe and the venv both stay -I.
+        stub = no_yaml_python()
+        need_pypi()
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as rt:
+            caller(d)
+            marker = pathlib.Path(d, "pwned")
+            pathlib.Path(d, "yaml.py").write_text(f"import pathlib; pathlib.Path({str(marker)!r}).write_text('x')\n")
+            r = self.shape_step(d, stub, runner_temp=rt)
+            self.assertFalse(marker.exists(), "the PR's own yaml.py ran inside the shape step (venv path)")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertTrue(list(pathlib.Path(rt).glob("bjg-py.*/bin/python")), "the venv path did not run")
+
+    def test_shape_green_when_system_python_lacks_yaml(self):
+        # SSSF-59: the old fallback was `-I -m pip install`, which cannot work under -I or PEP 668.
+        stub = no_yaml_python()
+        need_pypi()
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as rt:
+            caller(d)
+            r = self.shape_step(d, stub, runner_temp=rt)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("ci_shape: ok", r.stdout)
+            self.assertTrue(list(pathlib.Path(rt).glob("bjg-py.*/bin/python")), "the venv path did not run")
 
     def test_actionlint_ignores_the_prs_own_config(self):
         need("actionlint", "-version")
@@ -131,6 +171,72 @@ class Action(unittest.TestCase):
         for s in self.a["runs"]["steps"]:
             if "run" in s:
                 self.assertEqual(s.get("shell"), "bash", s.get("name"))
+
+
+class CiPython(unittest.TestCase):
+    """ci-python.sh (SSSF-59): the shape step's interpreter. A python that already imports PyYAML
+    is used as-is (no venv, no network); none → a fresh venv under $RUNNER_TEMP."""
+
+    def pick(self, *candidates):
+        rt = tempfile.mkdtemp()
+        r = subprocess.run(["bash", str(HERE / "ci-python.sh"), *candidates],
+                           env={**os.environ, "RUNNER_TEMP": rt}, capture_output=True, text=True)
+        return r, pathlib.Path(rt)
+
+    def test_python_with_yaml_is_used_without_a_venv(self):
+        r, rt = self.pick(sys.executable)
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, sys.executable), r.stderr)
+        self.assertEqual(list(rt.iterdir()), [], "the common path must not create a venv")
+
+    def test_first_candidate_with_yaml_wins(self):
+        r, rt = self.pick(no_yaml_python(), sys.executable)
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, sys.executable), r.stderr)
+        self.assertEqual(list(rt.iterdir()), [])
+
+    def test_no_usable_python_is_red(self):
+        r, _ = self.pick("/nonexistent/python3")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("::error", r.stderr)
+
+
+_NO_YAML = []
+
+
+def no_yaml_python():
+    """A real interpreter that cannot import PyYAML: a pip-less venv off this python (a venv
+    does not see the system site-packages), wrapped so it is not a symlink back to the base."""
+    if not _NO_YAML:
+        d = tempfile.mkdtemp()
+        subprocess.run([sys.executable, "-I", "-m", "venv", "--without-pip", f"{d}/v"], check=True)
+        w = pathlib.Path(d, "python3")
+        w.write_text(f'#!/bin/sh\nexec {shlex.quote(d + "/v/bin/python")} "$@"\n')
+        w.chmod(0o755)
+        r = subprocess.run([str(w), "-I", "-c", "import yaml"], capture_output=True)
+        assert r.returncode != 0, "the no-yaml stub can import yaml"
+        _NO_YAML.append(str(w))
+    return _NO_YAML[0]
+
+
+def need_pypi():
+    """The venv path installs PyYAML from PyPI: in CI it must work; offline locally it skips."""
+    import socket
+    try:
+        socket.create_connection(("pypi.org", 443), timeout=5).close()
+    except OSError:
+        if os.environ.get("CI"):
+            raise AssertionError("pypi.org unreachable in CI")
+        raise unittest.SkipTest("pypi.org unreachable here")
+
+
+def caller(d):
+    """A clean caller checkout: a conforming ci.yml for BJGLLC/x."""
+    wf = {"name": "ci", "on": {"push": {"branches": ["main"]}, "pull_request": {}, "workflow_dispatch": {}},
+          "permissions": {"contents": "read"}, "concurrency": cs.CONCURRENCY,
+          "jobs": {"ci": {"runs-on": "ubuntu-latest", "timeout-minutes": 20,
+                          "steps": [cs.CHECKOUT, {"id": "check", "uses": cs.ORG_ACTION}]}}}
+    p = pathlib.Path(d, ".github", "workflows", "ci.yml")
+    p.parent.mkdir(parents=True)
+    p.write_text(yaml.safe_dump(wf, sort_keys=False))
 
 
 class ShellcheckTracked(unittest.TestCase):
