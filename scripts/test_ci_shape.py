@@ -222,6 +222,25 @@ class Shape(unittest.TestCase):
         n["needs"] = ["ci"]; wf["jobs"]["notify-linear"] = n
         self.assertEqual(self.v(wf), [])
 
+    def test_notifier_may_call_the_org_reusable(self):
+        # SSSF-72: the org-served ci-red-notify replaces the per-repo copies.
+        wf = good(); n = notifier(); n["uses"] = "BJGLLC/.github/.github/workflows/ci-red-notify.yml@main"
+        wf["jobs"]["notify-linear"] = n
+        self.assertEqual(self.v(wf), [])
+
+    def test_notifier_refuses_any_other_reusable(self):
+        for uses in ("BJGLLC/.github/.github/workflows/ci-red-notify.yml@v1",        # not main: plan D7
+                     "BJGLLC/.github/.github/workflows/ci-red-notify.yml",           # no ref
+                     "bjgllc/.github/.github/workflows/ci-red-notify.yml@main",      # spelling variants
+                     "BJGLLC/.github/.github/workflows/review-verdict.yml@main",     # another org workflow
+                     "BJGLLC/.github/.github/workflows/pr-ticket-lint.yml@main",
+                     "evil/.github/.github/workflows/ci-red-notify.yml@main",        # another owner
+                     "BJGLLC/other/.github/workflows/ci-red-notify.yml@main",
+                     "./.github/workflows/ci-red-notify.yaml"):
+            with self.subTest(uses=uses):
+                wf = good(); n = notifier(); n["uses"] = uses; wf["jobs"]["notify-linear"] = n
+                self.hit(wf, "jobs.notify-linear")
+
     def test_notifier_is_only_a_call_to_the_notify_workflow(self):
         for extra in ({"name": "review-verdict"}, {"permissions": {"statuses": "write"}},
                       {"runs-on": "ubuntu-latest", "steps": [{"run": "true"}]},
@@ -344,6 +363,19 @@ class Reserved(unittest.TestCase):
             (p / "ci.yml").write_text(yaml.safe_dump(good(), sort_keys=False))
             (p / "review-verdict.yml").write_text(real)
             out = subprocess.run([sys.executable, cs.__file__, "--repo", "BJGLLC/cd-home", d], capture_output=True, text=True)
+            self.assertEqual(out.returncode, 0, out.stdout)
+            self.assertIn("ci_shape: ok", out.stdout)
+
+    def test_real_callers_of_the_shared_notifiers_pass(self):
+        # SSSF-72: the migrated ci.yml (org ci-red-notify) and the advisory pr-ticket-lint caller, as the
+        # lead will land them in each gated repo, next to the review-verdict caller.
+        fx = pathlib.Path(__file__).parent / "fixtures"
+        with tempfile.TemporaryDirectory() as d:
+            p = pathlib.Path(d)
+            (p / "ci.yml").write_text((fx / "caller-ci-with-red-notify.yml").read_text())
+            (p / "pr-ticket-lint.yml").write_text((fx / "caller-pr-ticket-lint.yml").read_text())
+            (p / "review-verdict.yml").write_text((fx / "caller-review-verdict.yml").read_text())
+            out = subprocess.run([sys.executable, cs.__file__, "--repo", "BJGLLC/bjg-intranet", d], capture_output=True, text=True)
             self.assertEqual(out.returncode, 0, out.stdout)
             self.assertIn("ci_shape: ok", out.stdout)
 

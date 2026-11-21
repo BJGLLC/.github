@@ -1,0 +1,37 @@
+# .github/workflows/pr-ticket-lint.yml — reusable (workflow_call), SSSF-72. Does the PR cite a Linear
+# ticket (title, body or branch)? Logic: scripts/pr_ticket_lint.py. Caller stanza:
+# scripts/fixtures/caller-pr-ticket-lint.yml (on pull_request; the `github` context is the caller's).
+#
+# ADVISORY. With advisory: true (the default) a PR without a ticket gets a ::warning and the job stays
+# green; the check (`ticket-lint / lint` in a caller) is not a required context anywhere. Turning it
+# into a gate is Blake's decision. It takes BOTH: `default: true` -> `default: false` below (a missing
+# ticket turns the job red), and the context `ticket-lint / lint` added to claude-dotfiles
+# claude/policy/required-checks.txt (until then a red non-required check blocks no merge), which needs
+# every gated repo to carry the caller first: a required context a repo never emits blocks every merge.
+# Exempt: label `hotfix`, dependabot/renovate. Event data reaches the script only as a file, never ${{ }}.
+name: pr-ticket-lint
+on:
+  workflow_call:
+    inputs:
+      advisory: { type: boolean, default: true }
+permissions: {}
+jobs:
+  lint:
+    if: github.event_name == 'pull_request'
+    runs-on: ${{ fromJSON(vars.BJG_RUNS_ON || '"ubuntu-latest"') }}   # OPS-973 eos route; unset = ubuntu-latest
+    timeout-minutes: 3
+    continue-on-error: ${{ inputs.advisory }}   # advisory: even a checkout failure cannot turn the run red
+    permissions: { contents: read }
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: BJGLLC/.github, ref: main, path: .ticketlint, persist-credentials: false }
+      - name: Does this PR cite a Linear ticket?
+        env:
+          ADVISORY: ${{ inputs.advisory }}
+        run: |
+          jq '.pull_request' "$GITHUB_EVENT_PATH" > "$RUNNER_TEMP/pr.json"
+          if [ "$ADVISORY" = true ]; then
+            python3 .ticketlint/scripts/pr_ticket_lint.py --annotate warning < "$RUNNER_TEMP/pr.json" || true
+          else
+            python3 .ticketlint/scripts/pr_ticket_lint.py < "$RUNNER_TEMP/pr.json"
+          fi

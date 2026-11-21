@@ -43,7 +43,8 @@ BANNED = {
     "uses": "a reusable-workflow job reports as `ci / <job>`, so `ci` never reports",
 }
 TOP_KEYS = {"name", "on", True, "permissions", "concurrency", "jobs"}   # env/defaults/run-name reach every step
-NOTIFY_USES = "./.github/workflows/ci-red-notify.yml"
+# The failure notifier: the org-served reusable (SSSF-72, @main like the action) or a repo's legacy local copy.
+NOTIFY_USES = ("BJGLLC/.github/.github/workflows/ci-red-notify.yml@main", "./.github/workflows/ci-red-notify.yml")
 NOTIFIER_KEYS = {"needs", "if", "uses", "with", "secrets"}
 CI_JOB_KEYS = {"runs-on", "timeout-minutes", "outputs", "steps"}
 RESERVED = {"ci", "review-verdict"}
@@ -94,7 +95,7 @@ def _needs(job):
 def is_notifier(job):
     """A failure notifier is only a call to the notify workflow: no name, permissions, steps, runs-on."""
     return (isinstance(job, dict) and set(job) <= NOTIFIER_KEYS and _needs(job) == ["ci"]
-            and job.get("if") == "failure()" and job.get("uses") == NOTIFY_USES)
+            and job.get("if") == "failure()" and job.get("uses") in NOTIFY_USES)
 
 
 def check_ci(wf, repo):
