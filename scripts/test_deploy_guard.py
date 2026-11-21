@@ -2,7 +2,10 @@
 import contextlib
 import io
 import json
+import os
+import pathlib
 import subprocess
+import tempfile
 import types
 import unittest
 from unittest import mock
@@ -461,7 +464,85 @@ class Gather(unittest.TestCase):
         self.assertIn("HTTP 403: nope", se.getvalue())
 
 
-BOT = {"login": "github-actions[bot]", "type": "Bot"}
+class GhJsonRetry(unittest.TestCase):
+    """OPS-965: one empty GitHub reply must not fail the deploy tick. A real `gh` on PATH is replaced by a
+    fake that plays back one reply per call (rc, stdout, stderr); the last reply repeats."""
+    PRS = '[{"number": 7, "labels": [{"name": "hotfix"}]}]'
+    EMPTY_GH = (1, "", "unexpected end of JSON input\n")  # what gh said on 2026-10-22
+    EMPTY_BODY = (0, "", "")  # gh exits 0 but the body is empty: the JSON parse fails
+    HTTP_502 = (1, "", "gh: Server Error (HTTP 502)\n")
+    NOT_FOUND = (1, '{"message":"Not Found"}', "gh: Not Found (HTTP 404)\n")
+    AUTH = (1, "", "HTTP 401: Bad credentials (https://api.github.com/repos/o/r/commits/x/pulls)\n")
+
+    def play(self, *replies):
+        """pr_of over the fake gh. Returns (result or the raised exception, gh call count, sleeps, stderr)."""
+        with tempfile.TemporaryDirectory() as d:
+            for i, (rc, out, err) in enumerate(replies, 1):
+                for ext, v in (("rc", str(rc)), ("out", out), ("err", err)):
+                    pathlib.Path(d, f"{i}.{ext}").write_text(v)
+            fake = pathlib.Path(d, "gh")
+            fake.write_text('#!/usr/bin/env bash\nn=$(cat "$GH_FAKE/n" 2>/dev/null || echo 0); n=$((n+1)); '
+                            'echo "$n" > "$GH_FAKE/n"\nr=$n; [ -e "$GH_FAKE/$r.rc" ] || r=$GH_FAKE_LAST\n'
+                            'printf %s "$(cat "$GH_FAKE/$r.out")"; printf %s "$(cat "$GH_FAKE/$r.err")" >&2; '
+                            'exit "$(cat "$GH_FAKE/$r.rc")"\n')
+            fake.chmod(0o755)
+            env = {"PATH": f"{d}:{os.environ['PATH']}", "GH_FAKE": d, "GH_FAKE_LAST": str(len(replies))}
+            sleeps = []
+            with mock.patch.dict(os.environ, env), mock.patch("time.sleep", sleeps.append), \
+                    contextlib.redirect_stderr(io.StringIO()) as se:
+                try:
+                    got = deploy_guard.pr_of("o/r", "f" * 40)
+                except Exception as e:  # noqa: BLE001 - the test inspects what escaped
+                    got = e
+            n = int(pathlib.Path(d, "n").read_text())
+        return got, n, sleeps, se.getvalue()
+
+    def test_success_first_time_calls_gh_once_and_never_sleeps(self):
+        got, n, sleeps, _ = self.play((0, self.PRS, ""))
+        self.assertEqual((got, n, sleeps), ((7, ["hotfix"]), 1, []))
+
+    def test_one_empty_reply_from_gh_is_retried(self):
+        got, n, sleeps, err = self.play(self.EMPTY_GH, (0, self.PRS, ""))
+        self.assertEqual((got, n), ((7, ["hotfix"]), 2))
+        self.assertEqual(len(sleeps), 1)
+        self.assertIn("retrying", err)
+
+    def test_one_empty_body_is_retried(self):
+        got, n, _, _ = self.play(self.EMPTY_BODY, (0, self.PRS, ""))
+        self.assertEqual((got, n), ((7, ["hotfix"]), 2))
+
+    def test_a_5xx_is_retried(self):
+        got, n, _, _ = self.play(self.HTTP_502, self.EMPTY_BODY, (0, "[]", ""))
+        self.assertEqual((got, n), ((None, []), 3))
+
+    def test_three_transient_failures_still_fail_the_tick_loudly(self):
+        got, n, sleeps, err = self.play(self.EMPTY_GH)
+        self.assertIsInstance(got, subprocess.CalledProcessError)
+        self.assertEqual((n, len(sleeps)), (3, 2))
+        self.assertIn("unexpected end of JSON input", err)
+        self.assertIn("giving up", err)
+
+    def test_three_empty_bodies_still_fail_the_tick(self):
+        got, n, _, _ = self.play(self.EMPTY_BODY)
+        self.assertIsInstance(got, ValueError)
+        self.assertEqual(n, 3)
+
+    def test_a_404_or_auth_error_is_not_retried(self):
+        for reply in (self.NOT_FOUND, self.AUTH):
+            with self.subTest(reply[2]):
+                got, n, sleeps, err = self.play(reply, (0, self.PRS, ""))
+                self.assertIsInstance(got, subprocess.CalledProcessError)
+                self.assertEqual((n, sleeps), (1, []))
+                self.assertIn(reply[2].strip(), err)
+
+    def test_backoff_is_short_and_grows(self):
+        _, _, sleeps, _ = self.play(self.EMPTY_GH)
+        self.assertEqual(len(sleeps), 2)
+        self.assertEqual(sleeps, sorted(sleeps))
+        self.assertTrue(all(0 < s <= 5 for s in sleeps), sleeps)
+
+
+BOT ={"login": "github-actions[bot]", "type": "Bot"}
 MALLORY = {"login": "mallory", "type": "User"}
 
 
