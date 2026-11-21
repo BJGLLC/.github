@@ -227,7 +227,14 @@ def compute(pr, now):
     # comment, a same-SHA review or an empty-sha-after-push review are the fallback. A 👍 or a
     # SHA-less no-issues comment is never a verdict (R46): after a push it may still be about
     # the previous head -- the stale-verdict race again, on PRs with 100+ comments.
-    has_head_sha_review = any(r.get("commit_sha") == head_sha for r in reviews)
+    # SSSF-81: GitHub stamps a review with the PR head at submission unless the reviewer pins a
+    # commit, so a review of an older commit that lands after a push can read commit_sha == head.
+    # Codex's receipt (`**Reviewed commit:** ...`) says what it reviewed; a review whose receipt
+    # names another commit is never a verdict for the head (fail closed). A receipt-less review
+    # keeps its commit_sha. Rounds and body-finding blocking still read every review.
+    verdict_reviews = [r for r in reviews
+                       if not ((rc := reviewed_commit(r.get("body") or "")) and not head_sha.lower().startswith(rc))]
+    has_head_sha_review = any(r.get("commit_sha") == head_sha for r in verdict_reviews)
     head_named_no_issues = any(
         NO_ISSUES.search(c["body"]) and (rc := reviewed_commit(c["body"])) and head_sha.lower().startswith(rc)
         for c in head_comments)
@@ -235,7 +242,7 @@ def compute(pr, now):
         has_verdict = (summary_status == "completed") or has_head_sha_review or head_named_no_issues
     else:
         empty_sha_review_after_push = any(
-            not r.get("commit_sha") and after(r["submitted_at"]) for r in reviews)
+            not r.get("commit_sha") and after(r["submitted_at"]) for r in verdict_reviews)
         has_verdict = has_head_sha_review or empty_sha_review_after_push or head_named_no_issues
 
     if not has_verdict:

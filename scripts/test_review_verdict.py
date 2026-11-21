@@ -1888,5 +1888,102 @@ class ReviewBodyFindings(unittest.TestCase):
         self.assertIn("reviews(first:100){nodes{id author{login} body submittedAt lastEditedAt editor{login} commit{oid}}}", rv.GQL)
 
 
+# ==== SSSF-81: a clean verdict on an earlier commit never passes the head =====================
+SHA_A = "aaaa111" + "1" * 33   # an earlier commit Codex reviewed clean
+SHA_B = "bbbb222" + "2" * 33   # the head, pushed at T0
+
+
+def receipt_review(minutes, commit_sha, named, body_extra=""):
+    """A Codex review as fetch() reports it: GitHub's commit_sha plus Codex's own receipt line."""
+    return {"id": f"PRR_{minutes}", "author": CODEX, "submitted_at": iso(T0 + timedelta(minutes=minutes)),
+            "commit_sha": commit_sha, "body": f"### Codex Review\n\n**Reviewed commit:** `{named[:10]}`\n{body_extra}",
+            "editor": None, "last_edited_at": None}
+
+
+class HeadReviewRequired(unittest.TestCase):
+    """compute() has no ci input: `ci` is a separate required check, so "ci green" here is every
+    other merge condition met. The only question is whether review-verdict passes."""
+
+    def test_clean_review_of_an_earlier_commit_never_passes_the_head(self):  # the ticket's fixture
+        for summary in (None, {"status": "completed", "commit": SHA_A[:7]}):
+            for minutes in (-5, 2):  # reviewed before B was pushed, or submitted (late) after it
+                p = pr(head_sha=SHA_B, reviews=[receipt_review(minutes, SHA_A, SHA_A)], summary=summary)
+                with self.subTest(summary=summary, minutes=minutes):
+                    v = compute(p, T0 + timedelta(minutes=5))
+                    self.assertEqual(v["state"], "pending")
+                    self.assertEqual(v["description"], f"waiting for Codex review of {SHA_B[:7]}")
+
+    def test_a_head_stamped_review_whose_receipt_names_another_commit_is_not_a_verdict(self):
+        # GitHub stamps a review with the PR head at submission unless the reviewer pins a commit,
+        # so a review of A that lands after B was pushed can read commit_sha=B. Codex's receipt
+        # says what it actually reviewed; when the two disagree, the head is not reviewed.
+        p = pr(head_sha=SHA_B, reviews=[receipt_review(2, SHA_B, SHA_A)])
+        self.assertEqual(compute(p, T0 + timedelta(minutes=5))["state"], "pending")
+
+    def test_a_sha_less_review_after_the_push_naming_another_commit_is_not_a_verdict(self):
+        p = pr(head_sha=SHA_B, reviews=[receipt_review(2, "", SHA_A)])
+        self.assertEqual(compute(p, T0 + timedelta(minutes=5))["state"], "pending")
+
+    def test_completed_review_of_the_head_with_no_p0_p1_passes(self):
+        for summary in (None, {"status": "completed", "commit": SHA_B[:7]}):
+            p = pr(head_sha=SHA_B, reviews=[receipt_review(-5, SHA_A, SHA_A), receipt_review(2, SHA_B, SHA_B)],
+                   threads=[thread("T2", 2, 2, sha=SHA_B)], summary=summary)
+            with self.subTest(summary=summary):
+                v = compute(p, T0 + timedelta(minutes=5))
+                self.assertEqual(v["state"], "success")
+                self.assertEqual(v["description"], "round 2: no blocking findings; 1 queued for janitor")
+
+    def test_a_sha_less_head_review_naming_the_head_still_passes(self):  # fallback path kept
+        p = pr(head_sha=SHA_B, reviews=[receipt_review(2, "", SHA_B)])
+        self.assertEqual(compute(p, T0 + timedelta(minutes=5))["state"], "success")
+
+    def test_a_mismatched_receipt_still_blocks_with_its_body_p1(self):  # fail closed both ways
+        p = pr(head_sha=SHA_B, reviews=[receipt_review(2, SHA_B, SHA_A, P1_BODY.format(p=1)),
+                                        receipt_review(3, SHA_B, SHA_B)])
+        v = compute(p, T0 + timedelta(minutes=5))
+        self.assertEqual(v["state"], "failure"); self.assertIn("PRR_2", v["description"])
+
+
+PR292 = "cd-marketing-292-at-merge.json"
+
+
+class Pr292Replay(unittest.TestCase):
+    """BJGLLC/cd-marketing #292 merged 11/7 with a Codex P1 open (fixed in #293). Codex HAD reviewed
+    the head: its review of 3977006 (16:13:13Z) carried the P1 thread. The gate passed it because
+    that review was round 3 (three reviewed SHAs), and from round 3 only P0 blocks (review v4
+    spec §6 rule 3, R22). These replays pin that path; if the round cap changes, the first flips."""
+
+    def load(self):
+        with open(os.path.join(FIXTURES, PR292)) as f:
+            return json.load(f)
+
+    def test_replay_reproduces_the_posted_status(self):
+        p = self.load()
+        v = compute(p, rv.ts("2026-11-07T16:13:24Z"))
+        self.assertEqual((v["state"], v["description"]), ("success", "round 3: no blocking findings; 1 queued for janitor"))
+        self.assertEqual(v["queue"], ["PRRT_kwDOSGaiis604Pu2"])  # the head's P1, handed to the janitor
+
+    def test_the_head_p1_was_let_through_only_by_the_round_cap(self):
+        p = self.load()
+        p["reviews"] = [r for r in p["reviews"] if not r["commit_sha"].startswith("075419b")]  # now round 2
+        v = compute(p, rv.ts("2026-11-07T16:13:24Z"))
+        self.assertEqual(v["state"], "failure"); self.assertIn("PRRT_kwDOSGaiis604Pu2", v["description"])
+
+    def test_without_the_head_review_the_replay_waits(self):  # the ticket's story, on the real shape
+        p = self.load()
+        p["reviews"] = [r for r in p["reviews"] if r["commit_sha"] != p["head_sha"]]
+        p["threads"] = [t for t in p["threads"] if t["comments"][0]["commit_sha"] != p["head_sha"]]
+        for summary in ({"status": "running", "commit": "3977006"}, {"status": "completed", "commit": "9375494"}):
+            p["summary"] = summary
+            with self.subTest(summary=summary):
+                v = compute(p, rv.ts("2026-11-07T16:13:24Z"))
+                self.assertEqual((v["state"], v["description"]), ("pending", "waiting for Codex review of 3977006"))
+
+    def test_the_fixture_agrees_with_fetchs_own_derivations(self):
+        p = self.load()
+        self.assertEqual(rv._newest_summary(p["comments"]), p["summary"])
+        self.assertEqual(rv.is_nudged(p["comments"], p["head_pushed_at"]), p["nudged"])
+
+
 if __name__ == "__main__":
     unittest.main()
