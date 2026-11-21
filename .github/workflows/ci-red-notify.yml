@@ -1,0 +1,93 @@
+# .github/workflows/ci-red-notify.yml — reusable (workflow_call), SSSF-72. Served from BJGLLC/.github in
+# place of the per-repo copies (bjg-intranet, bjg-file-mine, content-engine, sssf-trial byte-identical;
+# cd-dashboard differs in comments only). Behavior is unchanged: same trigger semantics (the caller's
+# `needs: <ci job>`, `if: failure()`), same input, same LINEAR_API_KEY secret passed explicitly, same
+# message. The `github` context and the token are the CALLER's, so checkout reads the caller's repo.
+# Caller stanza: scripts/fixtures/caller-ci-with-red-notify.yml (ci_shape.py allows it as a notifier).
+# The ticket regex is the copies' own, kept on purpose for a behavior-identical move; it misses
+# sssf|auto|data (deploy_notify.TEAM_KEYS has them) — widening it is a separate, visible change.
+name: CI red notify
+
+# TOOL-46 — red-gate visibility. Mirrors OPS-350 layer 4
+# (linear-deploy-notify.yml): posts a
+# Linear comment when CI goes red, so a failing run produces a signal Blake
+# sees within minutes without polling GitHub. Same ticket-extraction regex,
+# same LINEAR_API_KEY secret name. Only ever called `if: failure()` by the
+# caller's ci job — quiet on green by construction, not by a runtime check here.
+#
+# Posting requires the LINEAR_API_KEY secret (repo or org level). Until it
+# exists the job still runs and emits a notice annotation — the lane ships
+# dark and lights up the moment the secret lands.
+
+on:
+  workflow_call:
+    inputs:
+      failing_step:
+        description: 'Name of the step that failed (ci-check: tools | shape | actionlint | shellcheck | gitleaks | check | setup; older test.yml callers: lint | test | setup)'
+        required: false
+        type: string
+        default: 'unknown'
+    secrets:
+      LINEAR_API_KEY:
+        required: false
+
+permissions: {}
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 10
+      - name: Extract ticket ref from branch name or recent commits
+        id: ticket
+        env:
+          # pull_request runs: GITHUB_REF_NAME is "<pr>/merge", not the source
+          # branch — head_ref carries the real branch name on those events.
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: |
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          ticket=$(printf '%s\n' "$BRANCH" | grep -oiE '(ops|rnd|bjg|eng|des|sec|mar|tool|cd)-[0-9]+' | head -1 | tr '[:lower:]' '[:upper:]')
+          if [ -z "$ticket" ]; then
+            commits=$(git log -5 --format='%s %b' HEAD)
+            ticket=$(printf '%s\n' "$commits" | grep -oiE '\b(ops|rnd|bjg|eng|des|sec|mar|tool|cd)-[0-9]+\b' | head -1 | tr '[:lower:]' '[:upper:]')
+          fi
+          if [ -z "$ticket" ]; then
+            echo "::warning title=TOOL-46 — untied red run::No Linear ticket ref in the branch name or recent commits. Signal not posted to Linear."
+            exit 0
+          fi
+          echo "ticket=$ticket" >> "$GITHUB_OUTPUT"
+          echo "Found ticket: $ticket"
+      - name: Post red-run signal to the ticket
+        if: steps.ticket.outputs.ticket != ''
+        env:
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+          TICKET: ${{ steps.ticket.outputs.ticket }}
+          BRANCH: ${{ steps.ticket.outputs.branch }}
+          FAILING_STEP: ${{ inputs.failing_step }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$LINEAR_API_KEY" ]; then
+            echo "::notice title=TOOL-46 — posting disabled::Ticket $TICKET found, but the LINEAR_API_KEY secret is not set. Add it (repo or org level) to enable red-gate signal posting."
+            exit 0
+          fi
+          issue_id=$(jq -n --arg t "$TICKET" '{query: "query($t: String!) { issue(id: $t) { id } }", variables: {t: $t}}' \
+            | curl -sf https://api.linear.app/graphql \
+                -H "Authorization: $LINEAR_API_KEY" -H 'Content-Type: application/json' -d @- \
+            | jq -r '.data.issue.id // empty')
+          if [ -z "$issue_id" ]; then
+            echo "::warning title=TOOL-46::Could not resolve $TICKET in Linear — signal not posted."
+            exit 0
+          fi
+          body="🔴 **CI red** — \`${GITHUB_REPOSITORY}\` @ \`${BRANCH}\` failed at **${FAILING_STEP}** ([workflow run](${RUN_URL}))"
+          jq -n --arg id "$issue_id" --arg b "$body" \
+            '{query: "mutation($id: String!, $b: String!) { commentCreate(input: {issueId: $id, body: $b}) { success } }", variables: {id: $id, b: $b}}' \
+            | curl -sf https://api.linear.app/graphql \
+                -H "Authorization: $LINEAR_API_KEY" -H 'Content-Type: application/json' -d @- \
+            | jq -e '.data.commentCreate.success' >/dev/null \
+            && echo "Posted red-run signal to $TICKET" \
+            || echo "::warning title=TOOL-46::Linear comment failed for $TICKET."

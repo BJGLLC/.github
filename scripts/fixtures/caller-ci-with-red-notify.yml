@@ -1,0 +1,53 @@
+# scripts/fixtures/caller-ci-with-red-notify.yml — bjg-intranet's ci.yml (origin/main 2026-11-21) with the one
+# line SSSF-72 migrates: the notifier calls the org's reusable ci-red-notify instead of a per-repo copy.
+# test_ci_shape pins that this exact caller passes ci_shape.py.
+# .github/workflows/ci.yml — Review v4 single-job `ci` (spec §5, P3-B; decision 01M3N14TGN Q2). Was
+# test.yml ("CI": test + fan-in). One job, `ci`, the context the ruleset requires: checkout, then
+# BJGLLC/.github's ci-check action (hygiene + `make check` = lint + typecheck + vitest). No needs/if,
+# so it can never be skipped; red if any step failed. collector/ci-gate.test.ts pins it locally.
+name: ci
+on:
+  push:
+    branches: [main]
+    # Actions cost (SSSF-25): routine report commits (scripts/routines/* writing data/reports/)
+    # are ~60% of main's pushes and change nothing lint or tests read. This is the intranet
+    # machine lane from claude-dotfiles claude/policy/machine-paths.txt (`bjg-intranet
+    # data/reports/`); collector/ci-gate.test.ts pins it. A push is skipped only when EVERY
+    # path it changes matches, so a report riding with code still runs ci.
+    #
+    # push ONLY, never pull_request: `ci` is a REQUIRED check on PRs, and a path-skipped
+    # workflow never reports, so the PR would sit pending forever.
+    paths-ignore:
+      - data/reports/**
+  pull_request: {}
+  workflow_dispatch: {}
+permissions: { contents: read }
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+jobs:
+  ci:
+    # OPS-973: org variable BJG_RUNS_ON routes ci to the eos runners; unset = ubuntu-latest.
+    runs-on: ${{ fromJSON(vars.BJG_RUNS_ON || '"ubuntu-latest"') }}
+    timeout-minutes: 20
+    outputs:
+      failing_step: ${{ steps.check.outputs.failing_step }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0, persist-credentials: false }   # gitleaks scans this change's commits
+      - id: check
+        uses: BJGLLC/.github/actions/ci-check@main
+        with:
+          node-version: "20"
+          node-cache: npm
+          # TOOL-532: facts-mcp has its own lockfile; make check builds + tests it.
+          install: npm ci && npm ci --prefix facts-mcp
+  # TOOL-46 red-gate visibility. Runs only when ci failed, so it never changes the workflow's verdict.
+  notify-linear:
+    needs: ci
+    if: failure()
+    uses: BJGLLC/.github/.github/workflows/ci-red-notify.yml@main
+    with:
+      failing_step: ${{ needs.ci.outputs.failing_step }}
+    secrets:
+      LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}

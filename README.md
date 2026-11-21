@@ -24,9 +24,15 @@ Any later gate event (a review, a thread reply, Codex's comment) recomputes the 
 
 ## Deploy library
 
-This repo also hosts the shared deploy library (SSSF-31, Review v4 phase 4): `scripts/deploy_*.py`, `.github/workflows/linear-deploy-notify.yml`, `cf-deploy.yml` and `cf-ship.yml`. Callers pin `BJGLLC/.github@main`; team keys live in `scripts/deploy_notify.py` only.
+This repo also hosts the shared deploy library (SSSF-31, Review v4 phase 4): `scripts/deploy_*.py`, `.github/workflows/linear-deploy-notify.yml`, `cf-deploy.yml` and `cf-ship.yml`. Callers pin `BJGLLC/.github@main`; the deploy team keys live in `scripts/deploy_notify.py` only (`pr_ticket_lint.py` keeps the full Linear key list, a tested superset).
 
 `cf-deploy.yml` caller options beyond the build params:
 - `build_paths` (range filter): a production deploy whose live..sha range touches none of these globs is skipped and live stays the last shipped SHA. It never skips while the auto-rollback is unarmed (no trusted ledger record yet), so a surface's first v4 deploy (a workflow-only commit, after its preview drill) still ships and writes the first trusted record.
 - `client: true` (client production): no deploy window. The guard refuses until a preview drill is green on the `drill` ledger, the `MOSHI_TOKEN` secret is set, and (after the first deploy) the auto-rollback is armed. The live site is probed before and after. Every client production run that ships, rolls back or is refused pings Blake on Moshi; a skip stays silent, since nothing ships (a build-free range, a SHA already live or older than live, or a freeze, whose rollback already pinged).
 - A rollback's target is the newest ledger record the pipeline can rebuild (written by `github-actions[bot]`, with build params); `deploy_guard.py live|previous --trusted` show the same view.
+
+## Shared notifiers and the ticket lint (SSSF-72)
+
+- `.github/workflows/ci-red-notify.yml`: the red-ci Linear comment (TOOL-46), served here in place of the per-repo copies, behavior unchanged. A gated repo's `ci.yml` calls it as its failure notifier (`needs: ci`, `if: failure()`, `uses: BJGLLC/.github/.github/workflows/ci-red-notify.yml@main`, `LINEAR_API_KEY` passed explicitly); `ci_shape.py` accepts that and the legacy local copy, nothing else. Caller: `scripts/fixtures/caller-ci-with-red-notify.yml`.
+- `.github/workflows/pr-ticket-lint.yml` + `scripts/pr_ticket_lint.py`: does a PR cite a Linear ID in its title, body or branch? **Advisory**: it warns and stays green, and it is not a required check. Exempt: label `hotfix`, dependabot/renovate. Caller: `scripts/fixtures/caller-pr-ticket-lint.yml`. Making it blocking is Blake's call; the workflow header names the two changes it takes.
+- Check one PR by hand: `gh pr view <n> -R BJGLLC/<repo> --json title,body,headRefName,labels,author | python3 scripts/pr_ticket_lint.py`

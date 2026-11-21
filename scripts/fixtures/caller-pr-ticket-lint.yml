@@ -1,0 +1,11 @@
+# .github/workflows/pr-ticket-lint.yml — thin caller (SSSF-72), ADVISORY. Logic lives in BJGLLC/.github
+# (.github/workflows/pr-ticket-lint.yml + scripts/pr_ticket_lint.py). It warns when a PR cites no Linear
+# ticket and never fails; its check (`ticket-lint / lint`) is not a required context. Making it blocking
+# is Blake's call, not a caller's: see the reusable workflow's header.
+name: pr-ticket-lint
+on:
+  pull_request: { types: [opened, edited, synchronize, reopened, labeled, unlabeled, ready_for_review] }
+permissions: { contents: read }
+jobs:
+  ticket-lint:
+    uses: BJGLLC/.github/.github/workflows/pr-ticket-lint.yml@main
