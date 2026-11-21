@@ -32,9 +32,9 @@ runs:
     - name: shape
       id: shape
       shell: bash
+      # ci-python.sh: the system python if it has PyYAML, else a fresh $RUNNER_TEMP venv (SSSF-59).
       run: |
-        py=/usr/bin/python3
-        "$py" -I -c 'import yaml' 2>/dev/null || { py=python3; "$py" -I -c 'import yaml' 2>/dev/null || "$py" -I -m pip install --quiet pyyaml; }
+        py="$(bash "$BJG_CI/scripts/ci-python.sh")"
         "$py" -I "$BJG_CI/scripts/ci_shape.py" --repo "$GITHUB_REPOSITORY" .github/workflows
     - name: actionlint
       id: actionlint
