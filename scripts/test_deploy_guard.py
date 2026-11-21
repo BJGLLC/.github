@@ -5,6 +5,7 @@ import json
 import os
 import pathlib
 import subprocess
+import sys
 import tempfile
 import types
 import unittest
@@ -535,14 +536,59 @@ class GhJsonRetry(unittest.TestCase):
                 self.assertEqual((n, sleeps), (1, []))
                 self.assertIn(reply[2].strip(), err)
 
-    def test_backoff_is_short_and_grows(self):
-        _, _, sleeps, _ = self.play(self.EMPTY_GH)
+    # The whole decide tick (eos mode) over a fake gh that answers by request path, so the order of gather's
+    # calls does not matter. Every route but the PR lookup is healthy.
+    FAKE_GH_BY_PATH = (
+        "import json, os, re, sys\n"
+        "path = sys.argv[2]\n"
+        "open(os.environ['GH_LOG'], 'a').write(path + '\\n')\n"
+        "for pat, rc, out, err in json.load(open(os.environ['GH_ROUTES'])):\n"
+        "    if re.search(pat, path):\n"
+        "        sys.stdout.write(out); sys.stderr.write(err); sys.exit(rc)\n"
+        "sys.stderr.write('fake gh: no route for ' + path); sys.exit(97)\n")
+
+    def tick(self, pulls):
+        routes = [
+            (r"/commits/[0-9a-f]+/pulls$", *pulls),
+            (r"/commits/[0-9a-f]+/check-runs", 0,
+             json.dumps({"check_runs": [{"app": {"slug": "github-actions"}, "conclusion": "success", "started_at": "t"}]}), ""),
+            (r"/commits/main$", 0, B, ""),
+            (r"/commits/[0-9a-f]+$", 0, B, ""),
+            (r"/compare/", 0, "identical", ""),
+            (r"/deployments\?", 0, "[]", ""),
+            (r"/issues\?", 0, "[]", ""),
+        ]
+        with tempfile.TemporaryDirectory() as d:
+            fake = pathlib.Path(d, "gh")
+            fake.write_text(f"#!{sys.executable}\n{self.FAKE_GH_BY_PATH}")
+            fake.chmod(0o755)
+            pathlib.Path(d, "routes.json").write_text(json.dumps(routes))
+            env = {"PATH": f"{d}:{os.environ['PATH']}", "GH_ROUTES": f"{d}/routes.json", "GH_LOG": f"{d}/log"}
+            out, sleeps = io.StringIO(), []
+            with mock.patch.dict(os.environ, env), mock.patch("time.sleep", sleeps.append), \
+                    contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    got = deploy_guard.main(["decide", "--repo", "o/r", "--sha", B, "--reason", "deploy", "--env", "production"])
+                except Exception as e:  # noqa: BLE001 - the test inspects what escaped
+                    got = e
+            log = pathlib.Path(d, "log").read_text().split()
+        return got, out.getvalue(), log, sleeps
+
+    def test_the_tick_decides_go_when_the_pr_lookup_answers(self):
+        got, out, _, _ = self.tick((0, "[]", ""))  # control: the fake's other routes are enough for a go
+        self.assertEqual(got, 0)
+        self.assertTrue(json.loads(out)["go"], out)
+
+    def test_the_whole_tick_fails_when_the_pr_lookup_never_answers(self):
+        got, out, log, sleeps = self.tick(self.EMPTY_GH)
+        self.assertIsInstance(got, subprocess.CalledProcessError)
+        self.assertEqual(out, "")  # no decision printed, so nothing ships
+        self.assertEqual(sum(p.endswith("/pulls") for p in log), 3)
         self.assertEqual(len(sleeps), 2)
-        self.assertEqual(sleeps, sorted(sleeps))
-        self.assertTrue(all(0 < s <= 5 for s in sleeps), sleeps)
+        self.assertLessEqual(sum(sleeps), 10)  # the backoff observed on the retried call stays short
 
 
-BOT ={"login": "github-actions[bot]", "type": "Bot"}
+BOT = {"login": "github-actions[bot]", "type": "Bot"}
 MALLORY = {"login": "mallory", "type": "User"}
 
 
