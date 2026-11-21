@@ -1,0 +1,202 @@
+{
+ "_source": "BJGLLC/cd-marketing #292 as the review-verdict run that posted 2026-11-07T16:13:24Z saw it (reconstructed read-only from the API; bodies trimmed). It merged at 16:13:40Z. SSSF-81.",
+ "head_sha": "3977006c22f598f56408e5cdd85356f80ef01eff",
+ "head_pushed_at": "2026-11-07T16:11:24Z",
+ "draft": false,
+ "state": "OPEN",
+ "author_type": "Bot",
+ "labels": [],
+ "reviews": [
+  {
+   "id": "review-5813175898",
+   "author": "chatgpt-codex-connector",
+   "submitted_at": "2026-11-07T15:15:04Z",
+   "commit_sha": "075419b8f5388f10da854f2440c52940bef8225a",
+   "body": "<!-- codex-review-receipt:v1 -->\n\n\n### 💡 Codex Review\n\nHere are some automated review suggestions for this pull request.\n\n**Reviewed commit:** `075419b8f5`\n    \n\n<details> <summary>ℹ️ About Codex in G\n...",
+   "editor": null,
+   "last_edited_at": null
+  },
+  {
+   "id": "review-5813203751",
+   "author": "bjg-agent",
+   "submitted_at": "2026-11-07T15:17:55Z",
+   "commit_sha": "075419b8f5388f10da854f2440c52940bef8225a",
+   "body": "",
+   "editor": null,
+   "last_edited_at": null
+  },
+  {
+   "id": "review-5813203926",
+   "author": "bjg-agent",
+   "submitted_at": "2026-11-07T15:17:56Z",
+   "commit_sha": "9375494046c073b1d3a5d9e004ecac7d43ce366b",
+   "body": "",
+   "editor": null,
+   "last_edited_at": null
+  },
+  {
+   "id": "review-5813225939",
+   "author": "chatgpt-codex-connector",
+   "submitted_at": "2026-11-07T15:20:30Z",
+   "commit_sha": "9375494046c073b1d3a5d9e004ecac7d43ce366b",
+   "body": "<!-- codex-review-receipt:v1 -->\n\n\n### 💡 Codex Review\n\nHere are some automated review suggestions for this pull request.\n\n**Reviewed commit:** `9375494046`\n    \n\n<details> <summary>ℹ️ About Codex in G\n...",
+   "editor": null,
+   "last_edited_at": null
+  },
+  {
+   "id": "review-5813504722",
+   "author": "bjg-agent",
+   "submitted_at": "2026-11-07T16:11:21Z",
+   "commit_sha": "9375494046c073b1d3a5d9e004ecac7d43ce366b",
+   "body": "",
+   "editor": null,
+   "last_edited_at": null
+  },
+  {
+   "id": "review-5813515021",
+   "author": "chatgpt-codex-connector",
+   "submitted_at": "2026-11-07T16:13:13Z",
+   "commit_sha": "3977006c22f598f56408e5cdd85356f80ef01eff",
+   "body": "<!-- codex-review-receipt:v1 -->\n\n\n### 💡 Codex Review\n\nHere are some automated review suggestions for this pull request.\n\n**Reviewed commit:** `3977006c22`\n    \n\n<details> <summary>ℹ️ About Codex in G\n...",
+   "editor": null,
+   "last_edited_at": null
+  }
+ ],
+ "comments": [
+  {
+   "author": "linear-code[bot]",
+   "body": "<!-- linear-linkback --> (CD-616 link-back, trimmed)",
+   "created_at": "2026-11-07T15:12:49Z"
+  },
+  {
+   "author": "github-actions[bot]",
+   "body": "@codex review\n\n<!-- review-verdict:nudge 075419b8f5388f10da854f2440c52940bef8225a -->",
+   "created_at": "2026-11-07T15:12:52Z"
+  },
+  {
+   "author": "chatgpt-codex-connector[bot]",
+   "body": "<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 {\"code_review\":{\"commit_sha\":\"3977006c22f598f56408e5cdd85356f80ef01eff\",\"has_any_findings\":true,\"has_unresolved_findings\":true,\"status\":\"completed\"},\"security_review\":{\"commit_sha\":null,\"has_any_findings\":null,\"has_unresolved_findings\":null,\"status\":null}} -->\n\n<details>\n<summary><strong>Codex Review Summary</strong>: ✅ Completed</summary>\n\nThis comment shows the latest Codex review activity on this pull request.\n\n| Review | Status | Commit | Review trigger |\n| --- | --- | --- | --- |\n| 📝 **Code Review** | ✅ **Completed** <relative-time datetime=\"2026-11-07T16:13:15.788596Z\">2026-11-07T16:13:15.788596Z</relative-time> | `3977006` | Manual request |\n\n</details>",
+   "created_at": "2026-11-07T15:12:54Z"
+  },
+  {
+   "author": "bjg-agent[bot]",
+   "body": "@codex review",
+   "created_at": "2026-11-07T15:13:00Z"
+  },
+  {
+   "author": "bjg-agent[bot]",
+   "body": "@codex review",
+   "created_at": "2026-11-07T15:17:59Z"
+  },
+  {
+   "author": "github-actions[bot]",
+   "body": "@codex review\n\n<!-- review-verdict:nudge 9375494046c073b1d3a5d9e004ecac7d43ce366b -->",
+   "created_at": "2026-11-07T15:18:04Z"
+  },
+  {
+   "author": "bjg-agent[bot]",
+   "body": "@codex review",
+   "created_at": "2026-11-07T16:11:23Z"
+  },
+  {
+   "author": "github-actions[bot]",
+   "body": "@codex review\n\n<!-- review-verdict:nudge 3977006c22f598f56408e5cdd85356f80ef01eff -->",
+   "created_at": "2026-11-07T16:11:30Z"
+  }
+ ],
+ "threads": [
+  {
+   "id": "PRRT_kwDOSGaiis603qoA",
+   "is_resolved": true,
+   "comments": [
+    {
+     "author": "chatgpt-codex-connector",
+     "author_type": "Bot",
+     "editor": null,
+     "last_edited_at": null,
+     "body": "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Keep the split check scoped to one opportunity**\n\nWhen a contact has ove\n...",
+     "created_at": "2026-11-07T15:15:04Z",
+     "commit_sha": "075419b8f5388f10da854f2440c52940bef8225a"
+    },
+    {
+     "author": "bjg-agent",
+     "author_type": "Bot",
+     "editor": null,
+     "last_edited_at": null,
+     "body": "Fixed in 9375494: see test_contact_with_another_open_job_is_counted_not_flagged / test_read_budget_goes_newest_first_inside_the_window (both fail on the prior c\n...",
+     "created_at": "2026-11-07T15:17:55Z",
+     "commit_sha": "075419b8f5388f10da854f2440c52940bef8225a"
+    }
+   ]
+  },
+  {
+   "id": "PRRT_kwDOSGaiis603qoN",
+   "is_resolved": true,
+   "comments": [
+    {
+     "author": "chatgpt-codex-connector",
+     "author_type": "Bot",
+     "editor": null,
+     "last_edited_at": null,
+     "body": "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Rotate the split-check read budget**\n\nOnce more than 50 post-cutover lif\n...",
+     "created_at": "2026-11-07T15:15:04Z",
+     "commit_sha": "075419b8f5388f10da854f2440c52940bef8225a"
+    },
+    {
+     "author": "bjg-agent",
+     "author_type": "Bot",
+     "editor": null,
+     "last_edited_at": null,
+     "body": "Fixed in 9375494: see test_contact_with_another_open_job_is_counted_not_flagged / test_read_budget_goes_newest_first_inside_the_window (both fail on the prior c\n...",
+     "created_at": "2026-11-07T15:17:56Z",
+     "commit_sha": "075419b8f5388f10da854f2440c52940bef8225a"
+    }
+   ]
+  },
+  {
+   "id": "PRRT_kwDOSGaiis603vWY",
+   "is_resolved": true,
+   "comments": [
+    {
+     "author": "chatgpt-codex-connector",
+     "author_type": "Bot",
+     "editor": null,
+     "last_edited_at": null,
+     "body": "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Keep split monitoring beyond the first 14 days**\n\nFor any Attic opportun\n...",
+     "created_at": "2026-11-07T15:20:30Z",
+     "commit_sha": "9375494046c073b1d3a5d9e004ecac7d43ce366b"
+    },
+    {
+     "author": "bjg-agent",
+     "author_type": "Bot",
+     "editor": null,
+     "last_edited_at": null,
+     "body": "Fixed in 3977006: open jobs stay in scope while open (only closed jobs age out), and a persisted last-checked ledger rotates the read budget. See test_read_budg\n...",
+     "created_at": "2026-11-07T16:11:21Z",
+     "commit_sha": "9375494046c073b1d3a5d9e004ecac7d43ce366b"
+    }
+   ]
+  },
+  {
+   "id": "PRRT_kwDOSGaiis604Pu2",
+   "is_resolved": false,
+   "comments": [
+    {
+     "author": "chatgpt-codex-connector",
+     "author_type": "Bot",
+     "editor": null,
+     "last_edited_at": null,
+     "body": "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Preserve dedup keys across rotated scans**\n\nWhen eligible jobs exceed `t\n...",
+     "created_at": "2026-11-07T16:13:13Z",
+     "commit_sha": "3977006c22f598f56408e5cdd85356f80ef01eff"
+    }
+   ]
+  }
+ ],
+ "nudged": true,
+ "asked_at": "2026-11-07T16:11:24Z",
+ "summary": {
+  "status": "completed",
+  "commit": "3977006"
+ }
+}
