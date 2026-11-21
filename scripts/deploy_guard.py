@@ -43,6 +43,7 @@ import fnmatch
 import json
 import subprocess
 import sys
+import time
 
 FREEZE_LABEL, HOTFIX_LABEL, ACTIONS_APP = "deploy-freeze", "hotfix", "github-actions"
 # Every cf-ship input that can differ per revision (sha and cf_branch are per-run, not build params).
@@ -75,6 +76,8 @@ FREEZE_BODY_MANUAL = (
     "closes this issue. Review v4 spec §8.")
 FREEZE_STATES = ("", "auto-rolled-back", "rollback-failed", "smoke-failed-no-target", "manual")
 COMPARE_FILE_CAP = 300  # the compare API lists at most 300 files; a full page may be truncated
+RETRY_DELAYS = (1, 3)  # seconds between gh_json's 3 tries (OPS-965)
+TRANSIENT_RE = re.compile(r"unexpected end of JSON input|HTTP 5\d\d")
 
 
 def decide(c):
@@ -246,7 +249,22 @@ def gh(*args, stdin=None):
 
 
 def gh_json(path):
-    return json.loads(gh("api", path))
+    """GET only, so a retry is safe. GitHub sometimes answers with an empty body (gh: "unexpected end of JSON
+    input") or a 5xx that is fine moments later (OPS-965); those get RETRY_DELAYS more tries. Anything else,
+    a 404 or an auth error included, fails at once, and so does the last try."""
+    for delay in (*RETRY_DELAYS, None):
+        try:
+            return json.loads(gh("api", path))
+        except (subprocess.CalledProcessError, ValueError) as e:
+            stderr = getattr(e, "stderr", "") or ""
+            if isinstance(e, subprocess.CalledProcessError) and not TRANSIENT_RE.search(stderr):
+                raise
+            if delay is None:
+                print(f"deploy_guard: gh api {path} still failing; giving up", file=sys.stderr)
+                raise
+            print(f"deploy_guard: gh api {path} failed transiently ({type(e).__name__}); retrying in {delay}s",
+                  file=sys.stderr)
+            time.sleep(delay)
 
 
 def ledger(repo, env, n=20, sha=""):
