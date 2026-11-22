@@ -1,0 +1,306 @@
+{
+  "_doc": "SSSF-48 one-way-door patterns, read by scripts/one_way_door.py. A PR is one-way if any changed path (both sides of a rename, deleted files too) matches a path pattern, or any ADDED diff line in a non-exempt file matches a content pattern. The PR body cannot downgrade this: it is agent-written. Globs: ** = any number of directories, * = within one segment. repos (optional) limits a pattern to those repos. Every entry names the real repo and file it was grounded in; fixtures are made up. Design: docs/specs/2026-11-21-one-way-door-lane.md.",
+  "version": 1,
+  "content_exempt_paths": [
+    "**/test/**",
+    "**/tests/**",
+    "**/__tests__/**",
+    "**/fixtures/**",
+    "**/*.test.*",
+    "**/*.spec.*",
+    "**/test_*.py",
+    "**/*_test.py",
+    "**/*.md",
+    "**/docs/**"
+  ],
+  "path_patterns": [
+    {
+      "id": "sql-migration",
+      "kind": "migration",
+      "blast": "repo",
+      "globs": [
+        "**/migrations/**",
+        "**/*.sql",
+        "**/run-migrations.*"
+      ],
+      "exclude": [
+        "**/tests/**",
+        "**/test/**",
+        "**/fixtures/**"
+      ],
+      "why": "A migration changes a live database's shape; rolling the code back does not roll the data back.",
+      "source": {
+        "repo": "BJGLLC/cd-dashboard",
+        "example": "supabase/migrations/001_base_tables.sql"
+      }
+    },
+    {
+      "id": "one-off-migration-script",
+      "kind": "migration",
+      "blast": "repo",
+      "globs": [
+        "migration/**",
+        "scripts/migrate-*",
+        "scripts/**/migrate.*"
+      ],
+      "exclude": [
+        "**/*.test.*"
+      ],
+      "repos": [
+        "BJGLLC/bjg-intranet"
+      ],
+      "why": "One-off backfills and type migrations rewrite the facts store in place.",
+      "source": {
+        "repo": "BJGLLC/bjg-intranet",
+        "example": "scripts/migrate-question-type.ts"
+      }
+    },
+    {
+      "id": "drop-script",
+      "kind": "delete",
+      "blast": "repo",
+      "globs": [
+        "**/drop-*.ts",
+        "**/drop-*.mjs",
+        "**/drop-*.py"
+      ],
+      "exclude": [
+        "**/*.test.*",
+        "**/tests/**",
+        "**/test/**"
+      ],
+      "why": "Scripts named drop-* delete tables or corpora; there is no undo short of a restore.",
+      "source": {
+        "repo": "BJGLLC/bjg-intranet",
+        "example": "scripts/drop-legacy-trio-tables.ts"
+      }
+    },
+    {
+      "id": "n8n-live-workflows",
+      "kind": "send",
+      "blast": "customer",
+      "globs": [
+        "n8n/workflows/**"
+      ],
+      "repos": [
+        "BJGLLC/cd-lead-agent-deploy"
+      ],
+      "why": "The deployed n8n workflows post to GHL's send endpoint: a change here changes what real customers are texted and emailed.",
+      "source": {
+        "repo": "BJGLLC/cd-lead-agent-deploy",
+        "example": "n8n/workflows/manifest.json"
+      }
+    },
+    {
+      "id": "bot-prompts-and-templates",
+      "kind": "send",
+      "blast": "customer",
+      "globs": [
+        "config/assets/prompts/**",
+        "config/assets/templates/**"
+      ],
+      "repos": [
+        "BJGLLC/cd-lead-agent-deploy"
+      ],
+      "why": "The SMS agent's system prompts and the reactivation email templates are the words customers receive.",
+      "source": {
+        "repo": "BJGLLC/cd-lead-agent-deploy",
+        "example": "config/assets/prompts/system-prompt.md"
+      }
+    },
+    {
+      "id": "runtime-job-flags",
+      "kind": "send",
+      "blast": "customer",
+      "globs": [
+        "config/eos-runtime-flags.json"
+      ],
+      "repos": [
+        "BJGLLC/cd-lead-agent-deploy"
+      ],
+      "why": "Job environment and timers decide which send jobs run on eos and when.",
+      "source": {
+        "repo": "BJGLLC/cd-lead-agent-deploy",
+        "example": "config/eos-runtime-flags.json"
+      }
+    },
+    {
+      "id": "marketing-flow-workflows",
+      "kind": "send",
+      "blast": "customer",
+      "globs": [
+        "**/*.workflow.js",
+        "**/*.workflow.json",
+        "**/_assets/templates/dist/**"
+      ],
+      "repos": [
+        "BJGLLC/cd-marketing"
+      ],
+      "why": "Email-flow and SMS-agent workflow definitions and the built email templates go to real leads.",
+      "source": {
+        "repo": "BJGLLC/cd-marketing",
+        "example": "workstreams/Email Flows/flow-1-new-lead-nurture.workflow.js"
+      }
+    },
+    {
+      "id": "social-publish",
+      "kind": "send",
+      "blast": "customer",
+      "globs": [
+        "scripts/install-cron.sh",
+        "scripts/run-publish.sh"
+      ],
+      "repos": [
+        "BJGLLC/content-engine"
+      ],
+      "why": "The cron install and the publish runner decide when the publisher posts to public social accounts. Publisher code changes are caught by social-post-call only when they add a post call (dry run: the whole engine/publish tree forced 23% of commits).",
+      "source": {
+        "repo": "BJGLLC/content-engine",
+        "example": "scripts/run-publish.sh"
+      }
+    },
+    {
+      "id": "ad-platform-writers",
+      "kind": "money",
+      "blast": "money",
+      "globs": [
+        "claude-ops/scripts/meta_build_*.py",
+        "claude-ops/scripts/meta_ads_client.py",
+        "claude-ops/scripts/meta_stage_*.py"
+      ],
+      "repos": [
+        "BJGLLC/cd-marketing"
+      ],
+      "why": "These scripts create and edit Meta campaigns and budgets: real ad spend.",
+      "source": {
+        "repo": "BJGLLC/cd-marketing",
+        "example": "claude-ops/scripts/meta_ads_client.py"
+      }
+    },
+    {
+      "id": "secret-bearing-files",
+      "kind": "secret",
+      "blast": "repo",
+      "globs": [
+        "**/.env",
+        "**/.env.*",
+        "**/.dev.vars",
+        "**/.dev.vars.*",
+        "**/gitleaks.toml",
+        "**/.gitleaks.toml"
+      ],
+      "exclude": [
+        "**/*.example",
+        "**/tests/**",
+        "**/test/**",
+        "**/docs/**"
+      ],
+      "why": "Files that hold secret values, or the leak scanner's allowlist: a secret pushed to GitHub is out for good and must be rotated. Files that only name or load a secret (creds.py, *.env.ref, credential inventories) were dropped after the dry run: a revert undoes them.",
+      "source": {
+        "repo": "BJGLLC/.github",
+        "example": "scripts/gitleaks.toml"
+      }
+    }
+  ],
+  "content_patterns": [
+    {
+      "id": "ghl-send-endpoint",
+      "kind": "send",
+      "blast": "customer",
+      "regex": "/conversations/messages[\"'`]",
+      "why": "POST /conversations/messages is GHL's send-SMS/email call. Reads use /conversations/messages/{id} and do not match.",
+      "source": {
+        "repo": "BJGLLC/lead-agent",
+        "example": "runtime/agent_runner.py"
+      },
+      "fixture": "        GHL_BASE + \"/conversations/messages\","
+    },
+    {
+      "id": "ghl-message-type",
+      "kind": "send",
+      "blast": "customer",
+      "regex": "[\"']type[\"']\\s*:\\s*[\"'](SMS|Email|WhatsApp)[\"']",
+      "why": "A GHL message payload names its channel; a new one is a new customer send.",
+      "source": {
+        "repo": "BJGLLC/cd-marketing",
+        "example": "claude-ops/scripts/ghl_email_campaign.py"
+      },
+      "fixture": "                        \"type\": \"Email\","
+    },
+    {
+      "id": "social-post-call",
+      "kind": "send",
+      "blast": "customer",
+      "regex": "/(media_publish|photos|feed)[`'\"?]|\\$\\{REST\\}/posts[`'\"]|/rest/posts[`'\"]",
+      "repos": [
+        "BJGLLC/content-engine"
+      ],
+      "why": "The Graph API (photos, feed, media_publish) and LinkedIn REST posts calls that put a post on a public page.",
+      "source": {
+        "repo": "BJGLLC/content-engine",
+        "example": "engine/publish/social/meta.js"
+      },
+      "fixture": "  const res = await fetchFn(`${GRAPH}/${version}/${pageId}/photos`, {"
+    },
+    {
+      "id": "jobber-mutation",
+      "kind": "crm-write",
+      "blast": "customer",
+      "regex": "\\bmutation\\s+[A-Z]\\w*\\s*[({]",
+      "why": "A named GraphQL mutation writes to Jobber, the customer system of record (book, reschedule, create client, archive).",
+      "source": {
+        "repo": "BJGLLC/lead-agent",
+        "example": "runtime/agent_runner.py"
+      },
+      "fixture": "mutation Book($input: RequestCreateInput!) {"
+    },
+    {
+      "id": "ad-budget-field",
+      "kind": "money",
+      "blast": "money",
+      "regex": "[\"']?\\b(daily_budget|lifetime_budget|bid_amount)\\b[\"']?\\s*[:=]",
+      "why": "Setting a budget or bid on an ad object spends money. Reads (fields=...daily_budget) do not match.",
+      "source": {
+        "repo": "BJGLLC/cd-marketing",
+        "example": "claude-ops/scripts/meta_ads_client.py"
+      },
+      "fixture": "            \"daily_budget\": 2500,"
+    },
+    {
+      "id": "schema-change-sql",
+      "kind": "migration",
+      "blast": "repo",
+      "regex": "\\bALTER\\s+TABLE\\b",
+      "why": "An inline schema migration, wherever it lives.",
+      "source": {
+        "repo": "BJGLLC/lead-agent",
+        "example": "runtime/cd569_receipts.py"
+      },
+      "fixture": "        con.execute(\"ALTER TABLE example_receipts ADD COLUMN example_id TEXT\")"
+    },
+    {
+      "id": "destructive-sql",
+      "kind": "delete",
+      "blast": "repo",
+      "regex": "\\b(DROP\\s+(TABLE|COLUMN|SCHEMA|DATABASE|VIEW)|TRUNCATE(\\s+TABLE)?\\s+[\\w\"`]+)",
+      "why": "Dropping or truncating loses data on the live store.",
+      "source": {
+        "repo": "BJGLLC/bjg-intranet",
+        "example": "collector/drop-legacy-trio.ts"
+      },
+      "fixture": "  db.exec(\"DROP TABLE example_legacy\");"
+    },
+    {
+      "id": "unscoped-delete-sql",
+      "kind": "delete",
+      "blast": "repo",
+      "regex": "\\bDELETE\\s+FROM\\s+[\\w.\"`]+\\s*(;|[\"'`)]|$)",
+      "why": "DELETE FROM with no WHERE on the same line empties a table. Keyed deletes of local bookkeeping rows (common in lead-agent) do not match.",
+      "source": {
+        "repo": "BJGLLC/lead-agent",
+        "example": "runtime/quote_recovery_review.py"
+      },
+      "fixture": "    db.execute(\"DELETE FROM example_decisions\")"
+    }
+  ]
+}

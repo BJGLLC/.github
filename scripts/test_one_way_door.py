@@ -143,7 +143,7 @@ class EmptyAndScope(unittest.TestCase):
 
     def test_repo_scoped_pattern_only_fires_in_its_repo(self):
         p = {"content_exempt_paths": [], "content_patterns": [], "path_patterns": [
-            {"id": "only-here", "blast": "customer", "globs": ["n8n/workflows/**"], "repos": ["BJGLLC/deploy-a"],
+            {"id": "only-here", "kind": "send", "blast": "customer", "globs": ["n8n/workflows/**"], "repos": ["BJGLLC/deploy-a"],
              "why": "w", "source": {"repo": "BJGLLC/deploy-a", "example": "n8n/workflows/x.json"}}]}
         path = "n8n/workflows/abc.json"
         self.assertEqual(classify([path], "", "BJGLLC/deploy-a", p)["door"], "one-way")
