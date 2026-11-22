@@ -36,7 +36,7 @@ class SelfReportIgnored(unittest.TestCase):
         path = "supabase/migrations/024_new_table.sql"
         diff = file_diff(path, added=["CREATE TABLE example_rows (id int primary key);"], new_file=True)
         body = "Adds a table.\n\ndoor: two-way\nblast: local\n"
-        d = decide(body, [path], diff, "BJGLLC/cd-dashboard", PATTERNS)
+        d = decide(body, [path], diff, "BJGLLC/example", PATTERNS)
         self.assertEqual(d["door"], "one-way")
         self.assertTrue(d["forced"])
         self.assertEqual(d["declared"]["door"], "two-way")
@@ -45,7 +45,7 @@ class SelfReportIgnored(unittest.TestCase):
 
     def test_body_can_opt_in_to_one_way(self):
         d = decide("door: one-way\nblast: customer\n", ["README.md"], file_diff("README.md", added=["x"]),
-                   "BJGLLC/lead-agent", PATTERNS)
+                   "BJGLLC/example", PATTERNS)
         self.assertEqual(d["door"], "one-way")
         self.assertFalse(d["forced"])
         self.assertEqual(d["reasons"], [])
@@ -54,7 +54,7 @@ class SelfReportIgnored(unittest.TestCase):
 class OrdinaryChanges(unittest.TestCase):
     def test_docs_change_is_two_way(self):
         diff = file_diff("docs/guide.md", added=["Run the tests before you push.", "DELETE FROM is explained here."])
-        r = classify(["docs/guide.md"], diff, "BJGLLC/bjg-intranet", PATTERNS)
+        r = classify(["docs/guide.md"], diff, "BJGLLC/example", PATTERNS)
         self.assertEqual(r["door"], "two-way")
         self.assertEqual(r["reasons"], [])
 
@@ -62,26 +62,26 @@ class OrdinaryChanges(unittest.TestCase):
         path = "tests/test_router.py"
         diff = file_diff(path, added=['    assert posts[0][0].endswith("/conversations/messages")',
                                       '    payload = {"type": "SMS", "contactId": "ct-fake"}'])
-        r = classify([path], diff, "BJGLLC/lead-agent", PATTERNS)
+        r = classify([path], diff, "BJGLLC/example", PATTERNS)
         self.assertEqual(r["door"], "two-way", r["reasons"])
 
     def test_ordinary_code_change_is_two_way(self):
         path = "core/metrics.ts"
         diff = file_diff(path, added=["export const total = (xs: number[]) => xs.reduce((a, b) => a + b, 0);"])
-        self.assertEqual(classify([path], diff, "BJGLLC/cd-dashboard", PATTERNS)["door"], "two-way")
+        self.assertEqual(classify([path], diff, "BJGLLC/example", PATTERNS)["door"], "two-way")
 
 
 class Renames(unittest.TestCase):
     def test_rename_into_forced_path(self):
         old, new = "drafts/025_cleanup.sql.txt", "supabase/migrations/025_cleanup.sql"
-        r = classify([new], file_diff(new, old=old), "BJGLLC/cd-dashboard", PATTERNS)
+        r = classify([new], file_diff(new, old=old), "BJGLLC/example", PATTERNS)
         self.assertEqual(r["door"], "one-way")
         self.assertIn(new, {x["path"] for x in r["reasons"]})
 
     def test_rename_out_of_forced_path_reads_the_old_name_from_the_diff(self):
         # gh's file list names only the new path; the classifier must still see where it came from.
         old, new = "supabase/migrations/023_old.sql", "archive/023_old.sql"
-        r = classify([new], file_diff(new, old=old), "BJGLLC/cd-dashboard", PATTERNS)
+        r = classify([new], file_diff(new, old=old), "BJGLLC/example", PATTERNS)
         self.assertEqual(r["door"], "one-way")
         self.assertIn(old, {x["path"] for x in r["reasons"]})
 
@@ -92,7 +92,7 @@ class Renames(unittest.TestCase):
     def test_deleting_a_migration_is_one_way(self):
         path = "supabase/migrations/001_base_tables.sql"
         r = classify([path], file_diff(path, removed=["CREATE TABLE t (id int);"], deleted=True),
-                     "BJGLLC/cd-dashboard", PATTERNS)
+                     "BJGLLC/example", PATTERNS)
         self.assertEqual(r["door"], "one-way")
 
 
@@ -100,32 +100,32 @@ class ContentOnUnlistedPath(unittest.TestCase):
     def test_new_migration_statement_on_an_unlisted_path(self):
         path = "lib/store/setup.py"
         diff = file_diff(path, added=['    con.execute("ALTER TABLE example_rows ADD COLUMN note TEXT")'])
-        r = classify([path], diff, "BJGLLC/lead-agent", PATTERNS)
+        r = classify([path], diff, "BJGLLC/example", PATTERNS)
         self.assertEqual(r["door"], "one-way")
         self.assertIn("schema-change-sql", ids(r))
 
     def test_delete_statement_on_an_unlisted_path(self):
         path = "app/cleanup.ts"
         diff = file_diff(path, added=['  db.exec("DELETE FROM example_rows");'])
-        r = classify([path], diff, "BJGLLC/bjg-intranet", PATTERNS)
+        r = classify([path], diff, "BJGLLC/example", PATTERNS)
         self.assertEqual(r["door"], "one-way")
         self.assertIn("unscoped-delete-sql", ids(r))
 
     def test_scoped_delete_is_not_forced(self):
-        # Clearing one row of local bookkeeping by key is routine in lead-agent; only an unscoped one forces.
+        # Clearing one row of local bookkeeping by key is routine; only an unscoped one forces.
         path = "runtime/alerts.py"
         diff = file_diff(path, added=['        con.execute("DELETE FROM example_alerts WHERE contact_id=?", (cid,))'])
-        self.assertEqual(classify([path], diff, "BJGLLC/lead-agent", PATTERNS)["door"], "two-way")
+        self.assertEqual(classify([path], diff, "BJGLLC/example", PATTERNS)["door"], "two-way")
 
     def test_removed_line_does_not_force(self):
         path = "app/cleanup.ts"
         diff = file_diff(path, removed=['  db.exec("DROP TABLE example_rows");'])
-        self.assertEqual(classify([path], diff, "BJGLLC/bjg-intranet", PATTERNS)["door"], "two-way")
+        self.assertEqual(classify([path], diff, "BJGLLC/example", PATTERNS)["door"], "two-way")
 
     def test_customer_send_endpoint_in_runtime_code(self):
         path = "runtime/new_flow.py"
         diff = file_diff(path, added=['    url = GHL_BASE + "/conversations/messages"'])
-        r = classify([path], diff, "BJGLLC/lead-agent", PATTERNS)
+        r = classify([path], diff, "BJGLLC/example", PATTERNS)
         self.assertEqual(r["door"], "one-way")
         self.assertIn("ghl-send-endpoint", ids(r))
         self.assertIn("customer", r["blast"])
@@ -133,18 +133,18 @@ class ContentOnUnlistedPath(unittest.TestCase):
     def test_reading_one_message_is_not_a_send(self):
         path = "runtime/new_flow.py"
         diff = file_diff(path, added=['    detail = get(f"/conversations/messages/{message_id}")'])
-        self.assertEqual(classify([path], diff, "BJGLLC/lead-agent", PATTERNS)["door"], "two-way")
+        self.assertEqual(classify([path], diff, "BJGLLC/example", PATTERNS)["door"], "two-way")
 
 
 class EmptyAndScope(unittest.TestCase):
     def test_empty_diff_is_two_way(self):
-        r = classify([], "", "BJGLLC/lead-agent", PATTERNS)
+        r = classify([], "", "BJGLLC/example", PATTERNS)
         self.assertEqual(r, {"door": "two-way", "reasons": [], "blast": []})
 
     def test_repo_scoped_pattern_only_fires_in_its_repo(self):
         p = {"content_exempt_paths": [], "content_patterns": [], "path_patterns": [
             {"id": "only-here", "kind": "send", "blast": "customer", "globs": ["n8n/workflows/**"], "repos": ["BJGLLC/deploy-a"],
-             "why": "w", "source": {"repo": "BJGLLC/deploy-a", "example": "n8n/workflows/x.json"}}]}
+             "why": "w", "test_path": "n8n/workflows/x.json"}]}
         path = "n8n/workflows/abc.json"
         self.assertEqual(classify([path], "", "BJGLLC/deploy-a", p)["door"], "one-way")
         self.assertEqual(classify([path], "", "BJGLLC/other", p)["door"], "two-way")
@@ -191,29 +191,33 @@ class DangerBlock(unittest.TestCase):
 
 
 class ShippedPatternFile(unittest.TestCase):
-    """The data file is the product: every entry is grounded, compiles, and fires on its own example."""
+    """The data file is the product: every entry compiles and fires on its own made-up test path and fixture."""
 
     def test_file_covers_sends_money_schema_deletes_and_secrets(self):
         kinds = {p["kind"] for p in PATTERNS["path_patterns"] + PATTERNS["content_patterns"]}
         self.assertTrue({"send", "money", "migration", "delete", "secret"} <= kinds, kinds)
 
-    def test_every_pattern_names_its_source(self):
+    def test_every_pattern_has_a_test_path_and_a_known_blast(self):
         for p in PATTERNS["path_patterns"] + PATTERNS["content_patterns"]:
-            self.assertTrue(p["source"]["repo"].startswith("BJGLLC/"), p["id"])
-            self.assertTrue(p["source"]["example"], p["id"])
+            self.assertTrue(p["test_path"], p["id"])
             self.assertIn(p["blast"], one_way_door.BLASTS, p["id"])
 
-    def test_every_path_pattern_fires_on_its_example(self):
+    def test_every_path_pattern_fires_on_its_test_path(self):
         for p in PATTERNS["path_patterns"]:
-            ex, repo = p["source"]["example"], p["source"]["repo"]
-            r = classify([ex], "", repo, PATTERNS)
-            self.assertIn(p["id"], ids(r), f"{p['id']} does not match its own example {ex}")
+            path, repo = p["test_path"], _repo_for(p)
+            r = classify([path], "", repo, PATTERNS)
+            self.assertIn(p["id"], ids(r), f"{p['id']} does not match its own test path {path}")
 
     def test_every_content_pattern_fires_on_its_fixture_and_only_on_added_lines(self):
         for p in PATTERNS["content_patterns"]:
-            path, repo = p["source"]["example"], p["source"]["repo"]
+            path, repo = p["test_path"], _repo_for(p)
             self.assertIn(p["id"], ids(classify([path], file_diff(path, added=[p["fixture"]]), repo, PATTERNS)), p["id"])
             self.assertNotIn(p["id"], ids(classify([path], file_diff(path, removed=[p["fixture"]]), repo, PATTERNS)), p["id"])
+
+
+def _repo_for(p):
+    """A repo the pattern applies to: its first scoped repo, else any name."""
+    return (p.get("repos") or ["BJGLLC/example"])[0]
 
 
 if __name__ == "__main__":
